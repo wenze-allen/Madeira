@@ -2550,6 +2550,7 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         ios_jit_mappings[slot].machine_valid = 0;
         ios_jit_mappings[slot].hybrid_cached = 0;
         ios_jit_mappings[slot].hybrid_valid = 0;
+        ios_jit_mappings[slot].is_fex = ios_image_is_fex( m->pe_base, m->size );
         ios_jit_mappings[slot].jit_base = rx_dest;
         ios_jit_mappings[slot].unmapped = 0;
         ios_jit_mappings[slot].size = m->size;

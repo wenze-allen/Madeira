@@ -632,7 +632,13 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
                 {
                     static unsigned long wr_seen, wr_healed;
-                    int stripped = (is_write && (want & PROT_WRITE) &&
+                    /* Logical RWX does not mean the host may grant W: the
+                     * alias is RX by design. In particular, let FEX see CAS
+                     * writes so it invalidates translated code before patching
+                     * the RW alias. Healing here skips that invalidation and
+                     * leaves CoreCLR repeatedly executing its old prestub. */
+                    int aliased = ios_write_alias( (uintptr_t)siginfo->si_addr ) != 0;
+                    int stripped = (is_write && (want & PROT_WRITE) && !aliased &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                     ++wr_seen;
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
@@ -640,6 +646,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             "wine_want=%d host_prot=%d %s (seen=%lu healed=%lu) rev=ml552\n",
                             wr_seen, siginfo->si_addr, pc, (unsigned long long)esr,
                             is_write, want, host_prot,
+                            aliased ? "(intentional alias protection)" :
                             stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
                             wr_seen, wr_healed);
 

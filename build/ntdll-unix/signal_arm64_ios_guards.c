@@ -959,6 +959,133 @@ void ios_dump_guest_callers( const char *tag, unsigned long long x28 )
 }
 
 
+/* Executable aliases deliberately lack host write permission. Resolve only
+ * live mappings; callers must also validate the end of a multi-byte access. */
+static uintptr_t ios_write_alias( uintptr_t addr )
+{
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t size = ios_jit_pool_size_global;
+
+    if (rx && rw && addr >= rx && addr - rx < size)
+        return rw + (addr - rx);
+    return ios_jit_anon_alias_lookup( addr );
+}
+
+/* The writable alias is a host implementation detail, not permission to
+ * bypass a guest protection fault. FEX removes logical write permission
+ * while a guest page has cached translations. Let its normal exception
+ * handler invalidate those translations and restore logical write access
+ * before emulating the retried store. Native pool writes have no guest
+ * protection record and must retain their existing path. */
+static int ios_alias_write_is_trapped( uintptr_t addr )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern int ios_page_expected_prot( const void *addr );
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    int prot;
+
+    if (rx && addr >= rx && addr - rx < ios_jit_pool_size_global) return 0;
+    prot = ios_page_expected_prot( (const void *)addr );
+    return prot >= 0 && !(prot & PROT_WRITE);
+}
+
+/* Adjacent guest pages need not occupy adjacent pool slots. Validate every
+ * fragment before writing anything, then route each through its own alias.
+ * Only ordinary stores use this; atomic RMW operations must remain atomic. */
+static int ios_alias_write( uintptr_t addr, const void *source, size_t size, uintptr_t *blocked,
+                            int honor_guest_prot )
+{
+    enum { PAGE = 0x4000, MAX_STORE = 32 };
+    uintptr_t destinations[2];
+    size_t lengths[2], done = 0;
+    unsigned count = 0, i;
+
+    *blocked = 0;
+    if (!size || size > MAX_STORE || addr > UINTPTR_MAX - (size - 1)) return 0;
+    while (done < size)
+    {
+        uintptr_t at = addr + done, rw = ios_write_alias( at );
+        size_t length = PAGE - (at & (PAGE - 1));
+        if (length > size - done) length = size - done;
+        /* A store can cross a 4KB Wine protection boundary within one
+         * 16KB alias page. At most 32 bytes means the endpoints cover all
+         * protection pages touched by this fragment. */
+        if (honor_guest_prot && ios_alias_write_is_trapped( at ))
+        {
+            *blocked = at;
+            return 0;
+        }
+        if (honor_guest_prot && ios_alias_write_is_trapped( at + length - 1 ))
+        {
+            *blocked = (at + length - 1) & ~(uintptr_t)0xfff;
+            return 0;
+        }
+        if (!rw || rw > UINTPTR_MAX - (length - 1) ||
+            ios_write_alias( at + length - 1 ) != rw + length - 1) return 0;
+        destinations[count] = rw;
+        lengths[count++] = length;
+        done += length;
+    }
+    done = 0;
+    for (i = 0; i < count; ++i)
+    {
+        memcpy( (void *)destinations[i], (const unsigned char *)source + done, lengths[i] );
+        done += lengths[i];
+    }
+    if (count > 1)
+    {
+        static unsigned logged;
+        if (logged++ < 8)
+            dprintf( 2, "[alias-span] routed %zu bytes at %p across %u guest pages\n",
+                     size, (void *)addr, count );
+    }
+    return 1;
+}
+
+/* GPR STP/STNP, including pre/post-index writeback. gpr[31] is SP when
+ * used as a base, but register 31 as a store source is always zero. */
+static int ios_alias_store_pair( uint32_t insn, uintptr_t addr, uint64_t gpr[32], uintptr_t *blocked,
+                                 int honor_guest_prot )
+{
+    unsigned rt = insn & 31, rt2 = (insn >> 10) & 31, rn = (insn >> 5) & 31;
+    unsigned mode = (insn >> 23) & 3;
+    unsigned width = (insn & 0x80000000u) ? 8 : 4;
+    unsigned span = width * 2;
+    uintptr_t effective;
+    int64_t offset = (insn >> 15) & 0x7f;
+    uint64_t values[2];
+
+    /* Exclude loads, SIMD pairs and reserved opc encodings. */
+    if ((insn & 0x7e400000u) != 0x28000000u) return 0;
+    if ((mode == 1 || mode == 3) && rn != 31 && (rn == rt || rn == rt2)) return 0;
+    if (offset & 0x40) offset -= 0x80;
+    offset *= width;
+    effective = mode == 1 ? gpr[rn] : gpr[rn] + offset;
+    if (effective > UINTPTR_MAX - (span - 1) || addr < effective || addr - effective >= span) return 0;
+    /* FAR may identify the second word. Translate the whole effective access,
+     * rather than treating that fault address as the first store destination. */
+    addr = effective;
+    values[0] = rt == 31 ? 0 : gpr[rt];
+    values[1] = rt2 == 31 ? 0 : gpr[rt2];
+    if (width == 8)
+    {
+        if (!ios_alias_write( addr, values, sizeof(values), blocked, honor_guest_prot )) return 0;
+    }
+    else
+    {
+        uint32_t words[2] = { (uint32_t)values[0], (uint32_t)values[1] };
+        if (!ios_alias_write( addr, words, sizeof(words), blocked, honor_guest_prot )) return 0;
+    }
+    if (mode == 1) gpr[rn] = addr + offset;
+    else if (mode == 3) gpr[rn] = addr;
+    return 1;
+}
+
 /* Signal-safe 32/64-bit CAS core, shared semantics with the BSD alias path.
  * Caller establishes full alias coverage. FP/LR encodings deliberately
  * decline: Darwin's __x array contains only x0..x28. No Wine logging here. */
@@ -990,11 +1117,44 @@ static int ios_mach_emulate_cas(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[2
     return 1;
 }
 
+/* CASP/CASPA/CASPL/CASPAL pair forms (0sz0 1000 0L1 Rs o0 11111 Rn Rt).
+ * FEX's unaligned-atomic helpers (DoCAS, RunCASPAL) issue a 128-bit CASPAL on
+ * guest memory from inside its exception handler. On an executable alias that
+ * was just copied again into the pool, the access faults and nothing else
+ * completes it: FEX re-enters its handler until the stack overflows. Run the
+ * same hardware CASPAL on the RW alias so it stays atomic against other users
+ * of that alias. Caller establishes full alias coverage. */
+static int ios_mach_emulate_casp(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[29])
+{
+    unsigned rs = (insn >> 16) & 31, rt = insn & 31;
+    int wide = (insn >> 30) & 1;
+
+    if ((insn & 0xbfa07c00u) != 0x08207c00u) return 0;
+    if ((rs & 1) || (rt & 1) || rs + 1 >= 29 || rt + 1 >= 29) return 0;
+    if (!rw_addr || (rw_addr & (wide ? 15 : 7))) return 0;
+    {
+        register uint64_t c0 asm("x0") = gpr[rs];
+        register uint64_t c1 asm("x1") = gpr[rs + 1];
+        register uint64_t c2 asm("x2") = gpr[rt];
+        register uint64_t c3 asm("x3") = gpr[rt + 1];
+        if (wide)
+            asm volatile(".arch_extension lse\n\tcaspal x0, x1, x2, x3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        else
+            asm volatile(".arch_extension lse\n\tcaspal w0, w1, w2, w3, [%4]"
+                         : "+r"(c0), "+r"(c1) : "r"(c2), "r"(c3), "r"(rw_addr) : "memory");
+        gpr[rs] = c0;
+        gpr[rs + 1] = c1;
+    }
+    return 1;
+}
+
 /* ml938/ml939: defined far below, next to the store emulator they reuse.
  * Declared here because the Mach exception thread is the primary caller and
  * sits earlier in the file. */
 static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb );
 extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
+extern int ios_jit_pool_pc_is_fex( uintptr_t pc );   /* virtual_ios.c */
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 
 /* LSE read-modify-write atomics for the Mach alias-store emulator, each done as

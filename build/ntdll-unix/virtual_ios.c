@@ -182,6 +182,7 @@ struct ios_jit_mapping {
                                      * must not adopt it as is (ios_image_reload_mode). */
     unsigned char  hybrid_cached;   /* ml1245: image carries ARM64EC metadata */
     unsigned char  hybrid_valid;    /* 0 = hybrid_cached not yet populated */
+    unsigned char  is_fex;          /* copy of FEX's ARM64EC module (xtajit64.dll) */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
