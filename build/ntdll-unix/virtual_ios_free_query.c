@@ -1615,6 +1615,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         if (base == view->base && size == view->size)
             ios_vh_capture_free_site( view, __builtin_return_address(0) );
         status = free_pages( view, base, size );
+#ifdef WINE_IOS
+        if (!status) ios_jit_anon_alias_retire_range( base, size );
+#endif
         ios_vh_free_site.valid = 0;
         break;
     case MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER:
