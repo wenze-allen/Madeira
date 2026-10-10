@@ -14,9 +14,10 @@ build/ntdll-unix/signal_arm64_ios.c against a fake clock and checks:
     256 KB apart (the old shared slot) faulting in turn both give up as soon;
     64 pages in turn all do; a page that faults again after the idle window
     starts over instead of being refused for its lifetime count;
-  - livelock breaker: two threads stuck in turn are both broken on their 51st
-    fault (the 50th repeat); one thread alternating two pcs over one address
-    (ml261) is broken as soon; an
+  - livelock breaker: two threads stuck in turn (one old slot) are both broken
+    on their 51st fault (the 50th repeat); one thread alternating two pcs over
+    one address (ml261) is broken as soon; an exception delivered to the thread
+    starts its count again; an
     advancing address (ml876) is not, until the 20000 storm ceiling;
   - delivery debounce: two keys that shared an old slot are both dispatched on
     their 3rd fault;
@@ -48,13 +49,14 @@ def between(first, last):
 helper = between('#define IOS_GUARD_SLOTS 64', '    return victim;\n}')
 xr = between('static struct ios_guard_table xr_tab;', 'else if (++xr_n[s] > 8) giveup = 1;')
 rr = between('static struct ios_guard_table rr_tab;', 'else if (++rr_n[s] > 64) giveup = 1;')
-stuck = between('static struct ios_guard_table stuck_tab;', '*stuck_page_n = 0;\n                        }')
+stuck = between('static struct ios_guard_table stk_tab;', '                            stk[ss].page_n = 0;\n                        }')
+deliv = between('static volatile unsigned ios_guest_deliv_seq[16];', '__ATOMIC_RELEASE );\n}')
 rep = between('static struct ios_guard_table rep_tab;', 'if (++rep_n[slot] < 3) return 0;')
 redeliv = between('static struct ios_guard_table redeliv_tab;', 'storm forming rev=ml461\\n",\n                     (unsigned long long)pc, (unsigned long long)fault_addr );')
 heal = between('#define IOS_STALE_VA_MAX 256', 'static void *ios_stale_va_scanner( void *arg )').rsplit('static void *', 1)[0]
 
 # The old schemes are gone from every guard.
-for old in ('xr_pg[16]', 'rr_pg[16]', 'rep[16]', 'redeliv[16]', 'static volatile uint64_t stuck_page;'):
+for old in ('xr_pg[16]', 'rr_pg[16]', 'rep[16]', 'redeliv[16]', 'stk[16]', 'static volatile uint64_t stuck_page;'):
     assert old not in sig, old
 assert 'volatile int ios_stale_va_tail' not in sig and '__ATOMIC_RELEASE' in heal
 
@@ -73,6 +75,7 @@ int mach_timebase_info( void *p ) { unsigned int *tb = p; tb[0] = 125; tb[1] = 3
 code += helper
 code += 'static int xr_step( uint64_t pg ) {\n' + xr + '    return giveup;\n}\n'
 code += 'static int rr_step( uint64_t fa ) {\n' + rr + '    return giveup;\n}\n'
+code += deliv
 code += r'''
 /* the livelock breaker's surroundings */
 typedef void *thread_state_t;
@@ -147,15 +150,27 @@ int main( void )
     for (i = 1; i <= 65 && !(ga && gb); i++) { ga = rr_step( a ); step(); gb = rr_step( b ); step(); }
     assert( ga && gb && i - 1 == 65 );
 
-    /* livelock breaker: two threads stuck in turn */
-    fake_now += 3000 * TICK_MS;
-    ga = gb = 0;
-    for (i = 1; i <= 60 && !(ga && gb); i++)
+    /* livelock breaker: two threads stuck in turn, in one old slot */
     {
-        ga |= breaker_step( 0x1103, 0x13b5f2004ull, 0x73d16aff30ull ); step();
-        gb |= breaker_step( 0x1207, 0x1026b3188ull, 0x7400001000ull ); step();
+        uint64_t ta = 0x1103, tb;
+        for (tb = 0x1104; ios_fault_slot( ta ) != ios_fault_slot( tb ); tb++) ;
+        fake_now += 3000 * TICK_MS;
+        ga = gb = 0;
+        for (i = 1; i <= 60 && !(ga && gb); i++)
+        {
+            ga |= breaker_step( ta, 0x13b5f2004ull, 0x73d16aff30ull ); step();
+            gb |= breaker_step( tb, 0x1026b3188ull, 0x7400001000ull ); step();
+        }
+        assert( ga && gb && i - 1 == 51 );   /* the first fault opens the record */
     }
-    assert( ga && gb && i - 1 == 51 );   /* the first fault opens the record */
+    /* a delivery to the thread between faults starts its count again */
+    fake_now += 3000 * TICK_MS;
+    for (i = 1, ga = 0; i <= 40; i++, step()) ga |= breaker_step( 0x1503, 0x13b5f2004ull, 0x73d16aff30ull );
+    ios_note_guest_delivery( 0x1503 );
+    for (i = 1; i <= 40; i++, step()) ga |= breaker_step( 0x1503, 0x13b5f2004ull, 0x73d16aff30ull );
+    assert( !ga );
+    for (i = 1; i <= 60 && !ga; i++, step()) ga = breaker_step( 0x1503, 0x13b5f2004ull, 0x73d16aff30ull );
+    assert( ga && i - 1 == 11 );   /* 40 since the delivery, then the 50th repeat */
     /* ml261: one thread, two pcs, one address */
     fake_now += 3000 * TICK_MS;
     for (i = 1, ga = 0; i <= 60 && !ga; i++, step())
@@ -217,7 +232,7 @@ int main( void )
     ios_stale_va_enqueue( 0x7200000000ull );
     assert( ios_stale_va_tail == 257 && ios_stale_va_queue[0] == 0x7200000000ull );
 
-    printf( "PASS: exec/reclaim-recover, livelock breaker (threads in turn, ml261 pcs, ml876 progress), "
+    printf( "PASS: exec/reclaim-recover, livelock breaker (threads in turn, ml261 pcs, deliveries, ml876 progress), "
             "delivery debounce, redelivery terminal and stale-heal ring hold under interleaved faults\n" );
     return 0;
 }

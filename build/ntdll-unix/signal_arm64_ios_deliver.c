@@ -687,6 +687,7 @@ dispatch:
     REGn_sig(18, &uc) = thread_teb;
 
     *state = mc.__ss;
+    ios_note_guest_delivery( (uint64_t)thread );   /* restarts [fault-stuck] */
 
     if (deliver_logs < 24 || (deliver_logs % 100) == 0)
         dprintf( 2, "[mach-deliver] rev=ml369 #%d code=%08x pc=0x%llx excaddr=%p addr=0x%llx frame=%p teb=%p disp=%p\n",

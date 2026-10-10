@@ -51,6 +51,25 @@ done:
              why, written, total, path );
 }
 
+/* The [fault-stuck] loop breaker in ios_mach_exception_thread keeps its state per thread (an
+ * exact ios_guard_slot record), and every exception delivered to the guest starts that
+ * thread's count again; the delivery count is kept in 16 slots chosen by thread. It was one app-wide
+ * (page, pc, address) count, so faults of many threads at one instruction, or one thread's
+ * handled int3 or single-step exceptions there, read as a livelock: the thread was diverted
+ * to abort_thread and no exception reached the program. Windows delivers every one. A
+ * livelock is one thread re-faulting with no delivery in between; that is still broken. */
+static volatile unsigned ios_guest_deliv_seq[16];
+
+static inline int ios_fault_slot( uint64_t thread )
+{
+    return (int)((thread * 0x9E3779B97F4A7C15ull) >> 60);
+}
+
+static inline void ios_note_guest_delivery( uint64_t thread )
+{
+    __atomic_add_fetch( &ios_guest_deliv_seq[ios_fault_slot( thread )], 1, __ATOMIC_RELEASE );
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -3481,13 +3500,20 @@ skip_reclaim_band: ;
                      * threads stuck in turn (or one stuck thread and another making
                      * progress elsewhere) never reached 50 and the run spun forever.
                      * Each thread now has its own record (ios_guard_slot, keyed by
-                     * the thread port); a record idle for IOS_GUARD_IDLE_MS starts
-                     * over. */
+                     * the thread port, not one of 16 slots chosen by a hash of it,
+                     * where two threads stuck in turn still restarted each other's
+                     * run); a record idle for IOS_GUARD_IDLE_MS starts over. An
+                     * exception delivered to the thread also starts its run over
+                     * (ios_note_guest_delivery); that count is kept per hashed slot
+                     * (ios_guest_deliv_seq is also written from the faulting thread),
+                     * so a delivery to another thread of that slot restarts it too. */
                     {
-                        static struct ios_guard_table stuck_tab;
-                        static struct { uint64_t page, pc, addr; uint32_t n, page_n; } stuck_rec[IOS_GUARD_SLOTS];
-                        int stuck_fresh;
-                        int stuck_slot = ios_guard_slot( &stuck_tab, (uint64_t)thread, mach_absolute_time(), &stuck_fresh );
+                        static struct ios_guard_table stk_tab;
+                        static struct { uint64_t thread, page, pc, addr; uint32_t n, page_n; unsigned seq; } stk[IOS_GUARD_SLOTS];
+                        int stk_fresh;
+                        const int ss = ios_guard_slot( &stk_tab, (uint64_t)thread, mach_absolute_time(), &stk_fresh );
+                        const unsigned dseq = __atomic_load_n( &ios_guest_deliv_seq[ios_fault_slot( (uint64_t)thread )],
+                                                               __ATOMIC_ACQUIRE );
                         /* ml876: exact faulting ADDRESS, and a page-level storm
                          * counter. ml871-875 killed a UE 5.4 game thread here on
                          * every run: an SDK dll walked its import table with the
@@ -3500,13 +3526,7 @@ skip_reclaim_band: ;
                          * = the SAME address re-faulting (ml261 sp-16 push, ml385
                          * NULL write, ml557 un-stuck heal); key on it. Keep a much
                          * larger page-level ceiling as the storm safety net. */
-                        uint64_t *stuck_page = &stuck_rec[stuck_slot].page;
-                        uint64_t *stuck_pc = &stuck_rec[stuck_slot].pc;
-                        uint64_t *stuck_addr = &stuck_rec[stuck_slot].addr;
-                        uint32_t *stuck_n = &stuck_rec[stuck_slot].n;
-                        uint32_t *stuck_page_n = &stuck_rec[stuck_slot].page_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
-                        if (stuck_fresh) memset( &stuck_rec[stuck_slot], 0, sizeof(stuck_rec[stuck_slot]) );
                         /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
                          * excluded them entirely and a NULL-write loop in
                          * server_ioctl_file ran 3.3M times with no breaker
@@ -3514,34 +3534,44 @@ skip_reclaim_band: ;
                          * had detached). */
                         if (!fpage) fpage = 1;
 
-                        if (fpage == *stuck_page && fault_pc_check == *stuck_pc &&
-                            (uint64_t)fault_addr != *stuck_addr)
+                        /* A record new to this thread, or an exception delivered to its
+                         * delivery slot since its last fault, starts a new run (page 0 never
+                         * matches, so the run is keyed again below). */
+                        if (stk_fresh || stk[ss].thread != (uint64_t)thread || stk[ss].seq != dseq)
+                        {
+                            stk[ss].thread = (uint64_t)thread;
+                            stk[ss].seq = dseq;
+                            stk[ss].page = 0;
+                        }
+
+                        if (fpage == stk[ss].page && fault_pc_check == stk[ss].pc &&
+                            (uint64_t)fault_addr != stk[ss].addr)
                         {
                             /* ml876: same page+pc but a NEW address = progress.
                              * Restart the exact-address count; keep the page
                              * storm count (ceiling 20000, logged every 1000). */
-                            uint32_t pn = ++*stuck_page_n;
-                            *stuck_addr = (uint64_t)fault_addr;
-                            *stuck_n = 0;
+                            uint32_t pn = __sync_add_and_fetch(&stk[ss].page_n, 1);
+                            stk[ss].addr = (uint64_t)fault_addr;
+                            stk[ss].n = 0;
                             if ((pn % 1000) == 0)
                                 dprintf(STDERR_FILENO,
                                     "[fault-stuck] ml876 page 0x%llx pc 0x%llx: %u faults, addresses advancing (last 0x%llx)\n",
                                     (unsigned long long)fpage, (unsigned long long)fault_pc_check, pn,
                                     (unsigned long long)fault_addr);
-                            if (pn >= 20000) *stuck_n = 49;   /* storm ceiling: next fault breaks */
+                            if (pn >= 20000) stk[ss].n = 49;   /* storm ceiling: next fault breaks */
                         }
                         /* The SAME address on the same page is no progress whichever
                          * pc takes it: ml261, the case this breaker was written for,
                          * alternated two pcs (prologue push, memcpy) over one stack
                          * address, and a (page, pc) match reset the count on every
                          * alternation, so it was never caught. */
-                        if (fpage == *stuck_page &&
-                            (fault_pc_check == *stuck_pc || (uint64_t)fault_addr == *stuck_addr))
+                        if (fpage == stk[ss].page &&
+                            (fault_pc_check == stk[ss].pc || (uint64_t)fault_addr == stk[ss].addr))
                         {
-                            uint32_t n = ++*stuck_n;
+                            uint32_t n = __sync_add_and_fetch(&stk[ss].n, 1);
                             /* ml385 LOOP BREAKER: same page AND same pc (or the same
-                             * address) 50 times with zero progress is a livelock, not
-                             * a recoverable fault (guard/watch pages resolve in 1-3). Divert the
+                             * address) 50 times with zero progress is a livelock, not a
+                             * recoverable fault (guard/watch pages resolve in 1-3). Divert the
                              * thread to wine's abort_thread so the pseudo-process
                              * dies cleanly instead of eating the whole run. Native
                              * unix-code faults (dylib pc) can never be delivered
@@ -3560,7 +3590,7 @@ skip_reclaim_band: ;
                                 thread_set_state( thread, ARM_THREAD_STATE64,
                                                   (thread_state_t)&state, count );
                                 handled = 1;
-                                *stuck_n = 0;
+                                stk[ss].n = 0;
                             }
                             /* ml369: was 2048, which NEVER fired — the
                              * debugger script kills the app after 8
@@ -3608,11 +3638,11 @@ skip_reclaim_band: ;
                         }
                         else
                         {
-                            *stuck_page = fpage;
-                            *stuck_pc = fault_pc_check;
-                            *stuck_addr = (uint64_t)fault_addr;
-                            *stuck_n = 0;
-                            *stuck_page_n = 0;
+                            stk[ss].page = fpage;
+                            stk[ss].pc = fault_pc_check;
+                            stk[ss].addr = (uint64_t)fault_addr;
+                            stk[ss].n = 0;
+                            stk[ss].page_n = 0;
                         }
                     }
 
