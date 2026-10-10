@@ -861,6 +861,62 @@ static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb );
 extern void *ios_jit_current_peb(void);   /* virtual_ios.c */
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 
+/* LSE read-modify-write atomics for the Mach alias-store emulator, each done as
+ * ONE host atomic on the RW alias, which maps the same physical pages as the
+ * view that faulted:
+ *   LD<OP>  size 111 0 00 A R 1 Rs 0 0 op(2) 00 Rn Rt (mask 0x3f20cc00, value
+ *           0x38200000); op 00 LDADD, 01 LDCLR, 10 LDEOR, 11 LDSET. Rt gets the
+ *           old value; Rt = 31 is the ST<OP> alias, which discards it.
+ *   CAS     size 001000 1 L 1 Rs o0 11111 Rn Rt (mask 0x3fa07c00, value
+ *           0x08a07c00). Rs holds the compare value and gets the old value.
+ * Every size (B, H, W, X) and every acquire/release form. The operation is
+ * __ATOMIC_SEQ_CST whatever A/R or L/o0 ask for, which is at least as strong as
+ * each of them (the SWP case does the same); the exception and its reply
+ * already order the faulting thread's own accesses around it. Old values are
+ * zero-extended, as the B, H and W forms define. gpr[0..30] are x0..x30 (x29 =
+ * FP, x30 = LR; FEX's JIT uses both); register 31 is the zero register in
+ * both encodings, so gpr[31] is neither read nor written. Returns 0 with
+ * nothing changed for any other encoding or a misaligned address, which these
+ * builtins cannot do atomically. No Wine logging here. */
+#define IOS_MACH_RMW(type) do { \
+        type *p_ = (type *)rw_addr; \
+        type e_ = (type)s; \
+        if (cas) \
+        { \
+            __atomic_compare_exchange_n( p_, &e_, (type)t, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); \
+            old = e_; \
+        } \
+        else switch ((insn >> 12) & 3) \
+        { \
+        case 0:  old = __atomic_fetch_add( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        case 1:  old = __atomic_fetch_and( p_, (type)~s, __ATOMIC_SEQ_CST ); break; \
+        case 2:  old = __atomic_fetch_xor( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        default: old = __atomic_fetch_or( p_, (type)s, __ATOMIC_SEQ_CST ); break; \
+        } \
+    } while (0)
+static int ios_mach_emulate_rmw( uint32_t insn, uintptr_t rw_addr, uint64_t gpr[32] )
+{
+    const unsigned size = insn >> 30, rs = (insn >> 16) & 31, rt = insn & 31;
+    const int cas = (insn & 0x3fa07c00u) == 0x08a07c00u;
+    uint64_t s, t, old = 0;
+
+    if (!cas && (insn & 0x3f20cc00u) != 0x38200000u) return 0;
+    if (!rw_addr || (rw_addr & ((1u << size) - 1))) return 0;
+    s = rs == 31 ? 0 : gpr[rs];
+    t = rt == 31 ? 0 : gpr[rt];
+    switch (size)
+    {
+    case 0:  IOS_MACH_RMW( uint8_t );  break;
+    case 1:  IOS_MACH_RMW( uint16_t ); break;
+    case 2:  IOS_MACH_RMW( uint32_t ); break;
+    default: IOS_MACH_RMW( uint64_t ); break;
+    }
+    if (cas && rs != 31) gpr[rs] = old;
+    else if (!cas && rt != 31) gpr[rt] = old;
+    return 1;
+}
+#undef IOS_MACH_RMW
+
 /* ml974: is the ucontext's NEON state real?
  *
  * The Mach path builds a synthetic ucontext, memsets it to zero and fills

@@ -2615,11 +2615,10 @@ static void *ios_mach_exception_thread( void *arg )
                      * alias maps the SAME physical pages as the faulting RX view, so the
                      * atomic applies to the memory the guest actually shares.
                      *
-                     * ⛔ Deliberately NOT extended to LDADD/LDCLR/LDSET/CAS here. Those
-                     * encodings appear in this run only AFTER the SWPAL was mishandled,
-                     * inside FEX's exception path, so they are probably fallout. A wide
-                     * speculative decoder carries more correctness surface than this
-                     * blocker justifies — add families when they actually appear. */
+                     * Not extended to LDADD/LDCLR/LDSET/CAS here: in this run those came
+                     * only AFTER the mishandled SWPAL, inside FEX's exception path, as
+                     * fallout. They have since appeared on their own (a JVM's LDADDAL on
+                     * anonymous RWX memory) and have their own case below. */
                     else if ((insn & 0x3F20FC00) == 0x38208000)
                     {
                         int size_lg2 = (insn >> 30) & 0x3;
@@ -2684,6 +2683,41 @@ static void *ios_mach_exception_thread( void *arg )
                                         (unsigned long long)fault_addr, (unsigned long long)rw_addr,
                                         (unsigned long long)in, (unsigned long long)old);
                             }
+                        }
+                    }
+                    /* LD<OP> and CAS, the other read-modify-write atomics. FEX lowers a guest
+                     * LOCK ADD/SUB/XADD/INC/DEC to LDADDAL, LOCK AND to LDCLRAL, LOCK OR to
+                     * LDSETAL, LOCK XOR to LDEORAL and LOCK CMPXCHG to CASAL. A bundled JVM
+                     * ran LDADDAL W6, W0, [X1] (0xb8e60020) on anonymous RWX memory; with no
+                     * case here the add never happened and the fault went back to the guest.
+                     * ios_mach_emulate_rmw does each as one atomic on the RW alias, in every
+                     * size and ordering, x29/x30 included. CAS only off the pool: FEX's own
+                     * CASAL on the pool keeps the block below. Misaligned is refused, as for
+                     * SWP. */
+                    else if ((insn & 0x3f20cc00u) == 0x38200000u ||               /* LD<OP> */
+                             (!in_jit && (insn & 0x3fa07c00u) == 0x08a07c00u))     /* CAS */
+                    {
+                        uint64_t gpr[32];
+
+                        memcpy( gpr, state.__x, sizeof(state.__x) );
+                        gpr[29] = state.__fp;
+                        gpr[30] = state.__lr;
+                        gpr[31] = state.__sp;
+                        if (ios_mach_emulate_rmw( insn, rw_addr, gpr ))
+                        {
+                            memcpy( state.__x, gpr, sizeof(state.__x) );
+                            state.__fp = gpr[29];
+                            state.__lr = gpr[30];
+                            emulated = 1;
+                        }
+                        {
+                            static int rmw_n;
+                            if (rmw_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[mach-rmw] #%d insn=0x%08x pc=0x%llx addr=0x%llx rw=0x%llx %s\n",
+                                    ++rmw_n, insn, (unsigned long long)fault_pc,
+                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                    emulated ? "emulated" : "REFUSED: misaligned");
                         }
                     }
                     /* FEX's native backpatch lock uses CASAL on the pool RX
