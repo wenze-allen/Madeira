@@ -483,7 +483,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unsigned long)((rx && b >= rx && b < rx + ps) ? b - rx : b - rw) );
         }
     }
-    if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+    if (FORCE_EXEC_AT( base ) && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         if (!ios_in_mach_exc)                   /* ml374: see ios_in_mach_exc */
             TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );

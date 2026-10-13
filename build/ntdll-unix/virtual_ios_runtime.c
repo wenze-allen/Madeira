@@ -1182,10 +1182,62 @@ void virtual_free_teb( TEB *teb )
 #ifdef WINE_IOS
         /* guest -> host: a WoW thread's 32-bit stack pointer is a guest
          * address.  Outside a window ios_wow_base() is 0 and this is the
-         * classic identity. */
-        ptr = (char *)ptr + ios_wow_base();
+         * classic identity.
+         *
+         * ml1355: the base must be the DYING thread's window, not the freeing
+         * thread's.  exit_thread hands each exited TEB to the NEXT thread to
+         * exit anywhere in the session (the prev_teb handoff, see the TEB free
+         * list note below), and with two 32-bit processes running that thread
+         * is often in the other process: ios_wow_base() then turned the dead
+         * thread's guest stack address into an address in the FREEING
+         * process's window and released that process's live memory.  Device log
+         * 95: a game creating and ending a short-lived thread in a loop while
+         * the Steam client started beside it lost guest 0x167e0000+0x10000
+         * ("NO wine view", then a read access violation at 0x167EFF0C and the
+         * game's exit).  The TEB itself lives in its own process's window, so
+         * that window is the base.  A window that is no longer live keeps its
+         * stack: the VA goes away with the window.
+         * env.MADEIRA_WOW_STACK_FREE_OWNER = 0 restores the freeing thread's base. */
+        {
+            static int by_owner = -1;
+            BOOL skip = FALSE;
+
+            if (by_owner < 0)
+            {
+                const char *e = getenv( "MADEIRA_WOW_STACK_FREE_OWNER" );
+                by_owner = !(e && e[0] == '0');
+            }
+            if (by_owner)
+            {
+                struct ios_wow_window *owner = ios_wow_live_slot_for_addr( teb );
+                ULONG_PTR mine = ios_wow_base();
+
+                if (owner) ptr = (char *)ptr + owner->base;
+                else if (ios_wow_addr_in_any_window( teb )) skip = TRUE;
+                else ptr = (char *)ptr + mine;
+                if (owner && owner->base != mine)
+                {
+                    static unsigned int n_cross;
+                    if (++n_cross <= 16)
+                        dprintf( 2, "[wow-stack] ml1355 32-bit stack of an exited thread (teb=%p) freed in "
+                                 "its own window B=%p, not the freeing thread's (B=%p)\n",
+                                 teb, (void *)owner->base, (void *)mine );
+                }
+            }
+            else ptr = (char *)ptr + ios_wow_base();
+            if (skip)
+            {
+                static unsigned int n_skip;
+                if (++n_skip <= 8)
+                    dprintf( 2, "[wow-stack] ml1355 32-bit stack of an exited thread (teb=%p) left to its "
+                             "window, which is no longer live\n", teb );
+            }
+            else
 #endif
         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+#ifdef WINE_IOS
+        }
+#endif
     }
     ios_vh_why = NULL;
 
@@ -1989,7 +2041,7 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
                 ret = STATUS_SUCCESS;
         }
     }
-    else if (err == EXCEPTION_EXECUTE_FAULT && force_exec_prot && ios_wow_in_window( page ) &&
+    else if (err == EXCEPTION_EXECUTE_FAULT && FORCE_EXEC_AT( page ) && ios_wow_in_window( page ) &&
              (vprot & VPROT_COMMITTED) && (get_unix_prot( vprot ) & PROT_READ))
     {
         /* iOS-Madeira: DEP-OFF EXECUTE FAULT, host side.
@@ -2886,8 +2938,37 @@ void virtual_set_force_exec( BOOL enable )
 {
     struct file_view *view;
     sigset_t sigset;
+    ULONG_PTR wbase = 0;
+    /* ml1354: a 32-bit process's DEP choice is its own (see ios_dep_per_process):
+     * record it in its window and re-protect only the views inside that window.
+     * (ios_wow_mutex is taken before virtual_mutex, never inside it.) */
+    int changed = ios_wow_force_exec_set_current( enable, &wbase );
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (changed >= 0)
+    {
+        unsigned int swept = 0;
+
+        if (changed)
+        {
+            WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+            {
+                BYTE commit;
+
+                if ((ULONG_PTR)view->base < wbase ||
+                    (ULONG_PTR)view->base >= wbase + IOS_WOW_WINDOW_SIZE) continue;
+                commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
+                mprotect_range( view->base, view->size, commit, 0 );
+                swept++;
+            }
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        dprintf( 2, "[dep] ml1354 pid %04x: DEP %s for this process only (window B=%p)%s; %u of its views "
+                 "re-protected, other processes untouched (env.MADEIRA_DEP_PER_PROCESS=0 restores the "
+                 "session-wide sweep)\n", (int)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+                 enable ? "off" : "on", (void *)wbase, changed ? "" : " (unchanged)", swept );
+        return;
+    }
     if (!force_exec_prot != !enable)  /* change all existing views */
     {
         force_exec_prot = enable;

@@ -67,6 +67,9 @@ struct ios_wow_window
     int        teb_block_pos;
     unsigned   wine_mono;       /* ml1279: libmono-2.0-x86.dll was mapped in this window, so its
                                    RWX memory is plain read/write from then on */
+    unsigned   force_exec;      /* ml1354: this process turned DEP off (ProcessExecuteFlags) */
+    unsigned   exec_flags_set;  /* ml1354: exec_flags below holds this process's ProcessExecuteFlags */
+    ULONG      exec_flags;
 };
 static struct ios_wow_window ios_wow_windows[IOS_WOW_MAX_WINDOWS];
 static unsigned ios_wow_window_count;
@@ -1460,6 +1463,8 @@ void ios_wow_window_bind( void *peb_id )
     if ((slot = ios_wow_slot_current()) && !slot->peb)
     {
         slot->peb = peb_id;
+        slot->force_exec = 0;       /* ml1354: a new process starts with its own DEP state */
+        slot->exec_flags_set = 0;
         dprintf( 2, "[wow-window] slot %d B=%p bound to peb=%p\n",
                  (int)(slot - ios_wow_windows), (void *)slot->base, peb_id );
     }
@@ -1562,6 +1567,100 @@ void ios_wow_window_release( void *peb_id )
     pthread_mutex_unlock( &ios_wow_mutex );
     if (slot) ios_wow_window_mark_released( slot );
 }
+
+/* ml1354: PER-PROCESS DEP for 32-bit pseudo-processes.
+ *
+ * Upstream keeps the DEP state (execute_flags in process.c, force_exec_prot
+ * here) per Unix process, which is one Windows process there and the WHOLE
+ * session here. A 32-bit browser process enabling DEP for itself
+ * (SetProcessDEPPolicy, permanent) therefore switched DEP back on for a
+ * running 32-bit game that had turned it off, and virtual_set_force_exec's
+ * sweep re-protected every view of every pseudo-process from the browser's
+ * thread: every executable image of the game and of the Steam client was
+ * copied into the JIT pool again under the browser's identity (device log 95:
+ * ~69 MB of copies, then "[jit-pool] EXHAUSTED", the game's thread creation
+ * failing and the game dying soon after). Each window now carries its own
+ * DEP state; the sweep covers only the caller's window.
+ * env.MADEIRA_DEP_PER_PROCESS = 0 restores the session-wide behaviour. */
+static int ios_dep_per_process(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_DEP_PER_PROCESS" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* TRUE when addr lies in a live window whose process turned DEP off.
+ * Lock-free (fault paths): slots are only ever appended. */
+int ios_wow_force_exec_at( const void *addr )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    for (i = 0; i < n; i++)
+    {
+        const struct ios_wow_window *w = &ios_wow_windows[i];
+        if (w->base && w->force_exec && !w->dead && !w->leaked &&
+            (ULONG_PTR)addr >= w->base && (ULONG_PTR)addr < w->base + IOS_WOW_WINDOW_SIZE)
+            return 1;
+    }
+    return 0;
+}
+
+/* Record the calling process's DEP choice in its window. Returns -1 when the
+ * caller has no window or the per-process mode is off (session-wide path),
+ * else 1 when the state changed, 0 when it did not; *base gets B. */
+int ios_wow_force_exec_set_current( BOOL enable, ULONG_PTR *base )
+{
+    struct ios_wow_window *slot;
+    int ret = -1;
+
+    if (!ios_dep_per_process()) return -1;
+    pthread_mutex_lock( &ios_wow_mutex );
+    if ((slot = ios_wow_slot_current()))
+    {
+        ret = !slot->force_exec != !enable;
+        slot->force_exec = !!enable;
+        *base = slot->base;
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+    return ret;
+}
+
+/* The calling process's ProcessExecuteFlags: its own when it has a window and
+ * has set them, else `fallback` (the session-wide value). */
+ULONG ios_wow_exec_flags_current( ULONG fallback )
+{
+    struct ios_wow_window *slot;
+    ULONG ret = fallback;
+
+    if (!ios_dep_per_process()) return fallback;
+    pthread_mutex_lock( &ios_wow_mutex );
+    if ((slot = ios_wow_slot_current()) && slot->exec_flags_set) ret = slot->exec_flags;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    return ret;
+}
+
+/* Store them for the calling process. 0 when it has no window (the caller then
+ * keeps the session-wide value, as before). */
+int ios_wow_exec_flags_store_current( ULONG flags )
+{
+    struct ios_wow_window *slot;
+    int ret = 0;
+
+    if (!ios_dep_per_process()) return 0;
+    pthread_mutex_lock( &ios_wow_mutex );
+    if ((slot = ios_wow_slot_current()))
+    {
+        slot->exec_flags = flags;
+        slot->exec_flags_set = 1;
+        ret = 1;
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+    return ret;
+}
 /* ==== end of WoW64 guest windows ==== */
 #else
 int ios_main_image_i386 = 0;
@@ -1577,6 +1676,10 @@ void ios_wow_window_bind( void *peb_id ) { }
 void ios_wow_window_release( void *peb_id ) { }
 void ios_wow_window_release_current(void) { }
 void ios_wow_window_retire_current(void) { }
+int ios_wow_force_exec_at( const void *addr ) { return 0; }
+int ios_wow_force_exec_set_current( BOOL enable, ULONG_PTR *base ) { return -1; }
+ULONG ios_wow_exec_flags_current( ULONG fallback ) { return fallback; }
+int ios_wow_exec_flags_store_current( ULONG flags ) { return 0; }
 #endif  /* WINE_IOS */
 
 

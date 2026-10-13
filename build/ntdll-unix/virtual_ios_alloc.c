@@ -531,12 +531,12 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             {
                 base = view->base;
                 ios_place_note_new( base, ROUND_SIZE( 0, view->size, host_page_mask ) );   /* see ios_place_fresh */
-                if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+                if (vprot & VPROT_EXEC || FORCE_EXEC_AT( base )) mprotect_range( base, size, 0, 0 );
                 ios_swap_init();
                 /* ml1077 commit-time backing (classic runs it unchanged); wide also backs a
                  * writable reservation, never one for ARM64EC code. ml1257 broad backs the
                  * whole new reservation, committed or not, so commits inside it are mprotects */
-                if (force_exec_prot || (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) || !ios_swap_whole_resv( view, vprot ))
+                if (FORCE_EXEC_AT( base ) || (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) || !ios_swap_whole_resv( view, vprot ))
                 {
                     if (type & MEM_COMMIT) ios_swap_commit( base, size, vprot, view );
                     else if (!(attributes & MEM_EXTENDED_PARAMETER_EC_CODE)) ios_swap_reserve( base, size, vprot, view );

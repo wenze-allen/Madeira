@@ -3323,6 +3323,10 @@ static const size_t view_block_size = 0x100000;
 static void *preload_reserve_start;
 static void *preload_reserve_end;
 static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
+/* ml1354: force_exec_prot is session-wide; a 32-bit process's own DEP-off state
+ * lives in its guest window (ios_wow_force_exec_at, see the WoW64 windows). */
+int ios_wow_force_exec_at( const void *addr );
+#define FORCE_EXEC_AT(addr) (force_exec_prot || ios_wow_force_exec_at( addr ))
 static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
 
 struct range_entry
