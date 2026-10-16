@@ -1597,7 +1597,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             (unsigned long)image_size, reload_pe, (unsigned long)reload_size,
                             (unsigned long)(image_alloc + tramp_prealloc));
                 reload_jit = NULL;
-                offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved,
+                                                     ios_pool_image_tag( image_base, image_size, alloc_size ));
                 if (offset == (size_t)-1) offset = ios_pool_low_image_range( alloc_size );
                 if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
                     offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
@@ -2391,7 +2392,8 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
     {
         size_t data_delta = ios_jit_data_align_delta(m->pe_base, m->size);
         if (data_delta) alloc_size += pg;
-        offset = ios_pool_alloc_range(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved);
+        offset = ios_pool_alloc_range_tagged(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved,
+                                             ios_pool_image_tag( m->pe_base, m->size, alloc_size ));
         if (offset != (size_t)-1 && data_delta) offset += data_delta;
     }
     if (offset == (size_t)-1)

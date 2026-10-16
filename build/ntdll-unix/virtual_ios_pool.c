@@ -422,6 +422,7 @@ static int ios_pool_free_put( struct ios_pool_free *fl, int *n, int max, size_t 
     fl[*n].size = size;
     fl[*n].freed_at = now;
     fl[*n].advised = 0;
+    fl[*n].tag = 0;  /* madeira-pool-same-image */
     (*n)++;
     return 1;
 }
@@ -563,7 +564,7 @@ static int ios_pool_keep_big( size_t range, size_t want, int bump_ok )
  * image's pool offset and max_dist to force the range within branch
  * reach; (size_t)-1 anchor = unconstrained (old behavior). */
 static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
-                                       size_t anchor_off, size_t max_dist )
+                                       size_t anchor_off, size_t max_dist, uint64_t tag )
 {
     size_t off = (size_t)-1;
     time_t now = time( NULL );
@@ -729,6 +730,37 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         ios_pool_freelist[i].advised = 1;
     }
 
+    /* madeira-pool-same-image: a whole range whose old occupant had this
+     * exact layout, poisoned or not. Its non-executable pages are that
+     * image's writable sections, which are this image's writable sections
+     * too, so nothing executable lands on them. */
+    if (tag)
+    {
+        for (i = 0; i < ios_pool_free_count; i++)
+        {
+            size_t l_off = 0;
+            void  *l_peb = NULL;
+            if (ios_pool_freelist[i].tag != tag || ios_pool_freelist[i].size != alloc_size) continue;
+            if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+            if (!IOS_POOL_IN_REACH(ios_pool_freelist[i].off)) continue;
+            if (ios_jit_rw_base_global &&
+                ios_pool_live_overlap( (uintptr_t)ios_jit_rw_base_global + ios_pool_freelist[i].off,
+                                       alloc_size, &l_off, &l_peb ))
+                continue;
+            off = ios_pool_freelist[i].off;
+            ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
+            ios_pool_last_alloc_reused = 1;
+            {
+                static int same_n;
+                if (same_n++ < 40)
+                    dprintf(2, "[jit-pool] same-image reuse off=0x%lx size=0x%lx tag=%llx (freelist %d)\n",
+                            (unsigned long)off, (unsigned long)alloc_size,
+                            (unsigned long long)tag, ios_pool_free_count);
+            }
+            break;
+        }
+    }
+
     /* each `continue` below has dropped or replaced entry i: pick again */
     {
         size_t bump_cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
@@ -775,6 +807,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                     ios_pool_freelist[ios_pool_free_count].size = r_size[r];
                     ios_pool_freelist[ios_pool_free_count].freed_at = bad.freed_at;
                     ios_pool_freelist[ios_pool_free_count].advised = bad.advised | 2;
+                    ios_pool_freelist[ios_pool_free_count].tag = 0;  /* madeira-pool-same-image */
                     ios_pool_free_count++;
                     kept += r_size[r];
                 }
@@ -817,6 +850,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         {
             ios_pool_freelist[i].off  += alloc_size;
             ios_pool_freelist[i].size -= alloc_size;
+            ios_pool_freelist[i].tag   = 0;  /* madeira-pool-same-image */
         }
         else
         {
@@ -876,6 +910,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                     ios_pool_freelist[ios_pool_free_count].size = psz[k];
                     ios_pool_freelist[ios_pool_free_count].freed_at = 0;
                     ios_pool_freelist[ios_pool_free_count].advised = 1;
+                    ios_pool_freelist[ios_pool_free_count].tag = 0;  /* madeira-pool-same-image */
                     ios_pool_free_count++;
                 }
                 if (jump_n++ < 8)
@@ -950,6 +985,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
             ios_pool_ledger[ios_pool_ledger_count].off  = off;
             ios_pool_ledger[ios_pool_ledger_count].size = alloc_size;
             ios_pool_ledger[ios_pool_ledger_count].peb  = ios_jit_current_peb();
+            ios_pool_ledger[ios_pool_ledger_count].tag  = tag;  /* madeira-pool-same-image */
             ios_pool_ledger_count++;
         }
         else dprintf(2, "[jit-pool] ledger FULL — range off=0x%lx will never be reclaimed\n",
@@ -1034,7 +1070,41 @@ static unsigned ios_pool_check_range_exec( size_t off, size_t size, int reused )
     return bad;
 }
 
-static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
+/* madeira-pool-same-image: a fingerprint of everything that decides which
+ * pages of an image's pool copy are made writable -- the allocation size and
+ * every section's address, size and flags. Equal tags mean equal writable
+ * pages. 0 when the image cannot be read, which disables same-image reuse
+ * for it and nothing else. */
+static uint64_t ios_pool_image_tag( const void *image_base, size_t image_size, size_t alloc_size )
+{
+    const IMAGE_DOS_HEADER *dos = image_base;
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *sec;
+    uint64_t h = 1469598103934665603ULL;
+    unsigned i;
+
+#define IOS_TAG_MIX(v) do { uint64_t _v = (uint64_t)(v); int _b; \
+        for (_b = 0; _b < 8; _b++) { h ^= (_v >> (_b * 8)) & 0xff; h *= 1099511628211ULL; } } while (0)
+    if (!image_base || image_size < 0x1000 || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (const IMAGE_NT_HEADERS *)((const char *)image_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    IOS_TAG_MIX( alloc_size );
+    IOS_TAG_MIX( image_size );
+    IOS_TAG_MIX( nt->OptionalHeader.SizeOfImage );
+    IOS_TAG_MIX( nt->FileHeader.TimeDateStamp );
+    IOS_TAG_MIX( nt->FileHeader.NumberOfSections );
+    sec = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        IOS_TAG_MIX( sec[i].VirtualAddress );
+        IOS_TAG_MIX( sec[i].Misc.VirtualSize );
+        IOS_TAG_MIX( sec[i].Characteristics );
+    }
+#undef IOS_TAG_MIX
+    return h ? h : 1;
+}
+
+static size_t ios_pool_alloc_range_tagged( size_t alloc_size, size_t pool_limit, uint64_t tag )
 {
     /* ml1351: QUARANTINE A RANGE THAT IS ALREADY NON-EXECUTABLE (port of the pre-reset
      * ml1970 guard).
@@ -1062,11 +1132,11 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
     for (attempt = 0; attempt < 16; attempt++)
     {
         unsigned bad;
-        off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+        off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0, tag );
         if (off == (size_t)-1) break;
         /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
          * this came off the freelist or the virgin bump, which is exactly the discriminator. */
-        bad = ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+        bad = tag && ios_pool_last_alloc_reused == 2 ? 0 : ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
         if (!bad || !quarantine || skipped_total + alloc_size > (64u << 20)) break;
         skipped_total += alloc_size;
         {
@@ -1080,6 +1150,11 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
         off = (size_t)-1;
     }
     return off;
+}
+
+static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
+{
+    return ios_pool_alloc_range_tagged( alloc_size, pool_limit, 0 );
 }
 
 /* Default-off overflow for small image copies. EC_CODE and images reserve
@@ -1207,7 +1282,7 @@ done:
  * never be reclaimed out from under FEX when some pseudo-process exits. */
 static size_t ios_pool_take_freed_for_tail( size_t alloc_size )
 {
-    size_t off = ios_pool_alloc_range_ex( alloc_size, 0, (size_t)-1, 0 );
+    size_t off = ios_pool_alloc_range_ex( alloc_size, 0, (size_t)-1, 0, 0 );
     int i;
 
     if (off == (size_t)-1) return off;

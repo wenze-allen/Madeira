@@ -542,11 +542,12 @@ struct ios_pool_alloc
     size_t off;         /* pool offset */
     size_t size;        /* bytes (page-aligned) */
     void  *peb;         /* allocating pseudo-process; NULL = session/unknown */
+    uint64_t tag;       /* madeira-pool-same-image: image layout fingerprint, 0 = none */
 };
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_ledger_count;
 
-#define IOS_POOL_FREE_MAX 256
+#define IOS_POOL_FREE_MAX 1024  /* madeira-pool-same-image: whole poisoned ranges are kept */
 #define IOS_POOL_REUSE_GRACE_SEC 3
 /* Darwin madvise: MADV_FREE marks pages volatile; MADV_FREE_REUSE is the
  * documented cancel. Guard for older SDK headers. */
@@ -559,6 +560,7 @@ struct ios_pool_free
     size_t size;
     time_t freed_at;
     int    advised;   /* physical pages returned via MADV_FREE (post-grace) */
+    uint64_t tag;     /* madeira-pool-same-image: layout of the image that held it, 0 = none */
 };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static int ios_pool_free_count;

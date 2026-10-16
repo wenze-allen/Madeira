@@ -1219,6 +1219,25 @@ void ios_jit_reclaim_process( void *peb )
             ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
             continue;
         }
+        /* madeira-pool-same-image: a POISONED range whose image is known goes
+         * on whole, with its tag, so the next copy of that image can have all
+         * of it -- the executable runs below are each smaller than the image
+         * that needs them. A request for another image that reaches it later
+         * still splits it into those runs, in the allocator. */
+        if (ios_pool_ledger[i].tag && !ios_pool_range_clean( off, size ) &&
+            ios_pool_free_count < IOS_POOL_FREE_MAX)
+        {
+            struct ios_pool_free *whole = &ios_pool_freelist[ios_pool_free_count++];
+            whole->off = off;
+            whole->size = size;
+            whole->freed_at = time( NULL );
+            whole->advised = 0;
+            whole->tag = ios_pool_ledger[i].tag;
+            total += size;
+            ranges++;
+            ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+            continue;
+        }
         /* madeira-bcd: merged with its clean neighbours (ios_pool_free_put); a
          * POISONED range goes on as its executable runs, which merge too. The
          * MADV_FREE sweep that used to follow is gone (ml87), and nothing is
