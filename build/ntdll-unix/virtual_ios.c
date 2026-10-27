@@ -661,6 +661,7 @@ void ios_jit_describe_pool_addr( const void *addr, char *buf, size_t buflen )
  * 0 if it came off the virgin bump. Read immediately after the call by the
  * copy-verify probe so a failed copy can be attributed to reuse or not. */
 static int ios_pool_last_alloc_reused;
+static __thread int ios_pool_last_same_image;
 
 /* Defined next to decommit_pages; declared here so the allocator can check a
  * range against the LIVE ledger before handing it out (task #34 double-handout
