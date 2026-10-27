@@ -100,7 +100,8 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     extern void ios_jit_anon_alias_note_write( unsigned long long );
     const unsigned rt = insn & 31, rn = (insn >> 5) & 31, size = insn >> 30, v = (insn >> 26) & 1;
     const unsigned opc = (insn >> 22) & 3;
-    const uint64_t base = rn == 31 ? st->__sp : st->__x[rn];
+    const uint64_t base = rn == 31 ? st->__sp : rn == 30 ? st->__lr : rn == 29 ? st->__fp : st->__x[rn];
+    const int honor_guest_prot = !ios_jit_pool_pc_is_fex( arm_thread_state64_get_pc( *st ) );
     uint8_t src[32];
     uint64_t ea, a, x0, x1;
     int64_t imm = 0;
@@ -152,6 +153,7 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     }
     else return 0;
 
+    if (ea > UINTPTR_MAX - (bytes - 1)) return -1;
     if (((ea ^ (ea + bytes - 1)) & ~(uint64_t)0x3fff) == 0) return 0;   /* within one page */
     if (v && !neon) return 0;
 
@@ -162,8 +164,8 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     }
     else
     {
-        x0 = rt == 31 ? 0 : st->__x[rt];
-        x1 = rt2 == 31 ? 0 : st->__x[rt2];
+        x0 = rt == 31 ? 0 : rt == 30 ? st->__lr : rt == 29 ? st->__fp : st->__x[rt];
+        x1 = rt2 == 31 ? 0 : rt2 == 30 ? st->__lr : rt2 == 29 ? st->__fp : st->__x[rt2];
         memcpy( src, &x0, elem );
         if (pair) memcpy( src + elem, &x1, elem );
     }
@@ -173,8 +175,11 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
         unsigned len = bytes - done;
         a = ea + done;
         if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
-        part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
-                         ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+        part_rw[parts] = (rx && rw && len <= sz && a >= rx && a - rx <= sz - len)
+                         ? rw + (a - rx) : ios_write_alias( (uintptr_t)a );
+        if (part_rw[parts] && (ios_write_alias( a + len - 1 ) != part_rw[parts] + len - 1 ||
+            (honor_guest_prot && (ios_alias_write_is_trapped( a ) || ios_alias_write_is_trapped( a + len - 1 )))))
+            return -1;
         if (!part_rw[parts])
         {
             /* A page with no alias that is plain writable memory (the aliased page is
@@ -210,7 +215,9 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     if (wb)
     {
         if (rn == 31) st->__sp = base + (uint64_t)imm;
-        else          st->__x[rn] = base + (uint64_t)imm;
+        else if (rn == 30) st->__lr = base + (uint64_t)imm;
+        else if (rn == 29) st->__fp = base + (uint64_t)imm;
+        else st->__x[rn] = base + (uint64_t)imm;
     }
     return 1;
 }

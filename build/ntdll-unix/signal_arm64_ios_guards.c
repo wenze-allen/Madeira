@@ -970,7 +970,7 @@ static uintptr_t ios_write_alias( uintptr_t addr )
     uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
     size_t size = ios_jit_pool_size_global;
 
-    if (rx && rw && addr >= rx && addr - rx < size)
+    if (rx && rw && ((addr >= rx && addr - rx < size) || ios_jit_low_contains( addr )))
         return rw + (addr - rx);
     return ios_jit_anon_alias_lookup( addr );
 }
@@ -989,7 +989,7 @@ static int ios_alias_write_is_trapped( uintptr_t addr )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     int prot;
 
-    if (rx && addr >= rx && addr - rx < ios_jit_pool_size_global) return 0;
+    if ((rx && addr >= rx && addr - rx < ios_jit_pool_size_global) || ios_jit_low_contains( addr )) return 0;
     prot = ios_page_expected_prot( (const void *)addr );
     return prot >= 0 && !(prot & PROT_WRITE);
 }
