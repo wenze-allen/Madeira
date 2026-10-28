@@ -1141,6 +1141,10 @@ static void *ios_pool_warmer_thread( void *arg )
             if (cycle == 1 || (cycle % 30) == 0)
                 dprintf(2, "[pool-warmer] cycle=%u touched=%lu pages (head=0x%lx tail=0x%lx)\n",
                         cycle, (unsigned long)touched, (unsigned long)head, (unsigned long)tail);
+            {
+                extern void ios_wow_pressure_tick( unsigned cycle );
+                ios_wow_pressure_tick( cycle );   /* ml2030: idle 32-bit placeholders back under band pressure */
+            }
             /* task #35: report the three pool slots every ~30s on this existing
              * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
              * the only signal that says whether the ceiling is doing its job. */
