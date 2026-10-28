@@ -453,9 +453,13 @@ unsigned long long ios_get_real_usd(void)
  * NtProtect sync/translate pass ran). Each call through such a pointer
  * faults (~8K/s in gameplay, each suspending the calling thread for a full
  * handler round trip). The Mach handler enqueues every distinct faulted
- * PE VA here; a low-priority scanner thread rewrites EVERY 8-byte slot in
- * the module-copy pool ranges holding that value to its pool equivalent.
- * Each stale pointer faults once, then never again. FEX CodeBuffer ranges
+ * PE VA here; a low-priority scanner thread hands it to
+ * ios_jit_patch_stale_pointer (virtual_ios.c), which rewrites the import
+ * (IAT / delay-IAT) slots of each module copy that hold that value to its
+ * pool equivalent and, when that pass rewrites nothing, escalates to the
+ * exact 8-byte value anywhere in the copy outside its .text (default on;
+ * MADEIRA_NO_HEAL_ESCALATE=1 disables the escalation). Each stale pointer
+ * faults a bounded number of times, then never again. FEX CodeBuffer ranges
  * are NOT scanned (guest-RIP constants live there). */
 /* 64 → 256 (2026-07-07): with a desktop + several pseudo-processes the
  * boot one-shot VAs alone overflowed 64 slots, and the two-cube DXMT
@@ -474,9 +478,17 @@ unsigned long long ios_get_real_usd(void)
 static uint64_t ios_stale_va_seen[IOS_STALE_VA_MAX];
 static uint32_t ios_stale_va_hits[IOS_STALE_VA_MAX];
 static volatile int ios_stale_va_seen_count = 0;
+/* Single-producer (exc handler) / single-consumer (scanner) ring. `volatile`
+ * orders nothing on ARM64, and the slot itself was a plain store, so the
+ * scanner could see the new tail before the VA it publishes and heal a stale
+ * slot instead; that VA is queued only once (at the threshold), so its heal
+ * was then lost for good. The producer publishes the slot with a release
+ * store of the tail and the consumer frees it with a release store of the
+ * head; each reads the other's index with acquire. */
 static uint64_t ios_stale_va_queue[IOS_STALE_VA_MAX];
-static volatile int ios_stale_va_head = 0;   /* written by scanner */
-static volatile int ios_stale_va_tail = 0;   /* written by exc handler */
+static int ios_stale_va_head = 0;   /* written by scanner */
+static int ios_stale_va_tail = 0;   /* written by exc handler */
+static unsigned ios_stale_va_ring_full;   /* exc handler only */
 
 static void ios_stale_va_enqueue( uint64_t va )
 {
@@ -487,8 +499,21 @@ static void ios_stale_va_enqueue( uint64_t va )
         {
             if (++ios_stale_va_hits[i] == IOS_STALE_VA_HEAL_THRESHOLD)
             {
-                ios_stale_va_queue[ios_stale_va_tail % IOS_STALE_VA_MAX] = va;
-                ios_stale_va_tail++;
+                int tail = ios_stale_va_tail;
+                /* A VA is queued once and a hot entry is never evicted, so at most
+                 * IOS_STALE_VA_MAX are ever queued and the ring cannot fill; refuse
+                 * rather than overwrite an unread slot if that ever stops being true,
+                 * and ask again at this VA's next fault. */
+                if (tail - __atomic_load_n( &ios_stale_va_head, __ATOMIC_ACQUIRE ) >= IOS_STALE_VA_MAX)
+                {
+                    ios_stale_va_hits[i]--;
+                    if (ios_stale_va_ring_full++ < 8)
+                        fprintf( stderr, "[stale-heal] queue full: 0x%llx not queued yet (%u refused)\n",
+                                 (unsigned long long)va, ios_stale_va_ring_full );
+                    return;
+                }
+                ios_stale_va_queue[tail % IOS_STALE_VA_MAX] = va;
+                __atomic_store_n( &ios_stale_va_tail, tail + 1, __ATOMIC_RELEASE );
                 fprintf( stderr, "[stale-heal] 0x%llx crossed %d faults — queued for heal\n",
                          (unsigned long long)va, IOS_STALE_VA_HEAL_THRESHOLD );
             }
@@ -518,23 +543,28 @@ static void ios_stale_va_enqueue( uint64_t va )
 static void *ios_stale_va_scanner( void *arg )
 {
     extern int ios_jit_patch_stale_pointer( unsigned long long stale_va );
-    /* Healing default-ON since 2026-07-07: the patcher now rewrites ONLY
-     * IAT/delay-IAT slots (parsed from each pool copy's PE headers), so
-     * the 2026-07-04 breakage class — arm64x metadata slots whose
-     * consumers need PE VAs for identity/range comparisons — can't be
-     * touched. Import slots hold nothing but call targets; rewriting
-     * them is the same transform the NtProtect-time IAT-sync applies.
+    /* Healing default-ON since 2026-07-07: the patcher first rewrites
+     * IAT/delay-IAT slots (parsed from each pool copy's PE headers), which
+     * hold nothing but call targets, so the 2026-07-04 breakage class —
+     * arm64x metadata slots whose consumers need PE VAs for identity/range
+     * comparisons — is not touched by that pass; it is the same transform
+     * the NtProtect-time IAT-sync applies. When it rewrites nothing, the
+     * default-on escalation (MADEIRA_NO_HEAL_ESCALATE=1 disables) rewrites
+     * the exact value in the copy's non-.text data too: the DXMT unix-call
+     * pointer lives in a .data global (ios_jit_patch_stale_pointer).
      * MADEIRA_NO_HEAL=1 reverts to dry-run reporting. */
     int do_heal = getenv( "MADEIRA_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
     { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "wine-stale-heal" ); }   /* madeira-bcd eco-native */
     for (;;)
     {
+        int head = ios_stale_va_head;
         usleep( 100000 );
-        while (ios_stale_va_head != ios_stale_va_tail)
+        while (head != __atomic_load_n( &ios_stale_va_tail, __ATOMIC_ACQUIRE ))
         {
-            uint64_t va = ios_stale_va_queue[ios_stale_va_head % IOS_STALE_VA_MAX];
-            ios_stale_va_head++;
+            uint64_t va = ios_stale_va_queue[head % IOS_STALE_VA_MAX];
+            head++;
+            __atomic_store_n( &ios_stale_va_head, head, __ATOMIC_RELEASE );
             if (do_heal)
                 ios_jit_patch_stale_pointer( va );
             else
@@ -543,6 +573,74 @@ static void *ios_stale_va_scanner( void *arg )
         }
     }
     return NULL;
+}
+
+/* ---- Fault-guard counters -------------------------------------------------
+ * The exception server's give-up guards (exec-recover, reclaim-recover, the
+ * livelock breaker, the delivery debounce and the redelivery terminal) count
+ * repeats of one fault. They kept those counts in 16 slots chosen by a hash of
+ * the key (or in one global record), so two faults whose keys shared a slot
+ * reset each other's count on every alternation and the guard never tripped:
+ * two pages 256 KB apart re-faulted forever in exec-recover, and two threads
+ * faulting in turn did the same to the livelock breaker. A guard table matches
+ * its key exactly. A slot whose key has been quiet for IOS_GUARD_IDLE_MS is
+ * free again and its count starts over (a stuck fault repeats within
+ * microseconds; a page reclaimed again minutes later is a new event, and
+ * without this a collision-free table would hold every page's lifetime count);
+ * when every slot is live the least recently hit one is replaced. Only the
+ * single exception-server thread uses these, so no atomics. */
+#define IOS_GUARD_SLOTS 64
+#define IOS_GUARD_IDLE_MS 2000
+struct ios_guard_table
+{
+    uint64_t key[IOS_GUARD_SLOTS];
+    uint64_t last[IOS_GUARD_SLOTS];   /* mach_absolute_time of the last hit; 0 = empty */
+};
+
+static uint64_t ios_guard_idle_ticks( void )
+{
+    static uint64_t ticks;
+    if (!ticks)
+    {
+        /* mach_timebase_info_data_t is not visible in this TU's header set;
+         * the struct is two uint32s and the call takes it by pointer. */
+        struct { unsigned int numer, denom; } tb = { 0, 0 };
+        extern int mach_timebase_info( void * );
+        mach_timebase_info( &tb );
+        ticks = (tb.numer && tb.denom)
+            ? (uint64_t)IOS_GUARD_IDLE_MS * 1000000ull * tb.denom / tb.numer
+            : (uint64_t)IOS_GUARD_IDLE_MS * 24000ull;   /* the 24 MHz timebase */
+    }
+    return ticks;
+}
+
+/* The slot holding `key`, claimed when the key has none. *fresh is 1 when the
+ * slot was just claimed or its key had gone idle: the caller starts its count
+ * (and any per-slot state of its own) over. */
+static int ios_guard_slot( struct ios_guard_table *t, uint64_t key, uint64_t now, int *fresh )
+{
+    uint64_t idle = ios_guard_idle_ticks();
+    int i, victim = -1;
+
+    if (!now) now = 1;
+    for (i = 0; i < IOS_GUARD_SLOTS; i++)
+    {
+        if (t->last[i] && t->key[i] == key)
+        {
+            *fresh = now - t->last[i] > idle;
+            t->last[i] = now;
+            return i;
+        }
+    }
+    for (i = 0; i < IOS_GUARD_SLOTS; i++)
+    {
+        if (!t->last[i] || now - t->last[i] > idle) { victim = i; break; }
+        if (victim < 0 || t->last[i] < t->last[victim]) victim = i;
+    }
+    t->key[victim] = key;
+    t->last[victim] = now;
+    *fresh = 1;
+    return victim;
 }
 
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
@@ -4540,8 +4638,9 @@ wx_done: ;
              * mprotect(RW); it returns zero-filled, which is functionally correct
              * for FEX's caches (a zero L1/L2 slot reads as "empty" -> FEX
              * recompiles). Gated to the FEX host-arena band (~0x7Cxx..0x80xx) so
-             * it can't mask guest/dyld/null-deref faults, with a 16-slot per-page
-             * repeat guard so an ineffective mprotect can't spin forever. */
+             * it can't mask guest/dyld/null-deref faults, with a per-page repeat
+             * guard (ios_guard_slot: exact page, not a shared hash slot) so an
+             * ineffective mprotect can't spin forever. */
             {
                 uint64_t fa = (uint64_t)fault_addr;
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
@@ -4581,12 +4680,18 @@ wx_done: ;
                     {
                         enum { XR_PAGE = 0x4000 };
                         uint64_t pg = fa & ~(uint64_t)(XR_PAGE - 1);
-                        static volatile uint64_t xr_pg[16] = {0};
-                        static volatile uint32_t xr_n[16]  = {0};
-                        int s = (int)((pg >> 14) & 15);
+                        /* Was 16 slots indexed by (pg >> 14) & 15: two pages 256 KB
+                         * apart faulting in turn reset each other's count to 1,
+                         * the 8-try limit never tripped and the read-touch below
+                         * resumed both forever. Exact page now, 8 tries per page
+                         * within IOS_GUARD_IDLE_MS of the previous one. */
+                        static struct ios_guard_table xr_tab;
+                        static uint32_t xr_n[IOS_GUARD_SLOTS];
+                        int xr_fresh;
+                        int s = ios_guard_slot( &xr_tab, pg, mach_absolute_time(), &xr_fresh );
                         int giveup = 0;
-                        if (xr_pg[s] == pg) { if (++xr_n[s] > 8) giveup = 1; }
-                        else { xr_pg[s] = pg; xr_n[s] = 1; }
+                        if (xr_fresh) xr_n[s] = 1;
+                        else if (++xr_n[s] > 8) giveup = 1;
 #ifndef MADV_FREE_REUSE
 #define MADV_FREE_REUSE 8
 #endif
@@ -4624,7 +4729,7 @@ wx_done: ;
                              * thread the way a user-space load could — then retry
                              * the instruction. If exec really is gone the retry
                              * re-faults and the giveup counter above (8 tries per
-                             * page slot) surfaces it instead of spinning. */
+                             * page) surfaces it instead of spinning. */
                             else if (in_pool_rx)
                             {
                                 uint64_t probe[2] = { 0, 0 };
@@ -4692,17 +4797,21 @@ wx_done: ;
                 if (!handled && fa != (uint64_t)fault_pc &&
                     fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
                 {
-                    static volatile uint64_t rr_pg[16] = {0};
-                    static volatile uint32_t rr_n[16]  = {0};
+                    /* Same exact-page guard as exec-recover above (it was the
+                     * same 16-slot (pg >> 14) & 15 table, with the same
+                     * alternating-pages reset). */
+                    static struct ios_guard_table rr_tab;
+                    static uint32_t rr_n[IOS_GUARD_SLOTS];
                     /* iOS uses 16KB host pages. NOTE: `host_page_size` in this
                      * file resolves to the Mach *function*, not a size — using
                      * it as a value gave a garbage mask (mprotect EINVAL). */
                     enum { RR_PAGE = 0x4000 };
                     uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
-                    int s = (int)((pg >> 14) & 15);
+                    int rr_fresh;
+                    int s = ios_guard_slot( &rr_tab, pg, mach_absolute_time(), &rr_fresh );
                     int giveup = 0;
-                    if (rr_pg[s] == pg) { if (++rr_n[s] > 64) giveup = 1; }
-                    else { rr_pg[s] = pg; rr_n[s] = 1; }
+                    if (rr_fresh) rr_n[s] = 1;
+                    else if (++rr_n[s] > 64) giveup = 1;
                     if (!giveup)
                     {
                         /* ml95 (task #34): the "FEX host-arena band" assumption
@@ -4902,10 +5011,18 @@ skip_reclaim_band: ;
                      * This does NOT fix the missing commit -- it stops one page from
                      * eating an entire run, and dumps the region layout around it so the
                      * owner can be identified and the real fix aimed correctly. */
+                    /* PER THREAD. The record used to be one global (page, pc, addr),
+                     * so ANY other thread's unhandled fault in between reset it: two
+                     * threads stuck in turn (or one stuck thread and another making
+                     * progress elsewhere) never reached 50 and the run spun forever.
+                     * Each thread now has its own record (ios_guard_slot, keyed by
+                     * the thread port); a record idle for IOS_GUARD_IDLE_MS starts
+                     * over. */
                     {
-                        static volatile uint64_t stuck_page;
-                        static volatile uint64_t stuck_pc;
-                        static volatile uint32_t stuck_n;
+                        static struct ios_guard_table stuck_tab;
+                        static struct { uint64_t page, pc, addr; uint32_t n, page_n; } stuck_rec[IOS_GUARD_SLOTS];
+                        int stuck_fresh;
+                        int stuck_slot = ios_guard_slot( &stuck_tab, (uint64_t)thread, mach_absolute_time(), &stuck_fresh );
                         /* ml876: exact faulting ADDRESS, and a page-level storm
                          * counter. ml871-875 killed a UE 5.4 game thread here on
                          * every run: an SDK dll walked its import table with the
@@ -4918,9 +5035,13 @@ skip_reclaim_band: ;
                          * = the SAME address re-faulting (ml261 sp-16 push, ml385
                          * NULL write, ml557 un-stuck heal); key on it. Keep a much
                          * larger page-level ceiling as the storm safety net. */
-                        static volatile uint64_t stuck_addr;
-                        static volatile uint32_t stuck_page_n;
+                        uint64_t *stuck_page = &stuck_rec[stuck_slot].page;
+                        uint64_t *stuck_pc = &stuck_rec[stuck_slot].pc;
+                        uint64_t *stuck_addr = &stuck_rec[stuck_slot].addr;
+                        uint32_t *stuck_n = &stuck_rec[stuck_slot].n;
+                        uint32_t *stuck_page_n = &stuck_rec[stuck_slot].page_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
+                        if (stuck_fresh) memset( &stuck_rec[stuck_slot], 0, sizeof(stuck_rec[stuck_slot]) );
                         /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
                          * excluded them entirely and a NULL-write loop in
                          * server_ioctl_file ran 3.3M times with no breaker
@@ -4928,28 +5049,34 @@ skip_reclaim_band: ;
                          * had detached). */
                         if (!fpage) fpage = 1;
 
-                        if (fpage == stuck_page && fault_pc_check == stuck_pc &&
-                            (uint64_t)fault_addr != stuck_addr)
+                        if (fpage == *stuck_page && fault_pc_check == *stuck_pc &&
+                            (uint64_t)fault_addr != *stuck_addr)
                         {
                             /* ml876: same page+pc but a NEW address = progress.
                              * Restart the exact-address count; keep the page
                              * storm count (ceiling 20000, logged every 1000). */
-                            uint32_t pn = __sync_add_and_fetch(&stuck_page_n, 1);
-                            stuck_addr = (uint64_t)fault_addr;
-                            stuck_n = 0;
+                            uint32_t pn = ++*stuck_page_n;
+                            *stuck_addr = (uint64_t)fault_addr;
+                            *stuck_n = 0;
                             if ((pn % 1000) == 0)
                                 dprintf(STDERR_FILENO,
                                     "[fault-stuck] ml876 page 0x%llx pc 0x%llx: %u faults, addresses advancing (last 0x%llx)\n",
                                     (unsigned long long)fpage, (unsigned long long)fault_pc_check, pn,
                                     (unsigned long long)fault_addr);
-                            if (pn >= 20000) stuck_n = 49;   /* storm ceiling: next fault breaks */
+                            if (pn >= 20000) *stuck_n = 49;   /* storm ceiling: next fault breaks */
                         }
-                        if (fpage == stuck_page && fault_pc_check == stuck_pc)
+                        /* The SAME address on the same page is no progress whichever
+                         * pc takes it: ml261, the case this breaker was written for,
+                         * alternated two pcs (prologue push, memcpy) over one stack
+                         * address, and a (page, pc) match reset the count on every
+                         * alternation, so it was never caught. */
+                        if (fpage == *stuck_page &&
+                            (fault_pc_check == *stuck_pc || (uint64_t)fault_addr == *stuck_addr))
                         {
-                            uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
-                            /* ml385 LOOP BREAKER: same page AND same pc 50 times
-                             * with zero progress is a livelock, not a recoverable
-                             * fault (guard/watch pages resolve in 1-3). Divert the
+                            uint32_t n = ++*stuck_n;
+                            /* ml385 LOOP BREAKER: same page AND same pc (or the same
+                             * address) 50 times with zero progress is a livelock, not
+                             * a recoverable fault (guard/watch pages resolve in 1-3). Divert the
                              * thread to wine's abort_thread so the pseudo-process
                              * dies cleanly instead of eating the whole run. Native
                              * unix-code faults (dylib pc) can never be delivered
@@ -4968,7 +5095,7 @@ skip_reclaim_band: ;
                                 thread_set_state( thread, ARM_THREAD_STATE64,
                                                   (thread_state_t)&state, count );
                                 handled = 1;
-                                stuck_n = 0;
+                                *stuck_n = 0;
                             }
                             /* ml369: was 2048, which NEVER fired — the
                              * debugger script kills the app after 8
@@ -5016,11 +5143,11 @@ skip_reclaim_band: ;
                         }
                         else
                         {
-                            stuck_page = fpage;
-                            stuck_pc = fault_pc_check;
-                            stuck_addr = (uint64_t)fault_addr;
-                            stuck_n = 0;
-                            stuck_page_n = 0;
+                            *stuck_page = fpage;
+                            *stuck_pc = fault_pc_check;
+                            *stuck_addr = (uint64_t)fault_addr;
+                            *stuck_n = 0;
+                            *stuck_page_n = 0;
                         }
                     }
 
@@ -8126,13 +8253,19 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
      * Single server thread services all messages: no atomics needed. */
+    /* The count is per exact key (ios_guard_slot). It was 16 slots chosen by
+     * (key >> 4) & 15, so two faults whose keys shared a slot (two threads, or
+     * one thread at two addresses) reset each other to 1 on every alternation:
+     * neither was ever dispatched, and both went on being declined. */
     if (!is_align)
     {
-        static struct { uint64_t key; uint32_t n; } rep[16];
+        static struct ios_guard_table rep_tab;
+        static uint32_t rep_n[IOS_GUARD_SLOTS];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
-        int slot = (int)((key >> 4) & 15);
-        if (rep[slot].key != key) { rep[slot].key = key; rep[slot].n = 1; return 0; }
-        if (++rep[slot].n < 3) return 0;
+        int rep_fresh;
+        int slot = ios_guard_slot( &rep_tab, key, mach_absolute_time(), &rep_fresh );
+        if (rep_fresh) { rep_n[slot] = 1; return 0; }
+        if (++rep_n[slot] < 3) return 0;
     }
 
 dispatch:
@@ -8236,13 +8369,18 @@ dispatch:
          * ~35 s and this guard killed a healthy game. A real storm refaults the
          * same instruction back to back on one thread, so the slot is chosen by
          * thread and any other fault on that thread restarts the run. */
-        static struct { uint64_t thread, key; uint32_t n; } redeliv[16];
+        /* The thread's slot is found by exact thread port (ios_guard_slot). It
+         * was one of 16 chosen by a hash of the port, so two storming threads
+         * sharing a slot restarted each other's run on every delivery and the
+         * terminal never fired. */
+        static struct ios_guard_table redeliv_tab;
+        static struct { uint64_t key; uint32_t n; } redeliv[IOS_GUARD_SLOTS];
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
-        int rslot = (int)(((uint64_t)thread * 0x9E3779B97F4A7C15ull) >> 60);
-        if (redeliv[rslot].thread != (uint64_t)thread || redeliv[rslot].key != rkey)
+        int rfresh;
+        int rslot = ios_guard_slot( &redeliv_tab, (uint64_t)thread, mach_absolute_time(), &rfresh );
+        if (rfresh || redeliv[rslot].key != rkey)
         {
-            redeliv[rslot].thread = (uint64_t)thread;
             redeliv[rslot].key = rkey;
             redeliv[rslot].n = 1;
         }

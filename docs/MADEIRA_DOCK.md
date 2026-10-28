@@ -176,7 +176,10 @@ arguments are not supported.
    game its own. `env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0` keeps the fixed identity.
 5. **The report.** Dock writes numeric stages to `C:\madeira-dock.txt`.
    Madeira reads only whitelisted numeric fields and the 64-hex client
-   fingerprint (never other guest text), logs changes as `[dock-report]`,
+   fingerprint (never other guest text); every field the pinned host writes is
+   on the list (`tests/host/check-dock-report-fields.py`). A report over 32 KB
+   is read from its newest part on top of what was read before. Madeira logs
+   changes as `[dock-report]`,
    and turns the final `probe-result` into a message. Covered: unsupported
    client build, no licence, a licence Valve's client did not confirm within
    the host's 90 s after sign-in (34), a bad transfer, Valve's own launch
@@ -241,9 +244,11 @@ the Wine desktop instead of the game. Now (`DockStartScreen.swift`) the
 starting screen of a Dock start shows the game's Steam cover and background
 art (public store artwork by App ID), its title, a spinner, a status line
 with the seconds so far, and one row of round glyph buttons (their words are
-VoiceOver labels): **Close session** once Dock has stopped, **Show live log**,
-and **Show desktop** while the desktop is held back. It stays until the
-game's own window is shown.
+VoiceOver labels): **Close session** once Dock has stopped, or once a started
+host has reported nothing new for 2 minutes outside Steam's own waits
+(`DockStartStatus.stalled`; the status line then says so and nothing is closed
+by itself), **Show live log**, and **Show desktop** while the desktop is held
+back. It stays until the game's own window is shown.
 
 The status line follows the furthest stage in the host's report
 (`DockStartStatus`, read once a second):
@@ -258,7 +263,9 @@ The status line follows the furthest stage in the host's report
 | `session-authenticated-online=1` | "Signed in. Waiting for Steam to confirm this game's license…" |
 | `session-requested-app-listed=1` | "License confirmed. Steam is starting the game…" |
 | `ceg-scm`, `ceg-request-busy` or `ceg-request` without `ceg-result` | "Steam is preparing this game's executable…" |
+| `launch-request-submitted=1` without `launch-client-error` | "Asked Steam to start the game. Waiting for its answer…" |
 | `launch-client-error=0` | "The game is starting. Waiting for its window…" |
+| `launch-game-running=1` | "Steam started the game. Waiting for its window…" |
 
 Steam's own waits come first: content the game needs (`launch-update-wait`),
 the game's configuration right after sign-in (`launch-config-wait` with 22 or
@@ -266,7 +273,9 @@ the game's configuration right after sign-in (`launch-config-wait` with 22 or
 reports only numbers; the words are the app's. When the host reports a
 result while the starting screen is up, the screen says "Madeira Dock
 stopped" with the report's words (the host waits for the game it started, so
-a result before any game window means the game did not start).
+a result before any game window means the game did not start). The launch's
+result (`launch-host-result`) counts: the host writes it before Valve's client
+shuts down, and `probe-result` only after that.
 
 **Which window is the game's.** Winios keeps a census of the desktop's
 top-level windows while a Dock start's starting screen is up: per window,

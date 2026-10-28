@@ -228,7 +228,13 @@ enum DockStartStatus {
         if fields["launch-config-wait"] != nil && (fields["launch-client-error"] == "22" || fields["launch-client-error"] == "23") {
             return "Steam is still loading this game's configuration. Waiting for it…"
         }
+        // The stages after the license, newest first (madeira-dock src/launch.c): Steam reports the
+        // game's process running; Steam accepted the launch; the launch request went to Steam.
+        if fields["launch-game-running"] == "1" { return "Steam started the game. Waiting for its window…" }
         if fields["launch-client-error"] == "0" { return "The game is starting. Waiting for its window…" }
+        if fields["launch-request-submitted"] == "1" && fields["launch-client-error"] == nil {
+            return "Asked Steam to start the game. Waiting for its answer…"
+        }
         if ["ceg-scm", "ceg-request-busy", "ceg-request"].contains(where: { fields[$0] != nil }) && fields["ceg-result"] == nil {
             return "Steam is preparing this game's executable…"
         }
@@ -256,6 +262,25 @@ enum DockStartStatus {
 
     /// The host has started (its first report field): the one-time installs are over.
     static func hostStarted(_ fields: [String: String]) -> Bool { fields["probe-start-bits"] != nil }
+
+    /// Seconds without a new field from a started host before the starting screen
+    /// offers Close session. Nothing is closed by itself: a slow start can go on.
+    static let quietAfter = 120.0
+    static let stalledNote = "Nothing new from Steam for 2 minutes and no game window yet. Show desktop to see what is running, or close the session."
+
+    /// The start has gone quiet where nothing bounds it: the host started and has not
+    /// ended, Steam is not in one of its own waits (content, configuration, another
+    /// session, which have their own words), and no field changed for `quiet` s. Once
+    /// Steam reports the game running the host waits for the game without a limit, and
+    /// the starting screen waits for a window it recognises as the game's.
+    static func stalled(_ fields: [String: String], quiet: Double) -> Bool {
+        guard hostStarted(fields), fields["probe-result"] == nil, fields["launch-host-result"] == nil else { return false }
+        if fields["launch-update-wait"] != nil && fields["launch-update-ready"] == nil { return false }
+        if fields["launch-client-error"] != "0" && (fields["launch-session-wait"] != nil || fields["launch-config-wait"] != nil) {
+            return false
+        }
+        return quiet >= quietAfter
+    }
 
     /// The host reported a result. The host waits for the game it started, so a
     /// result while the starting screen is up means no game window appeared; any
@@ -289,8 +314,13 @@ final class DockStartScreen: ObservableObject {
     @Published private(set) var holding = false
     /// A window that may need the user is up behind the starting screen.
     @Published private(set) var attention = false
+    /// The host reported nothing new for DockStartStatus.quietAfter s while the
+    /// starting screen holds: it offers Close session (DockStartStatus.stalled).
+    @Published private(set) var stalled = false
 
     private var hold: SteamLaunchHold?
+    private var lastFields: [String: String] = [:]
+    private var lastProgress = Date()
     private var sceneLines = 0
     private var early = Set<UInt64>()
     private var hostStarted = false
@@ -304,6 +334,7 @@ final class DockStartScreen: ObservableObject {
         winios_window_census_enable(0)
         active = game != nil; appID = game?.id; failure = nil
         exitObserved = false; hostStarted = false; early = []; started = start
+        stalled = false; lastFields = [:]; lastProgress = start
         guard let game, MadeiraConfig.flag("MADEIRA_DOCK_HIDE_DESKTOP") else { return }   // 0: a Dock start's starting screen ends on the desktop's first frame, as before
         let hold = SteamLaunchHold(autoReveal: MadeiraConfig.flag("MADEIRA_DOCK_AUTO_REVEAL"))   // 0: a window that may need the user never reveals the desktop by itself (Show desktop still does)
         self.hold = hold; sceneLines = 0; holding = true
@@ -315,7 +346,7 @@ final class DockStartScreen: ObservableObject {
     func finish() {
         endHold(reason: "session-ended")
         winios_window_census_enable(0)
-        active = false; appID = nil; failure = nil
+        active = false; appID = nil; failure = nil; stalled = false
     }
 
     /// Every 0.5 s from LibraryModel.poll while a session runs. `rendered`: D3D
@@ -328,13 +359,24 @@ final class DockStartScreen: ObservableObject {
         if !exitObserved && MadeiraConfig.flag("MADEIRA_DOCK_STATUS") {   // 0: the starting screen does not watch the host's result
             let current = MainActor.assumeIsolated { MadeiraDock.pollReport() }
             report = current
-            if current.result != nil {
+            // The launch's result ends the start: the host writes it before Valve's client
+            // shuts down, which has no time limit (probe-result comes after that).
+            if current.launchResult != nil {
                 exitObserved = true
-                if let words = DockStartStatus.failure(result: current.result, words: current.failure, launching: model.launching) {
+                if let words = DockStartStatus.failure(result: current.launchResult, words: current.failure, launching: model.launching) {
                     failure = words
-                    LogStore.shared.log("[dock-status] host-ended result=\(current.result ?? 0) starting=\(model.launching ? 1 : 0)", level: .error)
+                    LogStore.shared.log("[dock-status] host-ended result=\(current.launchResult ?? 0) starting=\(model.launching ? 1 : 0)", level: .error)
                     MainActor.assumeIsolated { MadeiraDock.cleanup() }
                 }
+            }
+        }
+        if let report {
+            if report.fields != lastFields { lastFields = report.fields; lastProgress = Date() }
+            let quiet = Date().timeIntervalSince(lastProgress)
+            let now = holding && failure == nil && DockStartStatus.stalled(report.fields, quiet: quiet)
+            if now != stalled {
+                stalled = now
+                if now { LogStore.shared.log("[dock-status] no new host field for \(Int(quiet))s while starting: Close session offered") }
             }
         }
         guard var hold else { return }

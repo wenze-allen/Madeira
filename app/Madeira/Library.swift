@@ -4559,7 +4559,8 @@ struct LibraryHUD: View {
                 // VoiceOver labels. A stopped Dock start can be closed; while a Dock start
                 // holds the desktop back, Show desktop reveals it.
                 HStack(spacing: 14) {
-                    if dockStart.failure != nil {
+                    // A start that stopped, or one that went quiet (DockStartStatus.stalled), can be closed.
+                    if dockStart.failure != nil || dockStart.stalled {
                         launchGlyph("Close session", "stop.circle") { model.requestQuit() }
                     }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
@@ -4610,7 +4611,7 @@ struct LibraryHUD: View {
                     .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 22, height: 0), still: curtained))
                 launchWideStatus.modifier(LaunchEntrance(visible: launchVisible, step: 2, rise: CGSize(width: 22, height: 0), still: curtained))
                 HStack(spacing: 12) {
-                    if dockStart.failure != nil {
+                    if dockStart.failure != nil || dockStart.stalled {
                         launchGlyph("Close session", "stop.circle") { model.requestQuit() }
                     }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
@@ -4712,10 +4713,11 @@ struct LibraryHUD: View {
             let progress = DockInstallers.poll(drive: MadeiraDock.drive)
             // The host starts at once, or after this start's one-time installs finished.
             let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
-            return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
-                                        installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
-                                        waited: Date().timeIntervalSince(hostDue),
-                                        restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
+            let text = DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
+                                            installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
+                                            waited: Date().timeIntervalSince(hostDue),
+                                            restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
+            return dockStart.stalled ? text + "\n" + DockStartStatus.stalledNote : text
         }
     }
 

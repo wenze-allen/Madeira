@@ -18,9 +18,13 @@ This port supplies that unix side in `libntdll_unix.a`, bound by name in
 **By default only 32-bit (WoW64) processes get it.** A 64-bit (ARM64EC)
 process gets the generic stub table, which is what every module without a
 unix side gets and what `winegstreamer` got before this code existed, so the
-64-bit engine behaves exactly as it did. `MADEIRA_WG_64BIT=1` opts 64-bit
-processes in (they also need an arm64ec `winegstreamer.dll`, which is not
-shipped).
+64-bit engine behaves exactly as it did: a 64-bit game's Media Foundation or
+DirectShow playback finds no media backend. `MADEIRA_WG_64BIT=1` (or
+`env.MADEIRA_WG_64BIT = 1` in `madeira.cfg`) opts 64-bit processes in. The
+arm64ec `winegstreamer.dll` they need ships in the app bundle
+(`app/Madeira/arm64ec-windows/winegstreamer.dll`, built by
+`build/wine-pe/build-modules.sh`); the opt-in stays off by default until it
+has been tested game by game.
 
 ## Pieces
 

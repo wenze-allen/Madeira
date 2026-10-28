@@ -282,6 +282,27 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
                 "Steam accepted the launch: waiting for the game's window")
         require(text(listed.merging(["launch-client-error": "17"]) { $1 }) == "License confirmed. Steam is starting the game…",
                 "a refusal without a wait keeps the last stage until the host's result")
+        // The launch stages the report parser keeps since the field cross-check (launch.c).
+        let requested = listed.merging(["launch-client-discovery-published": "1", "launch-request-submitted": "1"]) { $1 }
+        require(text(requested) == "Asked Steam to start the game. Waiting for its answer…", "the launch request went to Steam")
+        require(text(requested.merging(["launch-client-error": "0"]) { $1 }) == "The game is starting. Waiting for its window…", "Steam accepted it")
+        require(text(requested.merging(["launch-client-error": "17"]) { $1 }) == "License confirmed. Steam is starting the game…",
+                "a refusal keeps the last stage")
+        require(text(requested.merging(["launch-client-error": "0", "launch-game-running": "1"]) { $1 }) ==
+                "Steam started the game. Waiting for its window…", "Steam reports the game running")
+        // Close session is offered once a started host goes quiet, except in Steam's own waits.
+        let running = requested.merging(["launch-client-error": "0", "launch-game-running": "1"]) { $1 }
+        require(!D.stalled(running, quiet: 119) && D.stalled(running, quiet: 120), "2 minutes without a new field")
+        require(D.stalled(listed, quiet: 300), "stuck after the license (the CEG service-manager hang)")
+        require(!D.stalled([:], quiet: 900) && !D.stalled(["probe-start-bits": "64", "probe-result": "34"], quiet: 900) &&
+                !D.stalled(running.merging(["launch-host-result": "0"]) { $1 }, quiet: 900), "not before the host started or after it ended")
+        require(!D.stalled(listed.merging(["launch-update-wait": "17", "launch-client-error": "17"]) { $1 }, quiet: 900) &&
+                D.stalled(listed.merging(["launch-update-wait": "17", "launch-update-ready": "2"]) { $1 }, quiet: 900),
+                "a content wait is Steam's own")
+        require(!D.stalled(listed.merging(["launch-session-wait": "35", "launch-client-error": "35"]) { $1 }, quiet: 170) &&
+                !D.stalled(listed.merging(["launch-config-wait": "22", "launch-client-error": "22"]) { $1 }, quiet: 110) &&
+                D.stalled(listed.merging(["launch-session-wait": "35", "launch-client-error": "0"]) { $1 }, quiet: 120),
+                "session and configuration waits are Steam's own until Steam accepts the launch")
 
         // Steam's own waits come first.
         let update = listed.merging(["launch-client-error": "17", "launch-update-wait": "17"]) { $1 }

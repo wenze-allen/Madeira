@@ -1261,6 +1261,27 @@ static void *wine_process_thread(void *arg) {
              * the mapping survives the screen locking. See virtual_ios.c ml1077. */
             {
                 long capMB = (long)madeira_cfg_int("swap-mb", 0);   /* ml1095: madeira.cfg swap-mb = N */
+                /* The cap is the file's real disk use, and the file is sparse: its blocks
+                 * are allocated when guest pages are written back to it. On a nearly full
+                 * volume that write-back has nowhere to go and the guest's access faults.
+                 * Keep the cap within half of the free space (the free space the system
+                 * reports for important use, which counts what it can purge), and leave
+                 * the tier off when that is under its 64 MB minimum. */
+                if (capMB >= 64) {
+                    NSURL *tmp = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+                    NSNumber *freeBytes = nil;
+                    /* the last run's file is replaced below; its blocks are free space too */
+                    [[NSFileManager defaultManager] removeItemAtURL:[tmp URLByAppendingPathComponent:@"madeira-swap.bin"] error:nil];
+                    if ([tmp getResourceValue:&freeBytes forKey:NSURLVolumeAvailableCapacityForImportantUsageKey error:nil] && freeBytes) {
+                        long halfMB = (long)(freeBytes.longLongValue / 2 / (1024 * 1024));
+                        if (capMB > halfMB) {
+                            fprintf(stderr, "[swap] app: cap %ld MB lowered to %ld MB, half of the %lld MB free%s\n",
+                                    capMB, halfMB, freeBytes.longLongValue / (1024 * 1024),
+                                    halfMB < 64 ? " -- under 64 MB: tier OFF" : "");
+                            capMB = halfMB;
+                        }
+                    }
+                }
                 if (capMB >= 64) {
                     NSString *swapPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"madeira-swap.bin"];
                     [[NSFileManager defaultManager] removeItemAtPath:swapPath error:nil];

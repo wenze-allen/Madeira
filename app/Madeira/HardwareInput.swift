@@ -446,11 +446,11 @@ enum StickVelocity {
 }
 
 
-/// Where a point on the game view lands on the Windows screen. The screen is
-/// drawn aspect-fit and centred in the view: MetalBackedView.gameRect for a
-/// program on the game view (its touch mapping, mapTouch, is the same
-/// arithmetic) and the desktop compositor (Winios.m) for the desktop
-/// session. A point in the letterbox clamps to the nearest edge.
+/// Where a point lands on a Windows screen drawn aspect-fit and centred in a
+/// view; a point in the letterbox clamps to the nearest edge. Only Fit: the
+/// absolute mouse route maps through MetalBackedView.guestPoint (the touch
+/// mapping, which follows the display mode and the desktop compositor), and
+/// uses this only for a view that is not the game view.
 enum ScreenMap {
     static func fit(viewW: Double, viewH: Double, screenW: Int, screenH: Int)
         -> (originX: Double, originY: Double, scale: Double) {
@@ -1305,11 +1305,21 @@ final class HardwareInput: ObservableObject {
     /// the game view. Main thread.
     private func postAbsolute(_ p: CGPoint, in view: UIView) {
         let desktop = Self.desktopMode
-        let desk = Self.desktopSize()
-        let sw = desktop ? desk.w : DirectCursorOverlay.screenW
-        let sh = desktop ? desk.h : DirectCursorOverlay.screenH
-        let s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
-                                   viewH: Double(view.bounds.height), screenW: sw, screenH: sh)
+        // The touch mapping (MetalBackedView.guestPoint): the live guest screen, the
+        // session's display mode, and in a desktop session the compositor's layout
+        // including a fitted oversized window. This used to be an aspect fit of a fixed
+        // 1024x768 screen (of the desktop's size in a desktop session) into the view, so
+        // on any other screen size, in Fill/Stretch/Aspect, or over a fitted window the
+        // click landed somewhere else than a tap at the same point.
+        let s: (x: Int32, y: Int32)
+        if let surface = view as? MetalBackedView {
+            let g = surface.guestPoint(p)
+            s = (g.0, g.1)
+        } else {
+            let desk = Self.desktopSize()
+            s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
+                                   viewH: Double(view.bounds.height), screenW: desk.w, screenH: desk.h)
+        }
         setMouseInUse(true)
         if let last = lastAbsolute, last.x == s.x, last.y == s.y { return }
         lastAbsolute = s
@@ -2025,12 +2035,18 @@ final class PointerFallback: NSObject {
 /// CALayer on MetalHostView, the window-level view that presents the game, so
 /// it moves and scales with it; created the first time a mouse is used there.
 /// The image and hotspot are the program's (driver_ios.c extracts them exactly
-/// as for the desktop compositor); positions are Wine screen pixels on the
-/// 1024x768 surface that MetalBackedView.mapTouch also maps to. Main thread.
+/// as for the desktop compositor); positions are Wine screen pixels on the live
+/// guest screen (winios_screen_size) that MetalBackedView.mapTouch also maps to,
+/// and MetalHostView is laid out over exactly that screen. Main thread.
 final class DirectCursorOverlay {
     static let shared = DirectCursorOverlay()
-    static let screenW = 1024
-    static let screenH = 768
+
+    /// The guest screen in pixels, as MetalBackedView.guestSize reads it.
+    static func screenSize() -> (w: Int, h: Int) {
+        var w: Int32 = 0, h: Int32 = 0
+        winios_screen_size(&w, &h)
+        return (w > 0 ? Int(w) : 1024, h > 0 ? Int(h) : 768)
+    }
 
     private var layer: CALayer?
     private var image = winios_direct_cursor_state()
@@ -2066,13 +2082,15 @@ final class DirectCursorOverlay {
         CATransaction.setDisableActions(true)
         l.isHidden = !visible
         if visible {
-            let k = MetalHostView.shared.bounds.width / CGFloat(Self.screenW)
+            // Per axis: Stretch scales the two differently.
+            let screen = Self.screenSize(), host = MetalHostView.shared.bounds
+            let kx = host.width / CGFloat(screen.w), ky = host.height / CGFloat(screen.h)
             let w = serial != 0 ? Int(image.w) : Self.arrowSize.w
             let h = serial != 0 ? Int(image.h) : Self.arrowSize.h
             let hx = serial != 0 ? Int(image.hot_x) : 0
             let hy = serial != 0 ? Int(image.hot_y) : 0
-            l.bounds = CGRect(x: 0, y: 0, width: CGFloat(w) * k, height: CGFloat(h) * k)
-            l.position = CGPoint(x: CGFloat(Int(x) - hx) * k, y: CGFloat(Int(y) - hy) * k)
+            l.bounds = CGRect(x: 0, y: 0, width: CGFloat(w) * kx, height: CGFloat(h) * ky)
+            l.position = CGPoint(x: CGFloat(Int(x) - hx) * kx, y: CGFloat(Int(y) - hy) * ky)
         }
         CATransaction.commit()
     }

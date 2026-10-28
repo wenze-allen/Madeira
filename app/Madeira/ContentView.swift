@@ -342,6 +342,12 @@ final class MetalBackedView: UIView {
         return (Int32(g.x), Int32(g.y))
     }
 
+    /// A hardware pointer at `p` (view-local points) in guest pixels: the touch
+    /// mapping above, so a mouse and a finger at one point land on the same pixel
+    /// in every display mode and in a desktop session's fitted window
+    /// (HardwareInput.postAbsolute). Main thread.
+    func guestPoint(_ p: CGPoint) -> (Int32, Int32) { mapPoint(p) }
+
     // ==================================================================
     // Touch pointer mode (InputSettings.touchMode), in direct and desktop
     // sessions alike:
