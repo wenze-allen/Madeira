@@ -41,6 +41,7 @@
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <sys/sysctl.h>
 
 /* iOS-Madeira ml674: XZR/WZR AS A STORE SOURCE MUST READ ZERO.
  *

@@ -2795,17 +2795,31 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;           /* old value lands here */
                         uint64_t align_mask = (1ULL << size_lg2) - 1;
 
-                        /* An unaligned atomic cannot be emulated atomically. Fall through
-                         * to the discriminator rather than quietly doing something weaker. */
+                        /* An unaligned atomic cannot be emulated with the builtins. Inside
+                         * one 16-byte granule ml2190 runs the hardware SWPAL (LSE2);
+                         * anything else falls through to the discriminator rather than
+                         * quietly doing something weaker. */
                         if (rw_addr & align_mask)
                         {
+                            /* __x holds x0..x28 only: an FP/LR operand is refused */
+                            const int regs_ok = (rs < 29 || rs == 31) && (rt < 29 || rt == 31);
+                            uint64_t in = (rs == 31 || !regs_ok) ? 0 : state.__x[rs];
+                            uint64_t old = 0;
+                            const int lse2 = regs_ok && ios_mach_swp_lse2( rw_addr, size_lg2, in, &old );
                             static int swp_unalign_n;
+
+                            if (lse2)
+                            {
+                                if (rt != 31) state.__x[rt] = old;
+                                emulated = 1;
+                            }
                             if (swp_unalign_n < 4)
                                 dprintf(STDERR_FILENO,
-                                    "[swp-emul] ml626 #%d REFUSING unaligned atomic: insn=0x%08x size=%d "
-                                    "addr=0x%llx rw=0x%llx\n",
-                                    ++swp_unalign_n, insn, 1 << size_lg2,
-                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr);
+                                    "[swp-emul] ml626 #%d %s unaligned atomic: insn=0x%08x size=%d "
+                                    "addr=0x%llx rw=0x%llx%s\n",
+                                    ++swp_unalign_n, lse2 ? "LSE2 SWPAL for" : "REFUSING", insn, 1 << size_lg2,
+                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                    lse2 ? " (ml2190)" : "");
                         }
                         else
                         {
