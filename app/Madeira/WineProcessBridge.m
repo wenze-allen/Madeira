@@ -1732,6 +1732,27 @@ static void *wine_process_thread(void *arg) {
              * the mapping survives the screen locking. See virtual_ios.c ml1077. */
             {
                 long capMB = (long)madeira_cfg_int("swap-mb", 0);   /* ml1095: madeira.cfg swap-mb = N */
+                /* The cap is the file's real disk use, and the file is sparse: its blocks
+                 * are allocated when guest pages are written back to it. On a nearly full
+                 * volume that write-back has nowhere to go and the guest's access faults.
+                 * Keep the cap within half of the free space (the free space the system
+                 * reports for important use, which counts what it can purge), and leave
+                 * the file tier off when that is under its 64 MB minimum. */
+                if (capMB >= 64) {
+                    NSURL *tmp = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+                    NSNumber *freeBytes = nil;
+                    /* the last run's file is replaced below; its blocks are free space too */
+                    [[NSFileManager defaultManager] removeItemAtURL:[tmp URLByAppendingPathComponent:@"madeira-swap.bin"] error:nil];
+                    if ([tmp getResourceValue:&freeBytes forKey:NSURLVolumeAvailableCapacityForImportantUsageKey error:nil] && freeBytes) {
+                        long halfMB = (long)(freeBytes.longLongValue / 2 / (1024 * 1024));
+                        if (capMB > halfMB) {
+                            fprintf(stderr, "[swap] app: cap %ld MB lowered to %ld MB, half of the %lld MB free%s\n",
+                                    capMB, halfMB, freeBytes.longLongValue / (1024 * 1024),
+                                    halfMB < 64 ? " -- under 64 MB: file tier OFF" : "");
+                            capMB = halfMB;
+                        }
+                    }
+                }
                 long onlyPoolMB = capMB >= 64 ? 0 : (long)madeira_cfg_int("donor-pool-mb", 0);
                 unsetenv("MADEIRA_SWAP_DONOR_ONLY");
                 if (onlyPoolMB >= 512 && madeira_cfg_int("donor-only", 1)) {   /* madeira.cfg donor-only = 0: donor-pool-mb without swap-mb does nothing, as before ml2200 */
