@@ -59,6 +59,22 @@ assert(parse("[steam-host] ml2016 session-offline-abi=0\n[steam-host] ml1830 pro
 assert(parse("[steam-host] ml2016 session-offline-logon-result=2\n[steam-host] ml1830 probe-result=51\n").failure!.contains("refused to sign in offline"))
 assert(parse("[steam-host] ml2016 session-offline-logon-state=3\n[steam-host] ml1830 probe-result=52\n").failure!.contains("does not list this game"))
 assert(parse("[steam-host] ml2016 session-offline-ready=1\n").fields["session-offline-ready"] == "1")
+// The launch's own stages are kept, and its end is launch-host-result, written before
+// Valve's client shuts down (probe-result follows that shutdown, which has no limit).
+let ended = parse("[steam-host] ml1830 launch-request-submitted=1\n[steam-host] ml1830 launch-game-running=1\n[steam-host] ml1830 launch-host-result=46\n")
+assert(ended.fields["launch-request-submitted"] == "1" && ended.fields["launch-game-running"] == "1")
+assert(ended.result == nil && ended.launchResult == 46 && ended.failure!.contains("code 46"))
+assert(parse("[steam-host] ml1830 launch-host-result=0\n[steam-host] ml1830 probe-result=33\n").launchResult == 33)
+assert(parse("[steam-host] ml1830 launch-host-result=0\n").failure == nil)
+// A sign-in or licence failure ends before the launch: host-result is written before
+// Valve's client shuts down (madeira-dock src/main.c), and is the end too.
+let licence = parse("[steam-host] ml1830 session-authenticated-online=1\n[steam-host] ml1830 host-result=34\n")
+assert(licence.result == nil && licence.launchResult == 34 && licence.failure!.contains("did not confirm this game's license"))
+assert(parse("[steam-host] ml1830 host-result=0\n[steam-host] ml1830 probe-result=33\n").launchResult == 33)
+// The host's bounded service-manager step timed out (madeira-dock src/scm.c).
+let timedOut = parse("[steam-host] ml2000 ceg-scm-timeout=120\n[steam-host] ml1990 ceg-result=-6\n[steam-host] ml1830 launch-host-result=49\n[steam-host] ml1830 probe-result=49\n")
+assert(timedOut.fields["ceg-scm-timeout"] == "120" && timedOut.failure!.contains("stopped answering"))
+assert(parse("[steam-host] ml1830 invalid-client-directory=1\n[steam-host] ml1830 probe-result=20\n").fields["invalid-client-directory"] == "1")
 let rejected = "[steam-host] ml1830 account=synthetic\n[steam-host] ml1830 token=synthetic\n[steam-host] ml1830 probe-result=2147483648\n[steam-host] ml1830 probe-result=secret\n[steam-host] ml1830 client-sha256=invalid\n[steam-host] unknown probe-result=0\n[steam-host] ml1830 probe-result=0 secret\n"
 assert(parse(rejected).fields.isEmpty)
 assert(parse(String(repeating: "x", count: 32769)).fields.isEmpty)

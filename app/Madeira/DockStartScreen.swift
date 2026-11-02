@@ -328,11 +328,13 @@ final class DockStartScreen: ObservableObject {
         if !exitObserved && MadeiraConfig.flag("MADEIRA_DOCK_STATUS") {   // 0: the starting screen does not watch the host's result
             let current = MainActor.assumeIsolated { MadeiraDock.pollReport() }
             report = current
-            if current.result != nil {
+            // The launch's result ends the start: the host writes it before Valve's client
+            // shuts down, which has no time limit (probe-result comes after that).
+            if current.launchResult != nil {
                 exitObserved = true
-                if let words = DockStartStatus.failure(result: current.result, words: current.failure, launching: model.launching) {
+                if let words = DockStartStatus.failure(result: current.launchResult, words: current.failure, launching: model.launching) {
                     failure = words
-                    LogStore.shared.log("[dock-status] host-ended result=\(current.result ?? 0) starting=\(model.launching ? 1 : 0)", level: .error)
+                    LogStore.shared.log("[dock-status] host-ended result=\(current.launchResult ?? 0) starting=\(model.launching ? 1 : 0)", level: .error)
                     MainActor.assumeIsolated { MadeiraDock.cleanup() }
                 }
             }

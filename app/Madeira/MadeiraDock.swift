@@ -235,9 +235,18 @@ enum MadeiraDock {
     /// The host's report: a bounded set of numeric fields, never arbitrary guest text.
     struct Report {
         var fields: [String: String] = [:]
+        /// The host's own result: written last, after Valve's client shut down.
         var result: Int? { fields["probe-result"].flatMap(Int.init) }
+        /// The start is over: the host's result, or already the one it writes before
+        /// Valve's client is shut down (host-result on every exit path, from a host that
+        /// has it; launch-host-result from a launch), which a starting screen must not
+        /// wait for: that shutdown has no time limit. The same codes; probe-result differs
+        /// only when that shutdown fails afterwards.
+        var launchResult: Int? {
+            result ?? fields["host-result"].flatMap(Int.init) ?? fields["launch-host-result"].flatMap(Int.init)
+        }
         var failure: String? {
-            guard let result, result != 0 else { return nil }
+            guard let result = launchResult, result != 0 else { return nil }
             if result == 30 {
                 if fields["session-unsupported-client"] == "1" || fields["session-user-method-mismatch"] != nil {
                     return "Madeira Dock does not support this Steam client build. Dock only drives client builds it has verified; the log has the client fingerprint and the failed check."
@@ -277,6 +286,8 @@ enum MadeiraDock {
                 case 10: return "Steam is busy with this game (updating or running). Try again in a moment."
                 case -4: return "Steam's Windows service manager could not be started, so Steam could not prepare this game's executable."
                 case -5: return "Steam's Windows service is not installed in Madeira's Windows setup, so Steam could not prepare this game's executable."
+                // A host that bounds its service-manager calls reports ceg-scm-timeout and -6.
+                case -6: return "Madeira's Windows service manager stopped answering, so Steam could not prepare this game's executable. Close the session and start the game again."
                 default: return "Steam could not prepare this game's executable for your account (code \(fields["ceg-result"] ?? "?"))."
                 }
             }
@@ -346,13 +357,35 @@ enum MadeiraDock {
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-request-retry", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-already-prepared", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-start", "ceg-service-start-retry", "ceg-service-stop", "ceg-scm-stopped",
+        "ceg-scm-timeout",
         "game-scm", "game-scm-services", "game-scm-timeout", "launch-keep-alive", "launch-keep-alive-held",
+        // The launch's own stages and its end: without these the starting screen could not tell
+        // "Steam accepted the launch" or "the game is running" from "License confirmed", and did
+        // not see the launch end until Valve's client had shut down.
+        "launch-install-directory-verified", "launch-install-directory-mismatch",
+        "launch-client-discovery-published", "launch-request-submitted", "launch-result-kind", "launch-result-size",
+        "launch-game-running", "launch-game-ended", "launch-discovery-restored", "launch-host-result", "host-result",
+        // Early refusals and the rest of the host's numeric fields (madeira-dock src/main.c,
+        // session.c, probe.c), so an export names the failed step.
+        "disabled-set-MADEIRA_STEAM_HOST_PROBE", "another-probe-or-mutex-error", "invalid-client-directory",
+        "another-client-or-process-query-error", "client-file-or-identity-error", "client-working-directory-error",
+        "Steam_CreateGlobalUser", "Steam_ReleaseUser", "Steam_BReleaseSteamPipe", "Steam_BGetCallback",
+        "Steam_FreeLastCallback", "Steam_BLoggedOn", "CreateInterface", "engine-factory-begin",
+        "session-requires-64-bit-host", "session-user-vtable-rva", "session-cached-credentials-available",
+        "session-cached-account-selected", "session-app-zero-query", "session-invalid-app-query",
+        "bootstrap-disabled", "bootstrap-result", "create-global-user-begin", "create-global-user-failed",
+        "global-user-created", "logged-on-not-ownership", "callback-id", "callback-count", "release-begin",
+        "ownership-unchecked-game-launch-disabled",
         "shutdown-begin", "shutdown-complete", "probe-result"]
     /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015", "ml2016", "ml2020"]
 
+    /// The most of the report read at once. The host rate-limits every field that
+    /// repeats, so a real report stays far below it (a few hundred lines).
+    static let reportLimit = 32768
+
     static func parseReport(_ data: Data) -> Report {
-        guard data.count <= 32768, let text = String(data: data, encoding: .utf8) else { return Report() }
+        guard data.count <= reportLimit, let text = String(data: data, encoding: .utf8) else { return Report() }
         var report = Report()
         // Ignore a partial final line until the writer completes and flushes it.
         for line in text.replacingOccurrences(of: "\r\n", with: "\n")
@@ -380,14 +413,34 @@ enum MadeiraDock {
     }
 
     @MainActor private static var lastReport = Report()
+    @MainActor private static var reportTruncationLogged = false
 
     /// Reads C:\madeira-dock.txt and logs fields that changed ([dock-report]).
     @MainActor static func pollReport() -> Report {
         let url = drive.appendingPathComponent("madeira-dock.txt")
         guard let file = try? FileHandle(forReadingFrom: url) else { return lastReport }
         defer { try? file.close() }
-        guard let data = try? file.read(upToCount: 32769), data.count <= 32768 else { return lastReport }
-        let report = parseReport(data)
+        guard var data = try? file.read(upToCount: reportLimit + 1) else { return lastReport }
+        var report: Report
+        if data.count > reportLimit {
+            // A report past the limit used to be skipped and the last state kept, so the
+            // starting screen stopped following the host for good. Read its newest part,
+            // from its first whole line, on top of the fields already read (the report is
+            // polled from its first line on, so those hold everything before it).
+            guard let end = try? file.seekToEnd(), end > UInt64(reportLimit),
+                  (try? file.seek(toOffset: end - UInt64(reportLimit))) != nil,
+                  let tail = try? file.read(upToCount: reportLimit),
+                  let newline = tail.firstIndex(of: 0x0A) else { return lastReport }
+            data = Data(tail[(newline + 1)...])
+            report = lastReport
+            for (key, value) in parseReport(data).fields { report.fields[key] = value }
+            if !reportTruncationLogged {
+                reportTruncationLogged = true
+                SteamLog.event("[dock-report] report is larger than \(reportLimit) bytes (\(end)); reading its newest part")
+            }
+        } else {
+            report = parseReport(data)
+        }
         for key in report.fields.keys.sorted() where report.fields[key] != lastReport.fields[key] {
             SteamLog.event("[dock-report] \(key)=\(report.fields[key]!)")
         }
@@ -424,6 +477,7 @@ enum MadeiraDock {
     @MainActor static func writeHandoff(account: String, token: String, appID: Int) throws {
         cleanup()
         lastReport = Report()
+        reportTruncationLogged = false
         let report = drive.appendingPathComponent("madeira-dock.txt")
         if FileManager.default.fileExists(atPath: report.path) { try FileManager.default.removeItem(at: report) }
         guard let url = transferURL else { throw DockError.message("Dock's private transfer folder is unavailable.") }

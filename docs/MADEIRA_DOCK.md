@@ -187,8 +187,11 @@ arguments are not supported.
    game its own. `env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0` keeps the fixed identity.
 5. **The report.** Dock writes numeric stages to `C:\madeira-dock.txt`.
    Madeira reads only whitelisted numeric fields and the 64-hex client
-   fingerprint (never other guest text), logs changes as `[dock-report]`,
-   and turns the final `probe-result` into a message. Covered: unsupported
+   fingerprint (never other guest text); every field the pinned host writes is
+   on the list (`tests/host/check-dock-report-fields.py`). A report over 32 KB
+   is read from its newest part on top of what was read before. Madeira logs
+   changes as `[dock-report]`,
+   and turns the host's result into a message. Covered: unsupported
    client build, no licence, a licence Valve's client did not confirm within
    the host's 90 s after sign-in (34), a bad transfer, Valve's own launch
    refusal codes, and per-user executable preparation errors. The game
@@ -280,7 +283,11 @@ the game's configuration right after sign-in (`launch-config-wait` with 22 or
 reports only numbers; the words are the app's. When the host reports a
 result while the starting screen is up, the screen says "Madeira Dock
 stopped" with the report's words (the host waits for the game it started, so
-a result before any game window means the game did not start).
+a result before any game window means the game did not start). The host's
+result counts as soon as it is written: `host-result` on every exit path (from
+a host that writes it) and `launch-host-result` from a launch come before
+Valve's client is shut down, which has no time limit, and `probe-result` only
+after that.
 
 **Which window is the game's.** Winios keeps a census of the desktop's
 top-level windows while a Dock start's starting screen is up: per window,
