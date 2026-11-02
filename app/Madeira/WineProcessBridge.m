@@ -2624,22 +2624,22 @@ static void *wine_process_thread(void *arg) {
         g_wine_running = 0;
         /* ml1184: these belong to the launch that just ended; a later session in this app
          * run gets its own from its game, or madeira.cfg's. */
-        unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM");
-        unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
-        unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
-        unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
-        unsetenv("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
-        unsetenv("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
+        madeira_env_unset("MADEIRA_FASTSYNC"); madeira_env_unset("MADEIRA_FASTSYNC_SEM");
+        madeira_env_unset("MADEIRA_CPU_COUNT"); madeira_env_unset("DXMT_D9_ANISO_LIMIT");
+        madeira_env_unset("FEX_X87REDUCEDPRECISION");   /* ml1184 */
+        madeira_env_unset("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        madeira_env_unset("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
+        madeira_env_unset("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
          * of this app run (GTA V Enhanced runs without them). */
-        unsetenv("MADEIRA_SRV_FGETPATH");
+        madeira_env_unset("MADEIRA_SRV_FGETPATH");
         g_madeira_srv_fgetpath = 0;
-        unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
-        unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
-        unsetenv("MADEIRA_GPU_VENDOR"); unsetenv("MADEIRA_GPU_DEVICE"); unsetenv("MADEIRA_GPU_NAME");
+        madeira_env_unset("MADEIRA_FEX_AVX"); madeira_env_unset("MADEIRA_FRAMEGEN");   /* ml1184 */
+        madeira_env_unset("DXMT_ENABLE_NVEXT"); madeira_env_unset("DXMT_WSI_MONITOR_IDENTITY"); madeira_env_unset("DXMT_WSI_MODE_TABLE");
+        madeira_env_unset("MADEIRA_GPU_VENDOR"); madeira_env_unset("MADEIRA_GPU_DEVICE"); madeira_env_unset("MADEIRA_GPU_NAME");
         /* madeira-bcd: the server's per-launch switches end with the session */
-        unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");
-        unsetenv("MADEIRA_SRV_IDLE_US"); unsetenv("MADEIRA_SRV_LOG_ALL");
+        madeira_env_unset("MADEIRA_SRV_ECO_FOLLOW"); madeira_env_unset("MADEIRA_SRV_DIRECT");
+        madeira_env_unset("MADEIRA_SRV_IDLE_US"); madeira_env_unset("MADEIRA_SRV_LOG_ALL");
         g_madeira_srv_eco_follow = 0; g_madeira_srv_direct = 0;
         g_madeira_srv_idle_us = 0; g_madeira_srv_log_all = 0;
 
@@ -2725,6 +2725,46 @@ int wine_process_start(const char *prefix_path) {
 
 int wine_process_is_running(void) {
     return g_wine_running;
+}
+
+/* An environment write once Wine runs. Wine's start-up copy of
+ * the environment (env_ios.c get_initial_environment) walks `environ` without libc's
+ * lock, so a setenv that grows the array could free it under that walk; these take the
+ * lock the walk holds. A write while Wine runs is logged once per name ("[env]"), the
+ * non-fatal form of "nothing writes the environment after start": the guest copied its
+ * environment at start, so such a write reaches only host code that reads it live. */
+extern void madeira_env_lock(void);
+extern void madeira_env_unlock(void);
+
+static void madeira_env_note(const char *name) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static char seen[32][48];
+    static int count;
+    int i, known = 0;
+    if (!g_wine_running) return;
+    pthread_mutex_lock(&lock);
+    for (i = 0; i < count; i++) if (!strncmp(seen[i], name, sizeof(seen[i]) - 1)) known = 1;
+    if (!known && count < 32) snprintf(seen[count++], sizeof(seen[0]), "%s", name);
+    pthread_mutex_unlock(&lock);
+    if (!known) dprintf(STDERR_FILENO, "[env] %s written while Wine runs (locked; host readers only)\n", name);
+}
+
+int madeira_env_set(const char *name, const char *value) {
+    int r;
+    madeira_env_note(name);
+    madeira_env_lock();
+    r = setenv(name, value, 1);
+    madeira_env_unlock();
+    return r;
+}
+
+int madeira_env_unset(const char *name) {
+    int r;
+    madeira_env_note(name);
+    madeira_env_lock();
+    r = unsetenv(name);
+    madeira_env_unlock();
+    return r;
 }
 
 int wine_process_exit_code(void) {

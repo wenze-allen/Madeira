@@ -1663,7 +1663,7 @@ enum StikJITHelper {
         jit26_detach()
         // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
         // is sticky post-detach, so an env flag is the reliable signal.
-        setenv("MADEIRA_DETACHED", "1", 1)
+        madeira_env_set("MADEIRA_DETACHED", "1")   // Wine runs by now: the locked write
         LogStore.shared.log("Debugger detached.", level: .success)
     }
 }

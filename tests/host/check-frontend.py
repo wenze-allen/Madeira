@@ -575,7 +575,8 @@ check(0 <= snap < loop and 'getenv(per_launch[i])' not in bridge[loop:bridge.ind
 per_launch = set(re.findall(r'"([A-Z0-9_]+)"', block(bridge, 'static const char *const per_launch[] =')))
 exported = set(re.findall(r'setenv\("([A-Z0-9_]+)"', block(lib, 'func applyEnvironment()')))
 ended = bridge[bridge.index('g_wine_running = 0;\n        /* ml1184'):]
-ended = set(re.findall(r'unsetenv\("([A-Z0-9_]+)"\)', ended[:ended.index('stopping wineserver')]))
+# madeira_env_unset: the locked unset (check-session-safety.py), since Wine's other threads still run here
+ended = set(re.findall(r'(?:madeira_env_unset|unsetenv)\("([A-Z0-9_]+)"\)', ended[:ended.index('stopping wineserver')]))
 check(exported and exported <= per_launch and per_launch <= ended,
       "ml1184: the per-launch list holds every key applyEnvironment exports, and the session's end unsets them "
       "(missing: %s)" % sorted((exported - per_launch) | (per_launch - ended)))

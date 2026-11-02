@@ -121,7 +121,8 @@ check('static let nameKeys = ["dxgi.customDeviceDesc", "d3d9.customDeviceDesc"]'
       'past DXMT\'s limit the names are dropped (DXGI\'s first) before DXMT_CONFIG is set, not every option')
 per_launch = block(bridge, 'static const char *const per_launch[] =')
 for name in ['MADEIRA_GPU_VENDOR', 'MADEIRA_GPU_DEVICE', 'MADEIRA_GPU_NAME']:
-    check(f'"{name}"' in per_launch and f'unsetenv("{name}");' in bridge, f'{name}: the game\'s choice wins over madeira.cfg and ends with the session')
+    # the session end unsets through madeira_env_unset, the locked unset (check-session-safety.py)
+    check(f'"{name}"' in per_launch and f'madeira_env_unset("{name}");' in bridge, f'{name}: the game\'s choice wins over madeira.cfg and ends with the session')
 
 # The page.
 check('compatLabel("Graphics card the game sees"' in library and 'LibraryPrefs.setGPUCard(id, for: entry.windowsPath)' in library

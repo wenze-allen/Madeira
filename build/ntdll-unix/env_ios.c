@@ -36,6 +36,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 #ifdef HAVE_SYS_PRCTL_H
 # include <sys/prctl.h>
 #endif
@@ -899,12 +900,34 @@ static const char overrides_help_message[] =
     "Example:\n"
     "  WINEDLLOVERRIDES=\"comdlg32=n,b;shell32,shlwapi=b\"\n";
 
+/* The host environment is one process-wide array that
+ * the app's Swift and Objective-C code writes too. getenv/setenv lock it, but
+ * the walk below reads `environ` directly, and a setenv that grows the array
+ * frees the one being walked. Writes the app can make once Wine runs go
+ * through madeira_env_set / madeira_env_unset (WineProcessBridge.m), which
+ * take this lock; the walk holds it. */
+static pthread_mutex_t madeira_env_mutex = PTHREAD_MUTEX_INITIALIZER;
+void madeira_env_lock(void) { pthread_mutex_lock( &madeira_env_mutex ); }
+void madeira_env_unlock(void) { pthread_mutex_unlock( &madeira_env_mutex ); }
+
+static WCHAR *get_initial_environment_locked( SIZE_T *pos, SIZE_T *size );
+
 /*************************************************************************
  *		get_initial_environment
  *
  * Return the initial environment.
  */
 static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
+{
+    WCHAR *env;
+
+    madeira_env_lock();
+    env = get_initial_environment_locked( pos, size );
+    madeira_env_unlock();
+    return env;
+}
+
+static WCHAR *get_initial_environment_locked( SIZE_T *pos, SIZE_T *size )
 {
     char **e;
     WCHAR *env, *ptr, *end;

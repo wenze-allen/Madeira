@@ -413,8 +413,10 @@ enum MadeiraDock {
     /// Removes an unconsumed transfer (session end, sign-out, app start).
     @MainActor static func cleanup() {
         if let url = transferURL { try? FileManager.default.removeItem(at: url) }
-        unsetenv("MADEIRA_DOCK_AUTH_FILE")
-        unsetenv("MADEIRA_DOCK_OFFLINE")
+        // Also called while a session runs (a failed start, Quit): madeira_env_unset, the
+        // write that takes the lock Wine's environment walk holds.
+        madeira_env_unset("MADEIRA_DOCK_AUTH_FILE")
+        madeira_env_unset("MADEIRA_DOCK_OFFLINE")
     }
 
     /// Writes the one-use transfer to protected Application Support storage

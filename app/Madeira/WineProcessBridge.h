@@ -30,6 +30,11 @@ long madeira_stdout_read(void *buf, unsigned long len);
 // Check if Wine process is running
 int wine_process_is_running(void);
 
+/* An environment write that can happen once Wine runs: takes the lock Wine's
+ * environment walk holds (env_ios.c), and is logged once per name. */
+int madeira_env_set(const char *name, const char *value);
+int madeira_env_unset(const char *name);
+
 /* How the last guest program ended. Only meaningful once
  * wine_process_is_running() returns 0. */
 int wine_process_exit_code(void);

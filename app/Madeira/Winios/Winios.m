@@ -1858,6 +1858,35 @@ static void winios_swap_layer_note(NSNumber *key, const char *why) {
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
  * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
  * the shim CFRetains it for DXMT's lifetime handling. */
+/* How long a Wine thread waits for the main thread to make a window's Metal layer. */
+#define WINIOS_LAYER_WAIT_S 10
+
+/* Runs `make` on the main thread and waits for it, at most WINIOS_LAYER_WAIT_S. The
+ * callers are Wine threads creating a swapchain, which may hold Wine
+ * or DXMT locks; an unbounded dispatch_sync would stop both threads for good if the
+ * main thread ever waited on this one. Past the bound the swapchain gets no layer (the
+ * IOSDisplayShim.m callers already handle that), this thread returns and frees what it
+ * holds, and the queued block still runs for the next try: whatever it writes must
+ * outlive the caller (__block storage does). NO when the bound passed. */
+static BOOL winios_run_on_main_bounded(void (^make)(void), const char *what, void *hwnd) {
+    if ([NSThread isMainThread]) {
+        make();
+        return YES;
+    }
+    dispatch_semaphore_t made = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        make();
+        dispatch_semaphore_signal(made);
+    });
+    if (dispatch_semaphore_wait(made, dispatch_time(DISPATCH_TIME_NOW, (int64_t)WINIOS_LAYER_WAIT_S * NSEC_PER_SEC))) {
+        fprintf(stderr, "[main-stall] %s hwnd=%p: the main thread did not make the layer in %d s; "
+                        "this swapchain gets none\n", what, hwnd, WINIOS_LAYER_WAIT_S);
+        fflush(stderr);
+        return NO;
+    }
+    return YES;
+}
+
 CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
     __block CAMetalLayer *result = nil;
     void (^make)(void) = ^{
@@ -1891,8 +1920,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
         }
         result = ml;
     };
-    if ([NSThread isMainThread]) make();
-    else dispatch_sync(dispatch_get_main_queue(), make);
+    if (!winios_run_on_main_bounded(make, "winios_metal_layer_for_hwnd", hwnd)) return nil;
     return result;
 }
 
@@ -1915,8 +1943,7 @@ CAMetalLayer *winios_vulkan_layer_for_hwnd(void *hwnd) {
                 ml.frame.size.width, ml.frame.size.height, (double)ml.contentsScale);
         result = ml;
     };
-    if ([NSThread isMainThread]) make();
-    else dispatch_sync(dispatch_get_main_queue(), make);
+    if (!winios_run_on_main_bounded(make, "winios_vulkan_layer_for_hwnd", hwnd)) return nil;
     return result;
 }
 

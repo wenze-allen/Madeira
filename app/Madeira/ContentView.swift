@@ -2721,7 +2721,27 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     /// `profile` is a library entry whose launch profile applies to this run.
+    /// Wine sessions started in this app run, whatever started them: the library
+    /// (LibraryModel.sessionsThisRun), a Dock start outside it, or the developer screen.
+    private static var wineSessionsThisRun = 0
+
     private func runWineFullSequence(profile: LibraryEntry? = nil) {
+        // One Wine session per app run, enforced where every session
+        // starts. The wineserver keeps the first session's permanent objects (a second
+        // init_registry aborts on \Registry), and settings read once per app run -- about
+        // 60 getenv switches cached in ntdll, win32u, the wineserver and Winios -- keep the
+        // first session's values. The library checked this; the developer screen and a Dock
+        // start outside the library did not. MADEIRA_ONE_SESSION_PER_RUN=0 tries anyway.
+        if Self.wineSessionsThisRun > 0 {
+            guard !MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") else {
+                logStore.log("[session-once] a second Wine session in this app run refused: restart Madeira", level: .error)
+                if library.enabled { library.restartNotice = LibraryModel.restartMessage }
+                if profile != nil { LibraryModel.shared.launchFailed() }
+                return
+            }
+            logStore.log("[session-once] MADEIRA_ONE_SESSION_PER_RUN=0: session \(Self.wineSessionsThisRun + 1) in this app run; "
+                         + "settings read once per app run keep the first session's values", level: .error)
+        }
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             if profile != nil { LibraryModel.shared.launchFailed() }
@@ -3805,6 +3825,7 @@ struct ContentView: View {
         // Call synchronously — caller already waited for wineserver to be ready
         let result = wine_process_start(winePrefixPath)
         if result == 0 {
+            Self.wineSessionsThisRun += 1
             logStore.log("Wine process thread launched", level: .success)
         } else {
             logStore.log("Failed to start Wine process (error: \(result))", level: .error)
