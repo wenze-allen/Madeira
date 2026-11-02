@@ -1,8 +1,9 @@
 # The host checks (tests/host): everything that runs without an iOS device or a Windows build.
 # tests/host/run-all.py runs each check-*.py and fails the job on any FAIL; a check that needs a
 # tool the runner lacks is NOTOOL, and one that fails only beside the others is rerun alone
-# (FLAKY). Linux runs the C, Python and FFmpeg checks; macOS adds the Swift (swiftc, xcrun) and
-# ARM64-assembly ones.
+# (FLAKY). Linux runs the C, Python and FFmpeg checks, and the Swift ones when the runner image
+# has swiftc (they are NOTOOL otherwise); macOS adds the ones whose Swift imports Apple-only
+# modules (Darwin, CryptoKit) or that need xcrun.
 name: host-checks
 
 on:
@@ -36,15 +37,18 @@ jobs:
           cd "$RUNNER_TEMP/wine-build"
           "$GITHUB_WORKSPACE/wine/configure" --without-x --without-mingw --without-freetype \
               --without-gstreamer --enable-win64 > configure.log
-          make -k -j"$(nproc)" $(cd "$GITHUB_WORKSPACE/wine/include" && ls *.idl | sed 's|\(.*\)\.idl|include/\1.h|') \
-              > headers.log 2>&1 || true
+          targets=()
+          for idl in "$GITHUB_WORKSPACE"/wine/include/*.idl; do
+            targets+=("include/$(basename "$idl" .idl).h")
+          done
+          make -k -j"$(nproc)" "${targets[@]}" > headers.log 2>&1 || true
           echo "MADEIRA_WINE_BUILD=$RUNNER_TEMP/wine-build" >> "$GITHUB_ENV"
       - name: Host checks
         run: python3 tests/host/run-all.py -j "$(nproc)"
 
   macos:
-    # The Swift and ARM64 checks. This job was added without a macOS runner to try it on, so
-    # until it has passed once its result does not fail the workflow.
+    # The checks that need Apple's SDK. This job was added without a macOS runner to try it on,
+    # so until it has passed once its result does not fail the workflow.
     runs-on: macos-14
     continue-on-error: true
     timeout-minutes: 120

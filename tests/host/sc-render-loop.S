@@ -87,6 +87,12 @@ pump_done:
     pop rsi
     pop rbx
     ret
+    /* The 15 bytes of padding as the production bytes have them. `.balign 16, 0x90` lets GNU as
+     * pick its multi-byte NOPs, and binutils 2.47 orders this pair the other way round: the same
+     * never-executed padding, different bytes, a failed comparison. The .balign after them is
+     * then a no-op that still checks the alignment. */
+    .byte 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00   /* data16 cs nopw 0(%rax,%rax) */
+    .byte 0x0f, 0x1f, 0x40, 0x00                                              /* nopl 0(%rax) */
 .balign 16, 0x90
 sc_loop_add_ref:
     lock inc dword ptr [rcx+0x38]

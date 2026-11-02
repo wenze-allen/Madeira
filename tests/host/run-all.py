@@ -6,7 +6,8 @@
 
   PASS     the check exited 0;
   NOTOOL   it stopped because a tool this machine lacks is missing (swift / swiftc / xcrun, a
-           configured Wine tree, an ARM64 or macOS toolchain) and printed no FAIL line before;
+           configured Wine tree) and printed no FAIL line before, or its only failure is
+           compiling production Swift that imports an Apple-only module (needs macOS);
   FAIL     everything else -- including a check that printed a FAIL line and THEN stopped on a
            missing tool: its text-level assertions ran, and one of them failed;
   FLAKY    failed while the others ran beside it, passed when run again alone (a timing-sensitive
@@ -30,10 +31,9 @@ NOTOOL = [
     r"SKIP-FAIL: .*(config\.h is missing|configured Wine)",
     r"\b(xcrun|swiftc): (command )?not found",
 ]
-ENV_ONLY = {
-    # need an ARM64 assembler / macOS host, by design (see each check's docstring)
-    "check-sc-ipc-split.py", "check-sc-render-loop.py", "check-srv-doorbell.py",
-}
+# Swift on a non-Apple host has no Apple frameworks: a check whose only failure is compiling
+# production code that imports one needs macOS (its FAIL line is that compile step).
+APPLE_ONLY = r"error: no such module '(Darwin|CryptoKit|UIKit|SwiftUI|AppKit|Network|AVFoundation|GameController|Metal|QuartzCore|CoreGraphics|os)'"
 
 
 def run(path, timeout):
@@ -51,8 +51,9 @@ def run(path, timeout):
     notool = any(re.search(p, out) for p in NOTOOL)
     if notool and not fail_lines:
         return "NOTOOL", dt, next(l for l in out.splitlines()[::-1] if any(re.search(p, l) for p in NOTOOL))
-    if path.name in ENV_ONLY and not fail_lines and code != "timeout":
-        return "NOTOOL", dt, "needs an ARM64 / macOS toolchain: " + (out.strip().splitlines() or [""])[-1][:160]
+    apple = re.search(APPLE_ONLY, out)
+    if apple and fail_lines and all("compile" in l for l in fail_lines):
+        return "NOTOOL", dt, "needs macOS: Swift here has no module %s" % apple.group(1)
     reason = fail_lines[0] if fail_lines else (out.strip().splitlines() or ["exit %s" % code])[-1]
     return "FAIL", dt, reason[:300]
 

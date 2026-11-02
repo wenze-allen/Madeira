@@ -992,7 +992,11 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         do { try MadeiraDock.validate(game, drive: drive, bundled: true) ; require(false, "validate needs the client files") }
         catch { require(error.localizedDescription.contains("client"), "Dock's launch check passes the record and stops at the missing client files only") }
         require(SteamInstallFiles.buildID(appID: 9000, steamApps: steamApps) == build, "the record's build id")
-        require(found.first(where: { $0.id == 9100 })?.installed == true, "the owning app has its own record for the shared depot, as Valve's client requires")
+        // Valve's client needs the owning app's own record; Dock's list leaves such an app out
+        // when it only lends the depot ("Shared Only", MadeiraDock.games since f4f6dca).
+        require(FileManager.default.fileExists(atPath: steamApps.appendingPathComponent("appmanifest_9100.acf").path)
+                && !found.contains(where: { $0.id == 9100 }),
+                "the owning app has its own record for the shared depot, as Valve's client requires, and Dock's list leaves it out (Shared Only)")
         let events = loggedEvents.joined(separator: "\n")
         require(!events.contains("Fixture") && !events.contains("7656119") && !events.contains("tok"), "no name, account or token in the log")
         require(events.contains("[steam-depot] license app=9000 skipped=9004"), "a depot the account neither has a key for nor a license for is left out")

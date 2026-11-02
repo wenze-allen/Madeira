@@ -43,6 +43,8 @@ typedef int semaphore_t;
 static sem_t real_sem;
 static semaphore_t ios_srv_wake_sem = 1;
 #define semaphore_signal(s) sem_post(&real_sem)
+/* build/madeira_cfg.h: no madeira.cfg here, so ios_srv_switch (9db61d5) falls back to getenv */
+static int madeira_cfg_get( const char *key, char *out, size_t cap ) { (void)key; (void)out; (void)cap; return 0; }
 ''' + wake + r'''
 #define NTHREADS 8
 #define NREQ 200000
