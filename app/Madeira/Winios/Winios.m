@@ -1712,6 +1712,9 @@ static void winios_swap_layer_note(NSNumber *key, const char *why) {
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
  * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
  * the shim CFRetains it for DXMT's lifetime handling. */
+/* How long a Wine thread waits for the main thread to make a window's Metal layer. */
+#define WINIOS_LAYER_WAIT_S 10
+
 CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
     __block CAMetalLayer *result = nil;
     void (^make)(void) = ^{
@@ -1745,8 +1748,29 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
         }
         result = ml;
     };
-    if ([NSThread isMainThread]) make();
-    else dispatch_sync(dispatch_get_main_queue(), make);
+    if ([NSThread isMainThread]) {
+        make();
+        return result;
+    }
+    /* Row 19 of the audit: this runs on the Wine thread creating a swapchain, which
+     * may hold Wine or DXMT locks. It used to dispatch_sync to the main thread
+     * without a limit, so a main thread that ever waited on this thread would have
+     * stopped both for good. The wait is bounded: past it the swapchain gets no layer
+     * (IOSDisplayShim.m then fails the creation, which DXMT reports), this thread
+     * returns and frees what it holds, and the queued block still makes the layer
+     * for the next try. `result` is __block, so the block may finish after this
+     * returns. */
+    dispatch_semaphore_t made = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        make();
+        dispatch_semaphore_signal(made);
+    });
+    if (dispatch_semaphore_wait(made, dispatch_time(DISPATCH_TIME_NOW, (int64_t)WINIOS_LAYER_WAIT_S * NSEC_PER_SEC))) {
+        fprintf(stderr, "[main-stall] winios_metal_layer_for_hwnd hwnd=%p: the main thread did not make the "
+                        "layer in %d s; this swapchain gets none\n", hwnd, WINIOS_LAYER_WAIT_S);
+        fflush(stderr);
+        return nil;
+    }
     return result;
 }
 

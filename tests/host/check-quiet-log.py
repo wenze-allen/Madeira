@@ -129,7 +129,7 @@ i_env = br.find('fprintf(stderr, "[madeira-env] game %s=%s\\n", k.UTF8String, v.
 i_set = br.find('g_madeira_srv_fgetpath = (fp && fp[0] == \'1\') ? 1 : 0;')
 check(0 <= i_env < i_set and 'const char *fp = getenv("MADEIRA_SRV_FGETPATH");' in br[i_env:i_set + 10],
       "the bridge sets it from MADEIRA_SRV_FGETPATH after the game's env lines are applied")
-i_end = br.find('unsetenv("MADEIRA_SRV_FGETPATH");')
+i_end = br.find('madeira_env_unset("MADEIRA_SRV_FGETPATH");')
 i_stop = br.find('wineserver_stop();', i_end)
 check(i_end > i_set and 0 <= br.find("g_madeira_srv_fgetpath = 0;", i_end) < i_stop,
       "the session end unsets MADEIRA_SRV_FGETPATH and clears the global before the server stops")

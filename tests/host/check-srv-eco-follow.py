@@ -165,13 +165,13 @@ check("getenv" not in follow and "getenv" not in idle, "the server reads neither
 i_env = BRIDGE.find('fprintf(stderr, "[madeira-env] game %s=%s\\n", k.UTF8String, v.UTF8String);')
 i_set = BRIDGE.find("g_madeira_srv_eco_follow = (ef && ef[0] == '1') ? 1 : 0;")
 i_idle = BRIDGE.find("g_madeira_srv_idle_us = idle > 0 ? idle : 0;")
-i_end = BRIDGE.find('unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");')
+i_end = BRIDGE.find('madeira_env_unset("MADEIRA_SRV_ECO_FOLLOW"); madeira_env_unset("MADEIRA_SRV_DIRECT");')
 i_clear = BRIDGE.find("g_madeira_srv_eco_follow = 0;", i_end)
 i_stop = BRIDGE.find("wineserver_stop();", i_end)
 check("volatile int g_madeira_srv_eco_follow = 0;" in BRIDGE and "volatile int g_madeira_srv_idle_us = 0;" in BRIDGE,
       "the bridge defines both globals, off")
 check(0 <= i_env < i_set and 0 <= i_env < i_idle, "the bridge sets them after the game's env lines")
-check(i_set < i_end < i_clear < i_stop and 'unsetenv("MADEIRA_SRV_IDLE_US");' in BRIDGE[i_end:i_stop] and
+check(i_set < i_end < i_clear < i_stop and 'madeira_env_unset("MADEIRA_SRV_IDLE_US");' in BRIDGE[i_end:i_stop] and
       "g_madeira_srv_idle_us = 0;" in BRIDGE[i_end:i_stop], "the session end clears both before the server stops")
 check(re.search(r'key: "env.MADEIRA_SRV_ECO_FOLLOW", title: "[^"]+", kind: \.bool, defaultValue: "0"', CAT) is not None,
       "the catalog documents env.MADEIRA_SRV_ECO_FOLLOW, default 0")

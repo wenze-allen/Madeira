@@ -574,7 +574,7 @@ check(td.find("int ret, err = errno;") < td.find("ios_srv_direct_call(") < td.fi
 check("volatile int g_madeira_srv_direct = 0;" in BRIDGE, "the bridge defines g_madeira_srv_direct, off")
 i_env = BRIDGE.find('fprintf(stderr, "[madeira-env] game %s=%s\\n", k.UTF8String, v.UTF8String);')
 i_set = BRIDGE.find("g_madeira_srv_direct = (dr && (dr[0] == '1' || dr[0] == '2') && !dr[1]) ? dr[0] - '0' : 0;")
-i_end = BRIDGE.find('unsetenv("MADEIRA_SRV_ECO_FOLLOW"); unsetenv("MADEIRA_SRV_DIRECT");')
+i_end = BRIDGE.find('madeira_env_unset("MADEIRA_SRV_ECO_FOLLOW"); madeira_env_unset("MADEIRA_SRV_DIRECT");')
 i_clear = BRIDGE.find("g_madeira_srv_direct = 0;", i_end)
 i_stop = BRIDGE.find("wineserver_stop();", i_end)
 check(0 <= i_env < i_set and 'const char *dr = getenv("MADEIRA_SRV_DIRECT");' in BRIDGE[i_env:i_set],
