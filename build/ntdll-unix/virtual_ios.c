@@ -1983,29 +1983,53 @@ static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st
  * becomes thinkable. If Steam commits heavily, the demand is real and two pools
  * is the ceiling until CEF itself is made to want less. Record each range and
  * attribute every MEM_COMMIT that lands inside one. */
-#define IOS_BIGRES_MAX 48
+/* 48 -> 256: the release of a range is also what counts a reserve->release cycle
+ * (ios_reserve_cycle_note), and Steam alone keeps 2 x 512MB per thread here, so a
+ * full ledger left a placement livelock uncounted. Any guest thread reserves,
+ * commits and frees, so the ledger has its own lock. */
+#define IOS_BIGRES_MAX 256
 static struct { uint64_t base, size, committed; unsigned commits; } ios_bigres_tab[IOS_BIGRES_MAX];
 static unsigned ios_bigres_cnt;
+static pthread_mutex_t ios_bigres_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void ios_bigres_note( void *base, size_t size )
 {
-    if (!base || ios_bigres_cnt >= IOS_BIGRES_MAX) return;
-    ios_bigres_tab[ios_bigres_cnt].base = (uint64_t)(uintptr_t)base;
-    ios_bigres_tab[ios_bigres_cnt].size = size;
-    ios_bigres_cnt++;
+    static int full_logged;
+    int full;
+
+    if (!base) return;
+    pthread_mutex_lock( &ios_bigres_lock );
+    full = ios_bigres_cnt >= IOS_BIGRES_MAX;
+    if (!full)
+    {
+        ios_bigres_tab[ios_bigres_cnt].base = (uint64_t)(uintptr_t)base;
+        ios_bigres_tab[ios_bigres_cnt].size = size;
+        ios_bigres_tab[ios_bigres_cnt].committed = 0;
+        ios_bigres_tab[ios_bigres_cnt].commits = 0;
+        ios_bigres_cnt++;
+    }
+    pthread_mutex_unlock( &ios_bigres_lock );
+    if (full && !full_logged)
+    {
+        full_logged = 1;
+        dprintf(2, "[bigres] ledger full (%u ranges): later big reserves are not tracked, nor their reserve->release cycles\n",
+                IOS_BIGRES_MAX);
+    }
 }
 
 static void ios_bigres_commit( void *addr, size_t size )
 {
     uint64_t a = (uint64_t)(uintptr_t)addr;
     unsigned i;
+    pthread_mutex_lock( &ios_bigres_lock );
     for (i = 0; i < ios_bigres_cnt; i++)
         if (a >= ios_bigres_tab[i].base && a < ios_bigres_tab[i].base + ios_bigres_tab[i].size)
         {
             ios_bigres_tab[i].committed += size;
             ios_bigres_tab[i].commits++;
-            return;
+            break;
         }
+    pthread_mutex_unlock( &ios_bigres_lock );
 }
 
 /* ml435 (#73): FEX-band span lifecycle census. ml434 filled the band solid
@@ -2037,31 +2061,74 @@ static void ios_span_census( void *base, size_t size, int is_free )
  * 15.5GB reserved). A same-(tid,size) big reserve that has been GRANTED and
  * immediately RELEASED dozens of times will never converge — after the cap,
  * deny it outright so the guest takes its own named failure path instead of
- * spinning. Keyed on (tid, size to 16MB granularity); 8 slots, evict-on-
- * collision, approximate by design. */
-static struct { unsigned tid; uint64_t size16m; unsigned cycles; } ios_rescycle[8];
+ * spinning. Keyed on (tid, size to 16MB granularity).
+ *
+ * Exact key in a 64-slot table. It was 8 slots chosen by (tid ^ size16m) & 7,
+ * evict-on-collision, and Wine's tids are multiples of 4 (server/process.c
+ * ptid_from_index): for one size every thread fell in one of 2 slots, so two
+ * threads cycling in turn reset each other's count to 1 and the deny never
+ * fired. A key quiet for IOS_RESCYCLE_IDLE_MS starts over (the livelock cycles
+ * back to back; an exact table would otherwise keep a thread's lifetime count),
+ * except one already at IOS_RESCYCLE_DENY, which stays denied as before; a full
+ * table replaces its least recently cycled key that is not denied. Any guest
+ * thread frees memory, so the table has its own lock. */
+#define IOS_RESCYCLE_SLOTS 64
+#define IOS_RESCYCLE_IDLE_MS 10000ull
+#define IOS_RESCYCLE_DENY 32
+static struct { unsigned tid; uint64_t size16m; unsigned cycles; unsigned long long last_ms; } ios_rescycle[IOS_RESCYCLE_SLOTS];
+static pthread_mutex_t ios_rescycle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A slot is live while it has cycles and was cycled recently, or is denied. */
+static int ios_rescycle_live( unsigned i, unsigned long long now )
+{
+    return ios_rescycle[i].cycles &&
+           (ios_rescycle[i].cycles >= IOS_RESCYCLE_DENY || now - ios_rescycle[i].last_ms <= IOS_RESCYCLE_IDLE_MS);
+}
+
 static void ios_reserve_cycle_note( unsigned tid, uint64_t size )
 {
     uint64_t s16 = size >> 24;
-    unsigned i, slot = (tid ^ (unsigned)s16) & 7;
-    for (i = 0; i < 8; i++)
-        if (ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
+    unsigned long long now = ios_now_ms();
+    unsigned i, slot = IOS_RESCYCLE_SLOTS;
+
+    pthread_mutex_lock( &ios_rescycle_lock );
+    for (i = 0; i < IOS_RESCYCLE_SLOTS; i++)
+        if (ios_rescycle[i].cycles && ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
         {
+            if (!ios_rescycle_live( i, now )) ios_rescycle[i].cycles = 0;
             ios_rescycle[i].cycles++;
+            ios_rescycle[i].last_ms = now;
+            pthread_mutex_unlock( &ios_rescycle_lock );
             return;
         }
+    for (i = 0; i < IOS_RESCYCLE_SLOTS; i++)
+    {
+        if (!ios_rescycle_live( i, now )) { slot = i; break; }
+        if (ios_rescycle[i].cycles >= IOS_RESCYCLE_DENY) continue;
+        if (slot == IOS_RESCYCLE_SLOTS || ios_rescycle[i].last_ms < ios_rescycle[slot].last_ms) slot = i;
+    }
+    if (slot == IOS_RESCYCLE_SLOTS) slot = (unsigned)(now % IOS_RESCYCLE_SLOTS);   /* all 64 denied */
     ios_rescycle[slot].tid = tid;
     ios_rescycle[slot].size16m = s16;
     ios_rescycle[slot].cycles = 1;
+    ios_rescycle[slot].last_ms = now;
+    pthread_mutex_unlock( &ios_rescycle_lock );
 }
 static unsigned ios_reserve_cycle_count( unsigned tid, uint64_t size )
 {
     uint64_t s16 = size >> 24;
-    unsigned i;
-    for (i = 0; i < 8; i++)
-        if (ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
-            return ios_rescycle[i].cycles;
-    return 0;
+    unsigned long long now = ios_now_ms();
+    unsigned i, cycles = 0;
+
+    pthread_mutex_lock( &ios_rescycle_lock );
+    for (i = 0; i < IOS_RESCYCLE_SLOTS; i++)
+        if (ios_rescycle[i].cycles && ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
+        {
+            if (ios_rescycle_live( i, now )) cycles = ios_rescycle[i].cycles;
+            break;
+        }
+    pthread_mutex_unlock( &ios_rescycle_lock );
+    return cycles;
 }
 
 /* ml433 (#72): drop released ranges so [bigres-use] stops double-counting the
@@ -2070,24 +2137,28 @@ static unsigned ios_reserve_cycle_count( unsigned tid, uint64_t size )
  * to 9 times). Exact-base match only: jumbo grants are released whole. */
 static void ios_bigres_release( void *base )
 {
-    uint64_t a = (uint64_t)(uintptr_t)base;
+    uint64_t a = (uint64_t)(uintptr_t)base, size = 0;
     unsigned i;
+    pthread_mutex_lock( &ios_bigres_lock );
     for (i = 0; i < ios_bigres_cnt; i++)
     {
         if (ios_bigres_tab[i].base != a) continue;
-        dprintf(2, "[bigres-free] 0x%llx +%lluMB released rev=ml433\n",
-                (unsigned long long)a, (unsigned long long)(ios_bigres_tab[i].size >> 20));
-        ios_reserve_cycle_note( NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
-                                ios_bigres_tab[i].size );
+        size = ios_bigres_tab[i].size;
         ios_bigres_tab[i] = ios_bigres_tab[--ios_bigres_cnt];
-        return;
+        break;
     }
+    pthread_mutex_unlock( &ios_bigres_lock );
+    if (!size) return;
+    dprintf(2, "[bigres-free] 0x%llx +%lluMB released rev=ml433\n",
+            (unsigned long long)a, (unsigned long long)(size >> 20));
+    ios_reserve_cycle_note( NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0, size );
 }
 
 static void ios_bigres_report( const char *why )
 {
     unsigned i;
     unsigned long long res = 0, com = 0, touched = 0;
+    pthread_mutex_lock( &ios_bigres_lock );
     for (i = 0; i < ios_bigres_cnt; i++)
     {
         res += ios_bigres_tab[i].size;
@@ -2108,6 +2179,7 @@ static void ios_bigres_report( const char *why )
         dprintf(2, "[bigres-use]   0x%llx +%lluMB committed=%lluMB in %u calls\n",
                 ios_bigres_tab[i].base, ios_bigres_tab[i].size >> 20,
                 ios_bigres_tab[i].committed >> 20, ios_bigres_tab[i].commits);
+    pthread_mutex_unlock( &ios_bigres_lock );
 }
 
 
@@ -8360,6 +8432,51 @@ static int ios_tid_is_dead( unsigned tid )
 {
     if (tid >= sizeof(ios_tid_dead) * 8) return 0;
     return (ios_tid_dead[tid >> 3] >> (tid & 7)) & 1;
+}
+
+/* ml462 (#77): the steer valve's per-tid intake cap (NtAllocateVirtualMemory). The
+ * valve was sized for the ~25-55 legitimate leaked-per-thread reserves it was built
+ * for (ml171); ml461's livelock fed it an INFINITE stream from two tids and it
+ * spilled 15.5GB into the FEX band before the process starved. No sane consumer
+ * needs more than IOS_STEER_CAP steered arenas; past that, stop feeding it.
+ *
+ * Keyed on the EXACT tid in a 64-slot table. It was 16 slots that were never
+ * freed: once 16 threads had steered, every later thread went to slot tid & 15,
+ * and Wine's tids are multiples of 4 and never reused here (server/process.c
+ * ml400), so later threads shared 4 slots, two of them in one slot reset each
+ * other's count at every ask, and the cap never applied. A full table replaces a
+ * thread that has exited, else the one with the fewest arenas, so a capped thread
+ * stays capped. Any guest thread reserves, so the table has its own lock. Returns
+ * 1 when this ask may steer (and counts it), 0 at the cap. */
+#define IOS_STEER_CAP 24
+#define IOS_STEER_TIDS 64
+static struct { unsigned tid; unsigned n; } ios_steer_tid[IOS_STEER_TIDS];
+static pthread_mutex_t ios_steer_tid_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ios_steer_intake( unsigned tid )
+{
+    unsigned i, slot = IOS_STEER_TIDS, n;
+
+    pthread_mutex_lock( &ios_steer_tid_lock );
+    for (i = 0; i < IOS_STEER_TIDS; i++)
+        if (ios_steer_tid[i].n && ios_steer_tid[i].tid == tid) { slot = i; break; }
+    if (slot == IOS_STEER_TIDS)
+    {
+        for (i = 0; i < IOS_STEER_TIDS; i++)
+        {
+            if (!ios_steer_tid[i].n || ios_tid_is_dead( ios_steer_tid[i].tid )) { slot = i; break; }
+            if (slot == IOS_STEER_TIDS || ios_steer_tid[i].n < ios_steer_tid[slot].n) slot = i;
+        }
+        ios_steer_tid[slot].tid = tid;
+        ios_steer_tid[slot].n = 0;
+    }
+    n = ios_steer_tid[slot].n;
+    if (n <= IOS_STEER_CAP) ios_steer_tid[slot].n++;   /* stops one past the cap: logged once */
+    pthread_mutex_unlock( &ios_steer_tid_lock );
+    if (n == IOS_STEER_CAP)
+        dprintf(2, "[steer] tid=%04x CAPPED at %d steered arenas — refusing further FEX-band spill rev=ml462\n",
+                tid, IOS_STEER_CAP);
+    return n < IOS_STEER_CAP;
 }
 
 /* Release every steered range whose owning thread has exited. Returns bytes freed.
@@ -32689,7 +32806,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 unsigned ctid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
                 unsigned cyc = ios_reserve_cycle_count( ctid, *size_ptr );
                 static unsigned cr_logs;
-                if (cyc >= 32)
+                if (cyc >= IOS_RESCYCLE_DENY)
                 {
                     if (cr_logs < 16)
                         dprintf(2, "[coderange] DENY tid=%04x size=0x%lx cycles=%u — placement livelock, failing honestly rev=ml462\n",
@@ -32726,34 +32843,11 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 SIZE_T want = *size_ptr;
                 void *saved = *ret;
                 static unsigned steer_n;
-                /* ml462 (#77): per-tid intake cap. The valve was sized for the
-                 * ~25-55 legitimate leaked-per-thread reserves it was built for
-                 * (ml171); ml461's livelock fed it an INFINITE stream from two
-                 * tids and it spilled 15.5GB into the FEX band before the
-                 * process starved. No sane consumer needs more than 24 steered
-                 * arenas; past that, stop feeding it — the ask falls through to
-                 * the normal path and fails honestly. */
-                static struct { unsigned tid; unsigned n; } steer_tid[16];
-                unsigned sti, sslot = 0xffff;
+                /* ml462 (#77): per-tid intake cap (ios_steer_intake); past it the ask
+                 * falls through to the normal path and fails honestly. */
                 unsigned stid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
-                for (sti = 0; sti < 16; sti++)
+                if (ios_steer_intake( stid ))
                 {
-                    if (steer_tid[sti].tid == stid) { sslot = sti; break; }
-                    if (sslot == 0xffff && !steer_tid[sti].tid) sslot = sti;
-                }
-                if (sslot == 0xffff) sslot = stid & 15;
-                if (steer_tid[sslot].tid != stid) { steer_tid[sslot].tid = stid; steer_tid[sslot].n = 0; }
-                if (steer_tid[sslot].n >= 24)
-                {
-                    if (steer_tid[sslot].n == 24)
-                    {
-                        steer_tid[sslot].n++;
-                        dprintf(2, "[steer] tid=%04x CAPPED at 24 steered arenas — refusing further FEX-band spill rev=ml462\n", stid);
-                    }
-                }
-                else
-                {
-                steer_tid[sslot].n++;
                 /* ml169: `limit` is 0 here ("unconstrained"), so passing it as limit_high
                  * described the EMPTY range [ios_spill_cap, 0) and every steer failed with
                  * *ret = 0x0. The upper bound has to be a real address: use the host VA
