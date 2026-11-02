@@ -75,8 +75,12 @@ require('HStack(spacing: 14)' in row, 'one row of glyph buttons')
 order = [row.index('"Close session", "stop.circle"'), row.index('"Hide live log" : "Show live log", "text.alignleft"'),
          row.index('"Show desktop", "macwindow"')]
 require(order == sorted(order), 'glyph order: close session, live log, show desktop')
-require('if dockStart.failure != nil {' in row and 'if dockStart.holding {' in row and 'dockStart.showDesktop(model)' in row,
-        'close session only once the Dock stopped; show desktop only while the desktop is held back')
+require('} else if dockStart.failure != nil || dockStart.stalled {' in row and 'if dockStart.holding {' in row
+        and 'dockStart.showDesktop(model)' in row,
+        'close session only once the Dock stopped or went quiet; show desktop only while the desktop is held back')
+require(row.index('if model.closing {') < row.index('"Close Madeira now", "xmark.circle"') < row.index('"Close session", "stop.circle"')
+        and 'model.closeApp(reason: "Close Madeira now")' in row,
+        'once Close session was pressed, the same place closes Madeira at once')
 require('Text("Madeira Dock stopped")' in library and 'DockInstallers.note' in library and 'DockStartStatus.text(' in library,
         'the starting screen shows the Dock status, the one-time-install note, and a stop with its words')
 status = library[library.index('    private var dockStatus: String {'):]

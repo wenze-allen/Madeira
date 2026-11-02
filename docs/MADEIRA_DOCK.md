@@ -248,7 +248,11 @@ VoiceOver labels): **Close session** once Dock has stopped, or once a started
 host has reported nothing new for 2 minutes outside Steam's own waits
 (`DockStartStatus.stalled`; the status line then says so and nothing is closed
 by itself), **Show live log**, and **Show desktop** while the desktop is held
-back. It stays until the game's own window is shown.
+back. It stays until the game's own window is shown. Close session closes
+Madeira like the session menu's Quit game (docs/LIBRARY.md): once the session
+ends, or 31 s after Steam's game stopped running (by the host's report:
+`launch-game-running` until `launch-game-ended` or the launch's result), and the
+same glyph then reads **Close Madeira now**.
 
 The status line follows the furthest stage in the host's report
 (`DockStartStatus`, read once a second):

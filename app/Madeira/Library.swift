@@ -745,6 +745,23 @@ final class LibraryModel: ObservableObject {
     var blocksGameplayTouch: Bool { preparing != nil || (current != nil && (menu || launching)) }
     private var timer: Timer?
     private var sawProcess = false
+    /// Quit game, and the starting screen's Close session, close Madeira itself, as
+    /// "Upload saves and close Madeira" does: a second Wine session cannot start in
+    /// this app run (sessionsThisRun), so going back to the library only led to
+    /// "Restart Madeira". The game is still asked to close first (Alt+F4) so it can
+    /// save. Madeira closes when the session ends, or `closeGrace` s after the game
+    /// stopped running when the rest of Windows does not end by itself (a Dock host
+    /// still shutting Steam down, or one that stopped answering). Close Madeira now
+    /// (closeApp) closes it at once.
+    @Published private(set) var closing = false
+    private var gameStoppedAt: Date?
+    private var appClosing = false
+    /// The session is a Madeira Dock start: Steam starts its game (DockStartScreen).
+    private var dockSession = false
+    /// Longer than the wineserver's periodic registry save (30 s, wine/server/registry.c),
+    /// so what the game wrote to the registry before it stopped is on disk.
+    static let closeGrace = 31.0
+    static var quitClosesApp: Bool { MadeiraConfig.flag("MADEIRA_QUIT_CLOSES_APP") }   // 0: Quit only asks the game to close; the session ends when it exits and Madeira returns to the library, as before
     // Why a session ended by itself (not Quit): the program the app launched
     // exited with a Windows error (wine_crash_exit_status, WineProcessBridge.m).
     // MADEIRA_EXIT_REPORT=0 returns to the library without a message.
@@ -1207,6 +1224,7 @@ final class LibraryModel: ObservableObject {
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
         quitRequested = false
+        closing = false; gameStoppedAt = nil; dockSession = dock != nil
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
@@ -1273,7 +1291,8 @@ final class LibraryModel: ObservableObject {
         if wine_process_is_running() != 0 {
             sawProcess = true
             if sessionMessage == "Starting…" { sessionMessage = "" }
-        } else if sawProcess && wineserver_is_running() == 0 { finish() }
+        } else if sawProcess && wineserver_is_running() == 0 { finish(); return }
+        if closing { closeOnceStopped() }
         // The first frame gives Aspect and Fill height the drawable's shape.
         if current != nil, !laidOutAfterFirstPresent, madeira_get_present_count() != MetalBackedView.presentCountAtLaunch {
             laidOutAfterFirstPresent = true
@@ -1349,9 +1368,49 @@ final class LibraryModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             winios_post_key(0x73, 0); winios_post_key(0x12, 0)
         }
-        sessionMessage = "Close requested. Confirm any in-game exit dialog."
         menu = false
-        fputs("[frontend] graceful close requested\n", stderr)
+        closing = Self.quitClosesApp
+        gameStoppedAt = nil
+        sessionMessage = closing ? "Closing the game. Confirm any in-game exit dialog; Madeira closes once the game has quit."
+                                 : "Close requested. Confirm any in-game exit dialog."
+        fputs("[frontend] graceful close requested\(closing ? "; Madeira closes after the game" : "")\n", stderr)
+    }
+
+    /// Quit's wait (poll): the game stopped running and the session has not ended
+    /// (finish closes Madeira then) within closeGrace s: close Madeira anyway.
+    private func closeOnceStopped() {
+        let running: Bool
+        if dockSession {
+            // Steam starts a Dock session's game: it runs from launch-game-running until
+            // launch-game-ended or the launch's result (madeira-dock src/launch.c).
+            let report = MainActor.assumeIsolated { MadeiraDock.pollReport() }
+            running = report.fields["launch-game-running"] == "1" && report.fields["launch-game-ended"] == nil
+                && report.launchResult == nil
+        } else {
+            running = wine_process_is_running() != 0   // the launched program and the children it started
+        }
+        if running { gameStoppedAt = nil; return }
+        guard let stopped = gameStoppedAt else {
+            gameStoppedAt = Date()
+            fputs("[frontend] the game is not running: Madeira closes when the session ends, at most \(Int(Self.closeGrace)) s from now\n", stderr)
+            return
+        }
+        if Date().timeIntervalSince(stopped) >= Self.closeGrace {
+            closeApp(reason: "the session had not ended \(Int(Self.closeGrace)) s after the game stopped")
+        }
+    }
+
+    /// Closes Madeira: the last step of Quit game, or Close Madeira now while it waits.
+    func closeApp(reason: String) {
+        guard !appClosing else { return }
+        appClosing = true
+        timer?.invalidate(); timer = nil
+        saveCurrentProfile()   // finish() saves it too when the session ended first
+        MainActor.assumeIsolated { MadeiraDock.cleanup() }   // a Dock start's one-use sign-in transfer
+        LogStore.shared.log("[frontend] closing Madeira: \(reason)")
+        fputs("[frontend] closing Madeira: \(reason)\n", stderr)
+        sessionMessage = "Closing Madeira…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
     }
     func saveCurrentProfile() {
         let controls = TouchControlsModel.shared
@@ -1394,6 +1453,7 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.shared.setActive(false)
         ThermalPacing.shared.end()
         fputs("[frontend] returned to library\n", stderr)
+        if closing { closeApp(reason: "the session ended after Quit") }
     }
 }
 
@@ -4559,8 +4619,11 @@ struct LibraryHUD: View {
                 // VoiceOver labels. A stopped Dock start can be closed; while a Dock start
                 // holds the desktop back, Show desktop reveals it.
                 HStack(spacing: 14) {
-                    // A start that stopped, or one that went quiet (DockStartStatus.stalled), can be closed.
-                    if dockStart.failure != nil || dockStart.stalled {
+                    // A start that stopped, or one that went quiet (DockStartStatus.stalled), can be closed;
+                    // once asked, Madeira closes (LibraryModel.closing), and the glyph closes it at once.
+                    if model.closing {
+                        launchGlyph("Close Madeira now", "xmark.circle") { model.closeApp(reason: "Close Madeira now") }
+                    } else if dockStart.failure != nil || dockStart.stalled {
                         launchGlyph("Close session", "stop.circle") { model.requestQuit() }
                     }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
@@ -4611,7 +4674,9 @@ struct LibraryHUD: View {
                     .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 22, height: 0), still: curtained))
                 launchWideStatus.modifier(LaunchEntrance(visible: launchVisible, step: 2, rise: CGSize(width: 22, height: 0), still: curtained))
                 HStack(spacing: 12) {
-                    if dockStart.failure != nil || dockStart.stalled {
+                    if model.closing {
+                        launchGlyph("Close Madeira now", "xmark.circle") { model.closeApp(reason: "Close Madeira now") }
+                    } else if dockStart.failure != nil || dockStart.stalled {
                         launchGlyph("Close session", "stop.circle") { model.requestQuit() }
                     }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
@@ -4717,6 +4782,7 @@ struct LibraryHUD: View {
                                             installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
                                             waited: Date().timeIntervalSince(hostDue),
                                             restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
+            if model.closing { return text + "\nClosing Madeira…" }
             return dockStart.stalled ? text + "\n" + DockStartStatus.stalledNote : text
         }
     }
@@ -4832,10 +4898,22 @@ struct LibraryHUD: View {
                 }
                 Divider()
                 // Red label and symbol; the menu's .primary style would otherwise win.
-                Button(role: .destructive) { model.requestQuit() } label: {
-                    Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
-                }.tint(.red)
-                Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
+                if model.closing {
+                    // Quit was pressed: the game may be in its exit dialog, or Windows still ending.
+                    Button(role: .destructive) { model.closeApp(reason: "Close Madeira now") } label: {
+                        Label("Close Madeira now", systemImage: "xmark.circle").foregroundStyle(.red)
+                    }.tint(.red)
+                    Text("Waiting for the game to quit. Madeira closes by itself once it has; this closes it at once. Unsaved progress will be lost.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Button(role: .destructive) { model.requestQuit() } label: {
+                        Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
+                    }.tint(.red)
+                    Text(LibraryModel.quitClosesApp
+                         ? "Asks the game to close, then closes Madeira (open it again to start another game). Unsaved progress will be lost."
+                         : "Closes the running session. Unsaved progress will be lost.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
                 .foregroundStyle(.primary)
         }

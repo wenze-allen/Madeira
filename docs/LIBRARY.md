@@ -264,7 +264,13 @@ in-game menu:
    the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
    `MADEIRA_SESSION_DIAGNOSTICS=1`);
 4. **Quit game** in red. Quit asks the program to close with Alt+F4 through
-   the normal input queue, so it can save; the session ends when it exits.
+   the normal input queue, so it can save, then closes Madeira, as **Upload
+   saves and close Madeira** does: a second session cannot start in the same
+   app run anyway. Madeira closes when the session ends, or 31 s after the
+   game stopped running when the rest of Windows does not end by itself (longer
+   than the wineserver's 30 s registry save). While it waits the menu offers
+   **Close Madeira now**. `env.MADEIRA_QUIT_CLOSES_APP = 0`: Quit only asks the
+   program to close, and Madeira returns to the library when the session ends.
 
 Changes made in the menu (FPS limit, Aspect & scaling, controls, overlay) are
 saved to the game's profile.
