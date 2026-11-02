@@ -294,6 +294,16 @@ static void execute_pending(void)
     running->execute(running);
     assert(!running->release(running));
 }
+/* A stand-in for the browser's original global drain (0x11be60, a guarded range the patch
+ * leaves unchanged). Since 293cd39 the image holds a filler there instead of the helper's
+ * code, so the fixture models it: it drains the loop the helper keeps in its global at
+ * 0x1cea00 -- the BROWSER's, whatever thread calls it -- through run_until_idle (0x1728b0),
+ * and does nothing without one. That is why a renderer must not reach it (legacy-drain). */
+static void ABI original_global_drain(void)
+{
+    struct Loop *loop = *(struct Loop **)(sch_fixture_image + 0x1cea00);
+    if (loop) ((void (ABI *)(struct Loop *))(sch_fixture_image + 0x1728b0))(loop);
+}
 static void stub(char *image, size_t rva, uintptr_t target)
 {
     unsigned char code[12] = {0x48, 0xb8, 0,0,0,0,0,0,0,0, 0xff,0xe0};
@@ -465,6 +475,7 @@ int main(int argc, char **argv)
     stub(image, IOS_SCH_LOOP_DELAYED, (uintptr_t)do_delayed);
     stub(image, IOS_SCH_LOOP_IDLE, (uintptr_t)do_idle);
     stub(image, 0x1728b0, (uintptr_t)run_until_idle);
+    stub(image, 0x11be60, (uintptr_t)original_global_drain);   /* after the patch checked the filler */
     /* Self-written call-frame fixture around the real patched CALL. */
     const unsigned char enter[] = {0x48,0x83,0xec,0x28};
     const unsigned char leave[] = {0x48,0x83,0xc4,0x28,0xc3};
