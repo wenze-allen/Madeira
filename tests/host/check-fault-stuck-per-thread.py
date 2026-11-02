@@ -10,9 +10,11 @@ instruction (each fault is declined from the thread port and then the task port)
 counted as one stuck thread and the next was diverted, and one thread whose handler
 continued past int3 or single-step exceptions at one instruction was diverted after about
 50 of them. No exception reached the program for the diverted thread; Windows delivers
-every one. The state now lives in 16 slots chosen by thread, and every exception delivered
-to the guest (setup_raise_exception, or the Mach-path delivery) starts that thread's count
-again.
+every one. The state is now each thread's own record (ios_guard_slot: exact, not one of 16
+slots chosen by a hash of the thread, where two threads stuck in turn restarted each other's
+run), and every exception delivered to the guest (setup_raise_exception, or the Mach-path
+delivery) starts that thread's count again; the delivery count is kept in 16 slots chosen
+by thread.
 
 Compiles the breaker block verbatim from ios_mach_exception_thread, with the delivery
 counter it reads, against stand-ins for the Mach thread-state calls, under AddressSanitizer
@@ -22,6 +24,8 @@ and UBSan, and checks:
     instruction and address: none diverted;
   * a thread re-faulting at one address with no delivery is still diverted, on its 51st
     decline, also while other threads fault in between;
+  * two threads of one hashed slot stuck in turn are both diverted on their 51st decline;
+  * one thread alternating two pcs over one address (ml261) is diverted on its 51st;
   * the page storm ceiling (same page and pc, addresses advancing, no delivery) still
     diverts after 20000;
   * both delivery paths restart the count, the Mach one only after the frame is written.
@@ -78,6 +82,8 @@ def braced(start):
         i += 1
 
 
+guard = src[src.index('#define IOS_GUARD_SLOTS 64'):]
+guard = guard[:guard.index('    return victim;\n}\n') + len('    return victim;\n}\n')]
 helpers = src[src.index('static volatile unsigned ios_guest_deliv_seq[16];'):]
 helpers = helpers[:helpers.index('\n}\n', helpers.index('static inline void ios_note_guest_delivery( uint64_t thread )')) + 3]
 marker = src.index('LIVELOCK BREAKER, keyed on the faulting PAGE.')
@@ -88,9 +94,10 @@ deliver_fn = function('static int ios_mach_deliver_guest_exception_inner( thread
 # ------------------------------------------------------------------ static
 require('static volatile uint64_t stuck_page;' not in src and 'stuck_n' not in breaker,
         'no app-wide breaker state is left')
-require(breaker.startswith('{\n                        static struct { uint64_t thread, page, pc, addr; uint32_t n, page_n; unsigned seq; } stk[16];')
-        and 'const int ss = ios_fault_slot( (uint64_t)thread );' in breaker,
-        'the breaker state is chosen by the faulting thread')
+require('static struct ios_guard_table stk_tab;' in breaker and 'stk[16]' not in breaker
+        and 'const int ss = ios_guard_slot( &stk_tab, (uint64_t)thread, mach_absolute_time(), &stk_fresh );' in breaker
+        and '&ios_guest_deliv_seq[ios_fault_slot( (uint64_t)thread )]' in breaker,
+        'the breaker state is the faulting thread\'s own record; its delivery count is the thread\'s slot\'s')
 require(before(raise_fn, 'ios_note_guest_delivery( (uint64_t)pthread_mach_thread_np( pthread_self() ) );',
                'send_debug_event( rec, context, TRUE, TRUE );'),
         'setup_raise_exception restarts the count of the thread it raises on')
@@ -155,6 +162,10 @@ static int mach_vm_region( mach_port_t task, mach_vm_address_t *a, mach_vm_size_
     return 1;   /* no region: the map dump stops at once */
 }
 void abort_thread( int status ) { }
+/* the guard tables' clock: 1 us per call at the 24 MHz timebase, so no record goes idle here */
+static uint64_t fake_ticks = 1000;
+static uint64_t mach_absolute_time( void ) { return fake_ticks += 24; }
+int mach_timebase_info( void *p ) { unsigned int *tb = p; tb[0] = 125; tb[1] = 3; return 0; }
 /* [fault-progress] (env.MADEIRA_FAULT_LOOP_GUEST_PROGRESS, opt-in): off here, so never evaluated */
 struct ios_fault_progress { uintptr_t thread; uint64_t frame, rip; };
 static struct ios_fault_progress ios_fault_progress_last;
@@ -247,6 +258,26 @@ int main( void )
     bad |= check( diverted == 1, "... diverted on its 51st decline, the other thread never" );
 
     diverted = 0;
+    stuck = 0x80003;
+    for (other = stuck + 0x100; ios_fault_slot( other ) != ios_fault_slot( stuck ); other += 0x100) ;
+    for (i = 0; i < 50; i++)
+    {
+        decline( stuck, addr, pc );
+        decline( other, addr + 0x40, pc + 8 );
+    }
+    bad |= check( !diverted, "two threads of one slot stuck in turn: neither diverted after 50 declines" );
+    decline( stuck, addr, pc );
+    decline( other, addr + 0x40, pc + 8 );
+    bad |= check( diverted == 2, "... both diverted on their 51st (each has its own record)" );
+
+    diverted = 0;
+    t = 0x88003;
+    for (i = 0; i < 50; i++) decline( t, addr, (i & 1) ? pc : pc + 0x40 );
+    bad |= check( !diverted, "one thread, two pcs in turn over one address (ml261): not diverted after 50 declines" );
+    decline( t, addr, pc + 0x40 );
+    bad |= check( diverted == 1, "... diverted on its 51st" );
+
+    diverted = 0;
     t = 0x60003;
     for (i = 0; i < 49; i++) decline( t, addr, pc );
     ios_note_guest_delivery( t );
@@ -266,7 +297,7 @@ int main( void )
 with tempfile.TemporaryDirectory() as tmp:
     c = Path(tmp) / 'fault_stuck.c'
     exe = Path(tmp) / 'fault_stuck'
-    c.write_text(harness + helpers + harness_main.replace('BREAKER', breaker))
+    c.write_text(harness + guard + helpers + harness_main.replace('BREAKER', breaker))
     build = subprocess.run([CC, '-std=gnu11', '-g', '-O1', '-Wall', '-Wno-unused-function', '-Wno-unused-variable',
                             '-Werror=implicit-function-declaration',
                             '-fsanitize=address,undefined', '-fno-sanitize-recover=undefined', str(c), '-o', str(exe)],
@@ -282,7 +313,7 @@ with tempfile.TemporaryDirectory() as tmp:
         if run.returncode:
             print(run.stderr[-4000:])
         breaks = [l for l in run.stderr.splitlines() if l.startswith('[fault-stuck] BREAKING LOOP')]
-        require(len(breaks) == 3, f'the log names each of the 3 diversions (got {len(breaks)})')
+        require(len(breaks) == 6, f'the log names each of the 6 diversions (got {len(breaks)})')
 
 print('PASS' if not failures else f'FAILED ({failures})')
 sys.exit(1 if failures else 0)

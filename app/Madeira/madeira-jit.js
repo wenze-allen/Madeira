@@ -77,8 +77,11 @@ log(`Madeira JIT: attached = ${attachResponse}`);
 
 let detached = false;
 let pending = null;        // stop packet returned by a continue we already sent
-let lastFaultKey = null;   // "tid:pc" of the last non-BRK stop
-let faultRepeats = 0;
+// tid -> { pc, count }: each thread's last non-BRK stop and how many times in a
+// row it stopped there. One global "tid:pc" key used to be reset by any other
+// thread's stop, so two threads stuck in turn never reached the kill below.
+let lastFault = new Map();
+const lastFaultMax = 512;  // threads come and go; never let the map grow without bound
 let faultLogs = 0;
 let sigLogs = 0;
 // Hard ceiling on UI log lines: each log() drives a SwiftUI update, and it is
@@ -170,9 +173,10 @@ while (!detached) {
         // A raw fault stop escalated past the app's Mach handler. Never skip
         // it. Deliver it back to the process as a unix signal so the app's
         // sigaction handlers (wine segv/bus/ill) get an honest shot at it.
-        let key = `${tid}:${pc}`;
-        faultRepeats = (key === lastFaultKey) ? faultRepeats + 1 : 1;
-        lastFaultKey = key;
+        let last = lastFault.get(tid);
+        let faultRepeats = (last && last.pc === pc) ? last.count + 1 : 1;
+        if (!last && lastFault.size >= lastFaultMax) lastFault.clear();
+        lastFault.set(tid, { pc: pc, count: faultRepeats });
 
         let kcode = medata.length > 0 ? medata[0] : 0;
 
@@ -225,9 +229,9 @@ while (!detached) {
         continue;
     }
 
-    // Genuine BRK from here on — the protocol path.
-    lastFaultKey = null;
-    faultRepeats = 0;
+    // Genuine BRK from here on — the protocol path. Only this thread's run of
+    // repeated fault stops ends here.
+    lastFault.delete(tid);
 
     let brkImm = extractBrkImmediate(instrU32);
 
