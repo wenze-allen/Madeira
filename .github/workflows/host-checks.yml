@@ -1,0 +1,61 @@
+# The host checks (tests/host): everything that runs without an iOS device or a Windows build.
+# tests/host/run-all.py runs each check-*.py and fails the job on any FAIL; a check that needs a
+# tool the runner lacks is NOTOOL, and one that fails only beside the others is rerun alone
+# (FLAKY). Linux runs the C, Python and FFmpeg checks; macOS adds the Swift (swiftc, xcrun) and
+# ARM64-assembly ones.
+name: host-checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential flex bison xz-utils
+      - name: Host FFmpeg builds (cached; built from build/ffmpeg/src by the checks)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/madeira-host-ffmpeg
+          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py') }}
+      - name: Wine headers (a configured tree, for check-wma-decoder.py)
+        run: |
+          mkdir -p "$RUNNER_TEMP/wine-build"
+          cd "$RUNNER_TEMP/wine-build"
+          "$GITHUB_WORKSPACE/wine/configure" --without-x --without-mingw --without-freetype \
+              --without-gstreamer --enable-win64 > configure.log
+          make -k -j"$(nproc)" $(cd "$GITHUB_WORKSPACE/wine/include" && ls *.idl | sed 's|\(.*\)\.idl|include/\1.h|') \
+              > headers.log 2>&1 || true
+          echo "MADEIRA_WINE_BUILD=$RUNNER_TEMP/wine-build" >> "$GITHUB_ENV"
+      - name: Host checks
+        run: python3 tests/host/run-all.py -j "$(nproc)"
+
+  macos:
+    # The Swift and ARM64 checks. This job was added without a macOS runner to try it on, so
+    # until it has passed once its result does not fail the workflow.
+    runs-on: macos-14
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Host FFmpeg builds (cached)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/madeira-host-ffmpeg
+          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py') }}
+      - name: Host checks
+        run: python3 tests/host/run-all.py -j "$(sysctl -n hw.ncpu)"
