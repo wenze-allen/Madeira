@@ -30,6 +30,7 @@ NOTOOL = [
     r"FileNotFoundError: \[Errno 2\] No such file or directory: '[^']*swiftly[^']*'",
     r"SKIP-FAIL: .*(config\.h is missing|configured Wine)",
     r"\b(xcrun|swiftc): (command )?not found",
+    r"^NOTOOL: ",          # a check that says so itself (check-dock-wine.py: no wine / no dockhost.exe)
 ]
 # Swift on a non-Apple host has no Apple frameworks: a check whose only failure is compiling
 # production code that imports one needs macOS (its FAIL line is that compile step).
@@ -48,9 +49,9 @@ def run(path, timeout):
     if code == 0:
         return "PASS", dt, ""
     fail_lines = [l for l in out.splitlines() if re.match(r"\s*FAIL\b", l)]
-    notool = any(re.search(p, out) for p in NOTOOL)
+    notool = any(re.search(p, out, re.M) for p in NOTOOL)
     if notool and not fail_lines:
-        return "NOTOOL", dt, next(l for l in out.splitlines()[::-1] if any(re.search(p, l) for p in NOTOOL))
+        return "NOTOOL", dt, next(l for l in out.splitlines()[::-1] if any(re.search(p, l, re.M) for p in NOTOOL))
     apple = re.search(APPLE_ONLY, out)
     if apple and fail_lines and all("compile" in l for l in fail_lines):
         return "NOTOOL", dt, "needs macOS: Swift here has no module %s" % apple.group(1)
