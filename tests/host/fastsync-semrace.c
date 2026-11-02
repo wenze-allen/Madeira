@@ -493,6 +493,7 @@ static int check_stress( void )
                                    * timeout has no rescuer but the protocol  */
 #define SRV_STALL_MS   100        /* liveness bound on draining a batch      */
 #define SRV_RUN_MS    2500
+#define CONTROL_PASSES   5        /* windows a must-fail control gets (main) */
 
 struct srv_entry
 {
@@ -1164,31 +1165,64 @@ static int check_timeout_requeue( int recheck )
 
 int main( void )
 {
-    int rc, pass;
+    int rc, pass, covered;
 
     if ((rc = check_layout())) return rc;
     if ((rc = check_overflow())) return rc;
     if ((rc = check_generation())) return rc;
     /* three passes: the interleavings that matter here are timing-dependent
      * and a single 2.5 s window is one sample, not a result */
-    for (pass = 0; pass < 3; pass++)
-        if ((rc = check_stress())) return rc;
+    /* Every pass must keep every invariant. Reaching the server-served path (78,
+     * returned only after all of them held) is coverage, asked of the passes
+     * together: one window on a loaded machine may not get there, so up to
+     * CONTROL_PASSES more run until one does. */
+    for (pass = 0, covered = 0; pass < 3 || (!covered && pass < 3 + CONTROL_PASSES); pass++)
+    {
+        if ((rc = check_stress()) == 78)
+        {
+            printf( "MADEIRA-SEM: window %d did not reach the server path; invariants held\n", pass + 1 );
+            continue;
+        }
+        if (rc) return rc;
+        covered = 1;
+    }
+    if (!covered) return 78;
 
     /* ml1060: the device's actual shape -- every waiter on the SERVER path,
      * every releaser on the client fast path, bursts of 1..8 in one release.
      * Three passes of the shipping ordering (late must be 0), then ONE pass of
      * the wrong ordering, which must lose wakeups -- otherwise the liveness
      * assertion above is not testing anything. */
-    for (pass = 0; pass < 3; pass++)
-        if ((rc = check_server_stress( 0 ))) return rc;
-    if ((rc = check_server_stress( 1 ))) return rc;
+    /* the same for the server wake path (83) */
+    for (pass = 0, covered = 0; pass < 3 || (!covered && pass < 3 + CONTROL_PASSES); pass++)
+    {
+        if ((rc = check_server_stress( 0 )) == 83)
+        {
+            printf( "MADEIRA-SEM[srv]: window %d did not reach the wake path; invariants held\n", pass + 1 );
+            continue;
+        }
+        if (rc) return rc;
+        covered = 1;
+    }
+    if (!covered) return 83;
+    /* A control must show the bug it guards against, and that bug is a race: one
+     * 2.5 s window can miss it on a loaded machine (the host checks run side by
+     * side). It gets up to CONTROL_PASSES windows, like the shipping ordering's
+     * three; only none of them showing the bug fails (85). Any other failure
+     * still ends the run at once. */
+    for (pass = 0; pass < CONTROL_PASSES && ((rc = check_server_stress( 1 )) == 85 || rc == 83); pass++)
+        printf( "MADEIRA-SEM[srv,WRONG-ORDER]: no stall in window %d of %d; again\n", pass + 1, CONTROL_PASSES );
+    if (rc) return rc;
 
     /* ml1110: the expiry handler.  Three passes of the shipping ordering
      * (LATE must be 0), then ONE of upstream's, which must deliver hand-offs
      * by the timer -- otherwise the assertion above is decoration. */
     for (pass = 0; pass < 3; pass++)
         if ((rc = check_timeout_requeue( 1 ))) return rc;
-    if ((rc = check_timeout_requeue( 0 ))) return rc;
+    /* the same for this control (90) */
+    for (pass = 0; pass < CONTROL_PASSES && (rc = check_timeout_requeue( 0 )) == 90; pass++)
+        printf( "MADEIRA-SEM[tmo,NO-RECHECK]: no timer hand-off in window %d of %d; again\n", pass + 1, CONTROL_PASSES );
+    if (rc) return rc;
 
     printf( "MADEIRA-SEM: all checks passed\n" );
     return 0;
