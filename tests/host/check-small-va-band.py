@@ -8,9 +8,12 @@ a 40 GB map is refused, and a map with too little free VA left over is refused.
 """
 from pathlib import Path
 import os, subprocess, tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-src = (root / "build/ntdll-unix/virtual_ios.c").read_text()
+src = unit_text(root / "build/ntdll-unix/virtual_ios.c")
 a = src.index("static ULONG_PTR ios_wow_map_end(void)")
 b = src.index("/* One slot below the FEX band's start")
 band = src[a:b]

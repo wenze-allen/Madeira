@@ -24,6 +24,8 @@ import os
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text, unit_of   # build/ntdll-unix's split units, parts in place
 
 ROOT = Path(__file__).resolve().parents[2]
 THREAD = ROOT / "build/ntdll-unix/thread_ios.c"
@@ -61,8 +63,8 @@ def func_body(src, signature):
 
 
 thread = THREAD.read_text(encoding="utf-8")
-virt = VIRT.read_text(encoding="utf-8")
-sig = SIG.read_text(encoding="utf-8")
+virt = unit_text(VIRT)
+sig = unit_text(SIG)
 server = SERVER.read_text(encoding="utf-8")
 
 fn = func_body(thread, "void ios_eco_native_self( const char *who )")
@@ -122,7 +124,7 @@ check('ios_eco_native_self( "wine-stale-heal" );' in heal and heal.index("ios_ec
 exc = func_body(sig, "static void *ios_mach_exception_thread")
 check("pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );" in exc and "ios_eco_native_self" not in exc,
       "the Mach exception thread keeps USER_INTERACTIVE")
-callers = [p.name for p in (ROOT / "build/ntdll-unix").glob("*.c") if "ios_eco_native_self(" in p.read_text(errors="ignore")]
+callers = sorted({unit_of(p) for p in (ROOT / "build/ntdll-unix").glob("*.c") if "ios_eco_native_self(" in p.read_text(errors="ignore")})
 check(sorted(callers) == ["signal_arm64_ios.c", "thread_ios.c", "virtual_ios.c"], "no other thread is moved (%s)" % callers)
 check(not any("ios_eco_native_self" in p.read_text(errors="ignore") for p in WS.glob("*.c")), "the wineserver is untouched")
 start = func_body(thread, "static void start_thread( TEB *teb )")

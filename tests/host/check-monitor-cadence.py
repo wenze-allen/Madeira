@@ -17,9 +17,12 @@ import os
 import re
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-virt = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+virt = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 srv = (root / 'build/ntdll-unix/server_ios.c').read_text()
 
 def function(source, signature):

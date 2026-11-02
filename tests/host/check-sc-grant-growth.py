@@ -15,10 +15,13 @@ Needs python3 and a C compiler.
 from pathlib import Path
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
 
-native = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+native = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 start = native.index('static void ios_sc2_note_growth( uint64_t a, uint64_t size, const struct ios_sc2_gv *gv, void *peb )')
 growth = native[start:native.index('\n}\n', start) + 3]
 enums = native[native.index('enum { IOS_SC2_NONE,'):]

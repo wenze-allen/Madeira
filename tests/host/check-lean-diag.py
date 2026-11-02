@@ -38,6 +38,8 @@ import re
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text, unit_of   # build/ntdll-unix's split units, parts in place
 
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = ROOT / "build/ntdll-unix/server_ios.c"
@@ -93,7 +95,7 @@ def compile_run(code, name, env_list):
 
 
 server = SERVER.read_text(encoding="utf-8")
-virt = VIRT.read_text(encoding="utf-8")
+virt = unit_text(VIRT)
 
 # ---- arming site -----------------------------------------------------------
 arm_at = server.find("if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))")

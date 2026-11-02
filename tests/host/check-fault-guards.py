@@ -32,9 +32,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-sig = (root / 'build/ntdll-unix/signal_arm64_ios.c').read_text()
+sig = unit_text(root / 'build/ntdll-unix/signal_arm64_ios.c')
 
 
 def between(first, last):

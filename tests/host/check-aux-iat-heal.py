@@ -26,10 +26,13 @@ import os
 import struct
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-virtual = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
-signal = (root / 'build/ntdll-unix/signal_arm64_ios.c').read_text()
+virtual = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
+signal = unit_text(root / 'build/ntdll-unix/signal_arm64_ios.c')
 k32 = (root / 'app/Madeira/arm64ec-windows/kernel32.dll').read_bytes()
 ntd = (root / 'app/Madeira/arm64ec-windows/ntdll.dll').read_bytes()
 

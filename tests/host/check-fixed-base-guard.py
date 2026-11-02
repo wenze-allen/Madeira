@@ -24,9 +24,12 @@ from pathlib import Path
 import os
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-src = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+src = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 
 start = src.index('static uint64_t ios_exe_win_base, ios_exe_win_size;')
 commit = src.index('void ios_exe_win_commit_claim( void *base, size_t size, int mapped )\n{')

@@ -20,6 +20,8 @@ widl-generated headers; default: wine/build-macos, the tree build/ntdll-unix/bui
 """
 from pathlib import Path
 import hashlib, os, subprocess, sys, tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
 ntdll_unix = root / "build/ntdll-unix"
@@ -35,7 +37,7 @@ for need in [wine_build / "include/config.h", wine_build / "include/mfobjects.h"
 # wow64 table.
 # The branch is only entered for a wow64 caller or with the switch, so a 64-bit caller without
 # it reaches the generic fallback (the stub table), byte for byte the path it took before.
-virtual = (ntdll_unix / "virtual_ios.c").read_text()
+virtual = unit_text(ntdll_unix / "virtual_ios.c")
 head = '} else if (match && strstr(match, "winegstreamer") && (wow || ios_wg_64bit_opted_in())) {'
 assert virtual.count('strstr(match, "winegstreamer")') == 1, "exactly one winegstreamer branch"
 assert head in virtual, "the winegstreamer branch must be gated on wow || MADEIRA_WG_64BIT"

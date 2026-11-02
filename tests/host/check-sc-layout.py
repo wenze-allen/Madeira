@@ -40,9 +40,12 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-native = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+native = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 swift = (root / 'app/Madeira/StikJITHelper.swift').read_text()
 
 

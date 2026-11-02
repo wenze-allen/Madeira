@@ -43,9 +43,11 @@ import re
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-virt = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+virt = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 failures = []
 
 

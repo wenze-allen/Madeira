@@ -18,9 +18,12 @@ all window code when the session has no window, no placeholder and is not armed.
 """
 from pathlib import Path
 import os, re, subprocess, tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-src = (root / "build/ntdll-unix/virtual_ios.c").read_text()
+src = unit_text(root / "build/ntdll-unix/virtual_ios.c")
 a = src.index("/* ==== WoW64 guest windows: registry and placement ==== */")
 b = src.index("/* ==== end of WoW64 guest windows ==== */")
 block = src[a:b]

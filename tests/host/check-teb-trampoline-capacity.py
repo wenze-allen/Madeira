@@ -7,9 +7,12 @@ import os
 import re
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'build/ntdll-unix/virtual_ios.c').read_text()
+source = unit_text(root / 'build/ntdll-unix/virtual_ios.c')
 assert 'jit_pool_offset = 0x4000;  /* one 16KB iOS page */' in source
 defines = '\n'.join(re.findall(r'^#define IOS_JIT_(?:TRAMPOLINE_SIZE|MAX_SLOTS) .*$', source, re.M))
 assert '#define IOS_JIT_MAX_SLOTS (0x4000 / IOS_JIT_TRAMPOLINE_SIZE)' in defines
