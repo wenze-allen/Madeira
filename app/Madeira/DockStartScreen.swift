@@ -274,7 +274,8 @@ enum DockStartStatus {
     /// Steam reports the game running the host waits for the game without a limit, and
     /// the starting screen waits for a window it recognises as the game's.
     static func stalled(_ fields: [String: String], quiet: Double) -> Bool {
-        guard hostStarted(fields), fields["probe-result"] == nil, fields["launch-host-result"] == nil else { return false }
+        guard hostStarted(fields), fields["probe-result"] == nil, fields["host-result"] == nil,
+              fields["launch-host-result"] == nil else { return false }
         if fields["launch-update-wait"] != nil && fields["launch-update-ready"] == nil { return false }
         if fields["launch-client-error"] != "0" && (fields["launch-session-wait"] != nil || fields["launch-config-wait"] != nil) {
             return false

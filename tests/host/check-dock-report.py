@@ -66,6 +66,11 @@ assert(ended.fields["launch-request-submitted"] == "1" && ended.fields["launch-g
 assert(ended.result == nil && ended.launchResult == 46 && ended.failure!.contains("code 46"))
 assert(parse("[steam-host] ml1830 launch-host-result=0\n[steam-host] ml1830 probe-result=33\n").launchResult == 33)
 assert(parse("[steam-host] ml1830 launch-host-result=0\n").failure == nil)
+// A sign-in or licence failure ends before the launch: host-result is written before
+// Valve's client shuts down (madeira-dock src/main.c), and is the end too.
+let licence = parse("[steam-host] ml1830 session-authenticated-online=1\n[steam-host] ml1830 host-result=34\n")
+assert(licence.result == nil && licence.launchResult == 34 && licence.failure!.contains("did not confirm this game's license"))
+assert(parse("[steam-host] ml1830 host-result=0\n[steam-host] ml1830 probe-result=33\n").launchResult == 33)
 // The host's bounded service-manager step timed out (madeira-dock src/scm.c).
 let timedOut = parse("[steam-host] ml2000 ceg-scm-timeout=120\n[steam-host] ml1990 ceg-result=-6\n[steam-host] ml1830 launch-host-result=49\n[steam-host] ml1830 probe-result=49\n")
 assert(timedOut.fields["ceg-scm-timeout"] == "120" && timedOut.failure!.contains("stopped answering"))

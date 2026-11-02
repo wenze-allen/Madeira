@@ -222,11 +222,14 @@ enum MadeiraDock {
         var fields: [String: String] = [:]
         /// The host's own result: written last, after Valve's client shut down.
         var result: Int? { fields["probe-result"].flatMap(Int.init) }
-        /// The launch is over: the host's result, or already the launch's
-        /// (launch-host-result, written before Valve's client is shut down, which a
-        /// starting screen must not wait for). The same codes; probe-result differs
-        /// only when that shutdown fails after a successful launch.
-        var launchResult: Int? { result ?? fields["launch-host-result"].flatMap(Int.init) }
+        /// The start is over: the host's result, or already the one it writes before
+        /// Valve's client is shut down (host-result, on every exit path, sign-in and
+        /// licence failures included; launch-host-result from a launch), which a
+        /// starting screen must not wait for: that shutdown has no time limit. The same
+        /// codes; probe-result differs only when that shutdown fails afterwards.
+        var launchResult: Int? {
+            result ?? fields["host-result"].flatMap(Int.init) ?? fields["launch-host-result"].flatMap(Int.init)
+        }
         var failure: String? {
             guard let result = launchResult, result != 0 else { return nil }
             if result == 30 {
@@ -342,7 +345,7 @@ enum MadeiraDock {
         // not see the launch end until Valve's client had shut down.
         "launch-install-directory-verified", "launch-install-directory-mismatch",
         "launch-client-discovery-published", "launch-request-submitted", "launch-result-kind", "launch-result-size",
-        "launch-game-running", "launch-game-ended", "launch-discovery-restored", "launch-host-result",
+        "launch-game-running", "launch-game-ended", "launch-discovery-restored", "launch-host-result", "host-result",
         // Early refusals and the rest of the host's numeric fields (madeira-dock src/main.c,
         // session.c, probe.c), so an export names the failed step.
         "disabled-set-MADEIRA_STEAM_HOST_PROBE", "another-probe-or-mutex-error", "invalid-client-directory",

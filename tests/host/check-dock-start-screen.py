@@ -299,7 +299,8 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         require(!D.stalled(running, quiet: 119) && D.stalled(running, quiet: 120), "2 minutes without a new field")
         require(D.stalled(listed, quiet: 300), "stuck after the license (the CEG service-manager hang)")
         require(!D.stalled([:], quiet: 900) && !D.stalled(["probe-start-bits": "64", "probe-result": "34"], quiet: 900) &&
-                !D.stalled(running.merging(["launch-host-result": "0"]) { $1 }, quiet: 900), "not before the host started or after it ended")
+                !D.stalled(running.merging(["launch-host-result": "0"]) { $1 }, quiet: 900) &&
+                !D.stalled(listed.merging(["host-result": "34"]) { $1 }, quiet: 900), "not before the host started or after it ended")
         require(!D.stalled(listed.merging(["launch-update-wait": "17", "launch-client-error": "17"]) { $1 }, quiet: 900) &&
                 D.stalled(listed.merging(["launch-update-wait": "17", "launch-update-ready": "2"]) { $1 }, quiet: 900),
                 "a content wait is Steam's own")

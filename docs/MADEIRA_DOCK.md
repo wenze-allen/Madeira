@@ -277,9 +277,11 @@ the game's configuration right after sign-in (`launch-config-wait` with 22 or
 reports only numbers; the words are the app's. When the host reports a
 result while the starting screen is up, the screen says "Madeira Dock
 stopped" with the report's words (the host waits for the game it started, so
-a result before any game window means the game did not start). The launch's
-result (`launch-host-result`) counts: the host writes it before Valve's client
-shuts down, and `probe-result` only after that.
+a result before any game window means the game did not start). The host's
+result counts as soon as it is written: `host-result` on every exit path (and
+`launch-host-result` from a launch) comes before Valve's client is shut down,
+which has no time limit, and `probe-result` only after that. A sign-in or
+licence failure therefore shows its words at once.
 
 **Which window is the game's.** Winios keeps a census of the desktop's
 top-level windows while a Dock start's starting screen is up: per window,
