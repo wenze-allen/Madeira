@@ -2034,17 +2034,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         uintptr_t lp_rx = (uintptr_t)ios_jit_rx_base_global;
         size_t lp_sz = ios_jit_pool_size_global;
 
-        if (low_rip_guest < 0)
+        int enabled = __atomic_load_n( &low_rip_guest, __ATOMIC_RELAXED );
+        if (enabled < 0)
         {
             const char *e = getenv( "MADEIRA_WOW_LOW_RIP_GUEST" );
-            low_rip_guest = !(e && e[0] == '0' && !e[1]);
+            enabled = !(e && e[0] == '0' && !e[1]);
+            __atomic_store_n( &low_rip_guest, enabled, __ATOMIC_RELAXED );
         }
-        if (low_rip_guest && lp_pc < 0x10000 && (uintptr_t)siginfo->si_addr == lp_pc &&
+        if (enabled && lp_pc < 0x10000 && (uintptr_t)siginfo->si_addr == lp_pc &&
             NtCurrentTeb()->WowTebOffset && lp_lr >= 4 &&
-            ((lp_rx && lp_lr >= lp_rx && lp_lr < lp_rx + lp_sz) || ios_jit_low_contains( lp_lr )))
+            ((lp_rx && lp_lr - 4 >= lp_rx && lp_lr - 4 - lp_rx < lp_sz) || ios_jit_low_contains( lp_lr - 4 )))
         {
             static int low_rip_logged;
-            if (low_rip_logged++ < 16)
+            if (__atomic_fetch_add( &low_rip_logged, 1, __ATOMIC_RELAXED ) < 16)
                 ERR( "[wow-low-rip] guest branch to %p: pc set to the dispatcher's call %p so the "
                      "32-bit program gets the access violation\n", (void *)lp_pc, (void *)(lp_lr - 4) );
             PC_sig(context) = lp_lr - 4;
