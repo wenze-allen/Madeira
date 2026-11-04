@@ -74,6 +74,8 @@ void *ios_jit_current_peb(void) { return cur_peb; }
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real, unsigned long long *size,
                        void **owner )
 { (void)idx; (void)low; (void)real; (void)size; (void)owner; return 0; }
+/* The modelled images are not mapped here; none of them is FEX's own module. */
+static unsigned char ios_image_is_fex( const void *pe_base, size_t size ) { (void)pe_base; (void)size; return 0; }
 void ios_push_subfloor_window( unsigned long long a, unsigned long long b, unsigned long long c, void *owner )
 { (void)a; (void)b; (void)c; (void)owner; }
 static void ios_resolve_fex_exports( void ) { }

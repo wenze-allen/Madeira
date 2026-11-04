@@ -79,6 +79,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-initial-cwd-') as directory:
     src = Path(directory) / 'test.c'
     exe = Path(directory) / 'test'
     src.write_text(program)
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror',
+    # GCC's -Wextra warns on the decoder's deliberate fallthrough; clang's does not
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Wno-implicit-fallthrough', '-Werror',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(src), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

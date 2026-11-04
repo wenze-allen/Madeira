@@ -91,6 +91,14 @@ prelude = r'''
 #include <signal.h>
 #include <sys/mman.h>
 #include <linux/falloc.h>
+#include <pthread.h>
+/* ml1291's deferred punches: a worker thread, the free list under virtual_mutex, and
+ * ml1293's MS_KILLPAGES (Darwin: drop dirty pages before the punch; a plain msync here). */
+#define pthread_setname_np(name) ((void)(name))   /* Darwin's one-argument form */
+#ifndef MS_KILLPAGES
+#define MS_KILLPAGES MS_ASYNC
+#endif
+static pthread_mutex_t virtual_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef unsigned long ULONG_PTR;
 typedef long NTSTATUS;
 #define NT_SUCCESS(s) ((s) >= 0)
@@ -176,9 +184,9 @@ static ssize_t test_pwrite( int fd, const void *buf, size_t len, off_t off )
     return pwrite( fd, buf, len, off );
 }
 #define pwrite( fd, buf, len, off ) test_pwrite( fd, buf, len, off )
-static int virtual_mutex;
-static void server_enter_uninterrupted_section( int *m, sigset_t *s ) { (void)m; (void)s; locked++; }
-static void server_leave_uninterrupted_section( int *m, sigset_t *s ) { (void)m; (void)s; locked--; }
+/* virtual_mutex is the prelude's (ml1291's punch worker locks it); the section only counts depth */
+static void server_enter_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)m; (void)s; locked++; }
+static void server_leave_uninterrupted_section( pthread_mutex_t *m, sigset_t *s ) { (void)m; (void)s; locked--; }
 /* the view table: one image view at most */
 static struct file_view the_view;
 static int have_view;
@@ -392,6 +400,7 @@ static void test_broad_churn_and_census( void )
 
 int main( void )
 {
+    setenv( "MADEIRA_SWAP_PUNCH_DEFER", "0", 1 );     /* ml1291: synchronous punches, ranges back at once (check-swap-coverage.py tests the queue) */
     char path[] = "/tmp/madeira-swapimg-XXXXXX";
     int fd = mkstemp( path );
     if (fd < 0) return 2;

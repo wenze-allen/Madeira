@@ -8,6 +8,7 @@ through the alias, not re-enter the handler. Uses real shared RX/RW mappings
 and ASan/UBSan.
 """
 from pathlib import Path
+import platform
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from source_unit import unit_text   # build/ntdll-unix's split units, parts in place
@@ -294,6 +295,10 @@ int main(void)
     puts("PASS: alias protection preserved; FEX handler stores complete; CASPAL; STP widths, writeback, bounds and registers");
 }
 '''
+# The CASPAL, LDXP and STP cases run the real arm64 instructions (inline asm).
+if platform.machine().lower() not in ('arm64', 'aarch64'):
+    print('NOTOOL: the alias-write helpers run arm64 instructions; this host is %s' % platform.machine())
+    sys.exit(3)
 with tempfile.TemporaryDirectory(prefix='madeira-alias-write-') as tmp:
     src, exe = Path(tmp)/'check.c', Path(tmp)/'check'
     src.write_text(code)
