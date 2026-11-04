@@ -65,6 +65,8 @@ print("PASS: syscall tail, entry stub, park/unpark placement, registration and s
 # ---- Part B: behaviour of the production parking code
 td = mod[mod.index("struct FrontendThreadData {"):mod.index("class WowSyscallHandler;")]
 park = mod[mod.index("static bool IosWowSweepEnabled()"):mod.index("// Returns the HOST address of the 32-bit TEB")]
+# Since FEX 1fac0f655 the parking code sits inside #ifdef FEX_IOS_HOST, whose #endif follows it.
+park = re.sub(r"\n#endif\s*$", "\n", park)
 resume = mod[mod.index("struct IosSyscallResume {"):mod.index("// Same arguments as SyscallHandler::HandleSyscall")]
 code = r"""
 #include <atomic>
