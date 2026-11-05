@@ -9,6 +9,8 @@ BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 DXMT_SRC="$REPO_ROOT/dxmt/src"
 DXMT_ROOT="$REPO_ROOT/dxmt"
+# This repository's DXMT changes (build/dxmt-patches/README.md) go in first.
+bash "$REPO_ROOT/build/dxmt-patches/apply.sh"
 LLVM_SRC="$REPO_ROOT/toolchains/llvm-project/llvm"
 LLVM_BUILD="$REPO_ROOT/toolchains/llvm-ios-build"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -195,6 +197,27 @@ fi
 echo "=== winemetal unix (Objective-C) ==="
 compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
 compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
+
+echo "=== airconv shader headers ==="
+# airconv_context.cpp links three Metal helper libraries into every converted
+# shader (air_msad.h, air_samplepos.h, air_tessellation.h): DXMT's meson makes
+# them with its metalir/xxd generators (src/airconv/meson.build), this script
+# the same way, at the language version and AIR target pinned for
+# dxmt_command below (see there for why both are pinned).
+DXMT_METAL_STD="${DXMT_METAL_STD:-metal3.1}"
+mkdir -p "$BUILD_DIR/shader-headers"
+for name in air_msad air_samplepos air_tessellation; do
+    src="$DXMT_SRC/airconv/shaders/$name.metal"
+    dst="$BUILD_DIR/shader-headers/$name.h"
+    if [ ! -f "$dst" ] || [ "$src" -nt "$dst" ] || [ "$0" -nt "$dst" ]; then
+        xcrun -sdk macosx metal -std="$DXMT_METAL_STD" --target=air64-apple-macos14.0 \
+            -o "$BUILD_DIR/shader-headers/$name.air" -c "$src"
+        xxd -n "$name" -i "$BUILD_DIR/shader-headers/$name.air" "$dst"
+        printf "  %-40s OK (-std=%s)\n" "$name.h" "$DXMT_METAL_STD"
+    else
+        printf "  %-40s CACHED\n" "$name.h"
+    fi
+done
 
 echo "=== airconv (C++ 20, needs LLVM headers) ==="
 for cpp in airconv_context.cpp air_type.cpp air_signature.cpp air_operations.cpp \
