@@ -51,6 +51,11 @@ git-ignored and consumed by the app project.
 3. Wine (submodule, branch madeira-lgpl):
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
+     `build/wineserver/build.sh` swaps its own objects into a base
+     `libwineserver.a` (an existing `app/Madeira/libwineserver.a`); a clean
+     checkout has none, and the script then runs
+     `build/wineserver/make-base.sh`, which compiles the server sources it does
+     not replace with the same flags (`tests/host/check-wineserver-base.py`).
      The ntdll build probes the selected iPhoneOS SDK for the optional
      `rusage_info_v6.ri_page_wait_time_mach` diagnostic member. When absent,
      `[xp] pgw=-1.0` means unavailable, not zero page-wait time. SDKs that
