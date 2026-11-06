@@ -358,13 +358,23 @@ echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"
 # here reaches nothing: the app would keep linking the previous objects and the
 # build would look clean. Replace our members in place and re-index.
 COMBINED="$BUILD_DIR/libdxmt_combined.a"
+APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
 if [ -f "$COMBINED" ]; then
     echo "=== Refreshing libdxmt_combined.a ==="
     xcrun -sdk iphoneos ar r "$COMBINED" "$OBJ_DIR"/*.o
     xcrun -sdk iphoneos ranlib "$COMBINED"
     echo "Refreshed: $COMBINED ($(wc -c < "$COMBINED" | tr -d ' ') bytes)"
-    APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
-    if [ -f "$APP_COPY" ]; then cp "$COMBINED" "$APP_COPY"; echo "Staged: $APP_COPY"; fi
 else
-    echo "NOTE: $COMBINED absent; the app links that file, so build it before deploying."
+    # A clean tree has no combined archive to refresh, and the app link needs
+    # one: make it from these objects and the LLVM archives airconv links.
+    echo "=== Creating libdxmt_combined.a ==="
+    LLVM_LIBS=("$LLVM_BUILD"/lib/libLLVM*.a)
+    if [ ! -f "${LLVM_LIBS[0]}" ]; then
+        echo "ERROR: no LLVM archives in $LLVM_BUILD/lib; run build/llvm-ios/build.sh first" >&2
+        exit 1
+    fi
+    xcrun -sdk iphoneos libtool -static -o "$COMBINED" "$OBJ_DIR"/*.o "${LLVM_LIBS[@]}"
+    echo "Created: $COMBINED (${#LLVM_LIBS[@]} LLVM archives, $(wc -c < "$COMBINED" | tr -d ' ') bytes)"
 fi
+cp "$COMBINED" "$APP_COPY"
+echo "Staged: $APP_COPY"

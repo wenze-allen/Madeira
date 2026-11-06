@@ -210,8 +210,16 @@ echo "=== Renaming colliding symbols in every .o (objcopy sweep) ==="
 # we know collide with win32u-unix, repackage. Affects definitions AND
 # references uniformly, so cross-file calls inside wineserver still
 # resolve. Externals (win32u, etc.) only see the ws_-prefixed names.
-OBJCOPY=$(command -v llvm-objcopy || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)
-[ -x "$OBJCOPY" ] || OBJCOPY=/opt/homebrew/Cellar/llvm/22.1.0/bin/llvm-objcopy
+# Any llvm-objcopy renames Mach-O symbols: one on PATH, Xcode's, the
+# llvm-mingw toolchain's (docs/BUILDING.md; no Homebrew needed), Homebrew's.
+OBJCOPY=""
+for c in "$(command -v llvm-objcopy || true)" "$(xcrun -f llvm-objcopy 2>/dev/null || true)" \
+         "$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/llvm-objcopy" \
+         /opt/homebrew/opt/llvm/bin/llvm-objcopy; do
+    if [ -n "$c" ] && [ -x "$c" ]; then OBJCOPY="$c"; break; fi
+done
+[ -n "$OBJCOPY" ] || { echo "ERROR: no llvm-objcopy (install llvm-mingw under toolchains/, docs/BUILDING.md)" >&2; exit 1; }
+echo "  objcopy: $OBJCOPY"
 COLLISIONS=(
     alloc_user_handle free_user_handle get_virtual_screen_rect
     destroy_thread_windows get_window_thread is_desktop_class

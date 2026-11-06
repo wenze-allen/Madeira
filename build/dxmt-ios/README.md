@@ -84,12 +84,13 @@ cp build-pe/src/d3d11/d3d11.dll \
 
 ```
 ./build.sh                    # builds libdxmt_unix.a (patched DXMT unix objs + airconv)
-
-# Combine DXMT objs + LLVM iOS static libs into one archive Xcode links.
-xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
-    obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
-cp libdxmt_combined.a ../../app/Madeira/
 ```
+
+It then combines the DXMT objects with the LLVM iOS archives into
+`libdxmt_combined.a`, the archive Xcode links: on the first run with
+`xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a obj/*.o
+../../toolchains/llvm-ios-build/lib/libLLVM*.a`, later by replacing its own
+objects in place. Either way it copies the result to `app/Madeira/`.
 
 ## What the fork changes vs upstream
 
