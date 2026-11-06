@@ -14,6 +14,28 @@ the submodule commits (FEX, its nested rpmalloc fork, wine branch
 recursive clone fails at the first submodule until every fork is pushed. This document is the
 remediation; steps marked UNVERIFIED have not yet been re-run from scratch.
 
+## The whole build in one script
+
+`build/build-mac.sh` runs every step below, in order, and packages
+`dist/Madeira-<rev>-Debug-unsigned.ipa`.
+- **What it needs:** a Mac with Xcode (the iOS SDK and the Metal toolchain) and network
+  access. It needs no administrator rights and no Homebrew.
+- **Host tools:** it makes them itself in `toolchains/host-tools`, at pinned versions with
+  their hashes: cmake 3.31, ninja and meson 1.11.1 in a Python venv, bison 3.8.2, 7-Zip,
+  and Rust when no rustup is installed.
+- **Xcode:** an Xcode outside `/Applications` is used through `DEVELOPER_DIR`
+  (`MADEIRA_XCODE=/path/to/Xcode.app`).
+- **Skipped steps:** a step is skipped while a stamp of its inputs matches. The unix-side
+  libraries, DXMT, the Dock and the app are rebuilt every time, and each must be newer than
+  the step's start.
+- **The IPA is checked before it is reported:**
+  - the Dock, Wine Mono and the VC++ runtime are in it;
+  - the i386 farm and the JIT helper are in it;
+  - the unix-side code is this checkout's.
+- **Options:** `--check` runs only the checks, `--plan` lists what would run, and
+  `--from`/`--only STEP` start at or run one step. `tests/host/check-mac-build.py` checks the
+  script against what the 21e6697 Mac build met, on a mock Mac.
+
 ## Inputs that are not in the repository
 
 | Input | Why absent | How to obtain | Verified from clean |
@@ -50,6 +72,7 @@ git-ignored and consumed by the app project.
    - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session. The first-run configure uses Ninja, `MINGW_TRIPLE=arm64ec-w64-mingw32`, `TUNE_CPU=cortex-a78`, `FEX_IOS_HOST_BUILD=ON`, `FEX_IOS_HOST=1` for the C, C++ and assembler flags, and LTO off: the options the madeira-bcd fork's macOS CI has built xtajit64.dll with since 2026-09-26 (the module every 64-bit game ran on from its build 231). A tree configured before keeps its cached options and generator (remove `FEX/build-arm64ec` to configure it again).
 3. Wine (submodule, branch madeira-lgpl):
    - FreeType for win32u: clone FreeType 2.13.3 into `research/freetype` (`git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype`), then `build/freetype-ios/build.sh` -> `build/freetype-ios/build/libfreetype.a`, which `build/win32u-unix/build.sh` merges into `libwin32u_unix.a` (without it, it warns and the app has no fonts); run it before the unix side below.
+   - host tree: `build/wine-macos/configure.sh` configures `wine/build-macos` (`--enable-archs=aarch64`, no X, FreeType or GnuTLS) and builds its tools and every widl header. The unix side below reads its `include/` (`config.h`, `wtypes.h`, `dwrite.h`, `mfobjects.h`, ...). It needs bison 3 and flex on PATH and llvm-mingw under `toolchains/`. Before this script there was no recipe for the tree.
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
      `build/wineserver/build.sh` swaps its own objects into a base
@@ -67,7 +90,7 @@ git-ignored and consumed by the app project.
    - `app/Madeira/arm64ec-windows/` is the DLL farm: every file in it is linked into the prefix (`system32` for x64 sessions, and `sysx64`), so a Wine module is only available if it was built and copied there. The native D3D12 path needs two stock modules in addition to the existing ones: `dcomp.dll` (`make -C dlls/dcomp`; a 64-bit Godot 4 engine loads it before it creates its D3D12 device, and gives up on D3D12 without it) and `ktmw32.dll` (`make -C dlls/ktmw32`; an optional import the same engine probes).
    - Stand-ins for DLLs Wine cannot provide here but games import: `python3 tools/build-stub-dlls.py wine build/stub-dlls toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/arm64ec-w64-mingw32-clang toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/llvm-readobj app/Madeira/arm64ec-windows` builds `vulkan-1.dll` (answers like a PC without a Vulkan driver, so a game falls back to D3D) and, when the farm has no Wine build of them, `d3d10.dll` and `avifil32.dll`; each exports exactly its Wine `.spec`. Crysis Remastered imports all three.
 4. DXMT (submodule, branch ios-port):
-   - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). Verified this session. It first applies `build/dxmt-patches/*.patch` to the `dxmt` working tree (`build/dxmt-patches/README.md`; `build/wine-i386/build.sh` does the same), and makes the Metal headers it embeds (`dxmt_command.h` and airconv's `air_msad.h`, `air_samplepos.h`, `air_tessellation.h`) with Xcode's `metal` and `xxd`.
+   - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). On a clean tree it makes the archive from its objects and the LLVM libraries (before, it only refreshed an existing one). Verified this session. It first applies `build/dxmt-patches/*.patch` to the `dxmt` working tree (`build/dxmt-patches/README.md`; `build/wine-i386/build.sh` does the same), and makes the Metal headers it embeds (`dxmt_command.h` and airconv's `air_msad.h`, `air_samplepos.h`, `air_tessellation.h`) with Xcode's `metal` and `xxd`.
    - PE side: `meson setup dxmt/build-arm64ec dxmt -Dbuildtype=release -Dwine_build_path=../../wine/build-arm64ec --cross-file=dxmt/build-arm64ec-win.txt` then `ninja -C dxmt/build-arm64ec src/winemetal/winemetal.dll` (and d3d11.dll) -> copied to `app/Madeira/arm64ec-windows/`. Verified this session (winemetal.dll).
 4b. In-app pairing (Built-in StikJIT on iOS 27): `build/rppairing-ios/build.sh`
    (Rust with the `aarch64-apple-ios` target; crates from crates.io at the

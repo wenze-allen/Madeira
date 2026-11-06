@@ -119,6 +119,8 @@ photorec.se2
 
 # Build/deploy artifacts (regenerable; keep them out of history)
 *.ipa
+# build/build-mac.sh's IPA and its build record
+/dist/
 clean-prefix/
 tests/x64/asmconf_gen/
 tests/x64/asmconf_obj/
