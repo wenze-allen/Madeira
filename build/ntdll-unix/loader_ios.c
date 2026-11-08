@@ -3196,6 +3196,28 @@ static void start_main_thread(void)
                      "[wow-window] main-process reserve FAILED 0x%x — a 32-bit main image "
                      "cannot run without a guest window; terminating this process\n",
                      (unsigned)wst );
+            /* This is the SESSION'S OWN program, not a child (a 32-bit program
+             * started on a device whose address space has no 4 GB window left).
+             * The pthread_exit() inside fatal_error() ends the boot thread
+             * (wine_process_thread) in the middle of __wine_main, so the end work
+             * after __wine_main never runs: the app keeps showing the session
+             * as running until the user closes it. exit() is the shim's
+             * wine_ios_exit (shims/wine_ios_exit.h): on the boot thread it
+             * long-jumps back to wine_process_thread, which ends the session as
+             * it does for any program; on any other thread it leaves by
+             * pthread_exit, as before. The status goes to the exit hook first,
+             * so the exit report carries it. env.MADEIRA_WOW_MAIN_FAIL_EXIT = 0
+             * keeps fatal_error(). Log tag [wow-window]. */
+            {
+                const char *fe = getenv( "MADEIRA_WOW_MAIN_FAIL_EXIT" );
+                if (!(fe && fe[0] == '0'))
+                {
+                    extern void wine_launched_process_did_exit( int status ) __attribute__((weak));
+                    os_log_error( OS_LOG_DEFAULT, "[Wine ntdll] FATAL: no WoW64 guest window for the 32-bit main image (status %x)", (unsigned)wst );
+                    if (wine_launched_process_did_exit) wine_launched_process_did_exit( (int)wst );
+                    exit( 1 );
+                }
+            }
             fatal_error( "no WoW64 guest window for the 32-bit main image (status %x)\n",
                          (unsigned)wst );
         }
