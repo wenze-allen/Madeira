@@ -21,7 +21,8 @@ build/ntdll-unix/signal_arm64_ios.c against a fake clock and checks:
     advancing address (ml876) is not, until the 20000 storm ceiling;
   - delivery debounce: two keys that shared an old slot are both dispatched on
     their 3rd fault;
-  - redelivery terminal: two threads that shared an old slot both reach 2000;
+  - redelivery terminal: two threads that shared an old slot both reach 2000; a protection
+    change between two deliveries starts a new run (MADEIRA_REDELIV_VPROTECT);
   - stale-heal ring: each hot VA queued once; 1024 VAs x 256 faults with no
     drain (in turn, or one VA after another) never fills the ring; a ring that
     is full refuses instead of overwriting, and the VA is queued at its next
@@ -64,8 +65,10 @@ code = r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define STDERR_FILENO 2
+volatile unsigned long long ios_vprotect_seq;   /* NtProtectVirtualMemory's counter (virtual_ios_free_query.c) */
 #define dprintf(fd, ...) ((void)0)
 static uint64_t fake_now = 1000;
 static uint64_t mach_absolute_time( void ) { return fake_now; }
@@ -209,6 +212,16 @@ int main( void )
             nb = redeliv_count( tb, 0x140002000ull, 0x20 ); step();
         }
         assert( na == 2000 && nb == 2000 );
+    }
+
+    /* a protection change between two deliveries is progress: the run starts again (MADEIRA_REDELIV_VPROTECT) */
+    {
+        uint32_t n = 0;
+        for (i = 0; i < 1500; i++) { n = redeliv_count( 0x1301, 0x140003000ull, 0x30 ); step(); }
+        assert( n == 1500 );
+        ios_vprotect_seq++;
+        assert( redeliv_count( 0x1301, 0x140003000ull, 0x30 ) == 1 );
+        assert( redeliv_count( 0x1301, 0x140003000ull, 0x30 ) == 2 );
     }
 
     /* stale-heal ring: 1024 VAs x 256 faults, nothing drained, in turn and one after another */

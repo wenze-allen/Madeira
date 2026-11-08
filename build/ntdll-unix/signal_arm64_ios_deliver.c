@@ -799,9 +799,9 @@ dispatch:
          * sequence number of its last delivery, and a different one starts a new run
          * (upstream 0a2e6ed tags its guest-RIP key with it; this guard has no such key).
          * MADEIRA_REDELIV_VPROTECT=0 restores the old counting. */
+        static struct ios_guard_table redeliv_tab;
         extern volatile unsigned long long ios_vprotect_seq;
         static int redeliv_vprotect = -1;
-        static struct ios_guard_table redeliv_tab;
         static struct { uint64_t key; uint32_t n; uint64_t vp_seq; } redeliv[IOS_GUARD_SLOTS];
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
