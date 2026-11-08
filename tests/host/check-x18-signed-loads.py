@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Madeira's x18 emulator (the Mach exception path in build/ntdll-unix/signal_arm64_ios_mach.c) does
-the sign-extending loads with an immediate offset from x18; no Wine runs.
+the sign-extending loads with an immediate offset from x18 (ios_x18_signed_load, upstream's fix from
+0a2e6ed); no Wine runs.
 
 A thread whose x18 the OS had cleared faulted on `ldrsw x28, [x18, #0x180c]` (b9980e5c). The
 emulator had cases for LDR/STR of every width, but not LDRSW/LDRSB/LDRSH with an unsigned
@@ -9,13 +10,14 @@ unhandled, and Wine ended the game process. The app stayed up with the last fram
 "random freeze while playing" of 14 of 26 iPad sessions, 2026-11-05 to 11-08 (Senren Banka and
 Sabbat of the Witch).
 
-Compiles the emulator's integer cases (from its `switch (insn & 0xffc00000)` to the SIMD block)
-out of the source, with a buffer standing in for the TEB. Checks, with encodings from the AArch64
+Compiles ios_x18_signed_load and the emulator's integer cases (from its `switch (insn & 0xffc00000)`
+to the SIMD block) out of the source, with a buffer standing in for the TEB. Checks, with encodings from the AArch64
 assembler (llvm-mingw 20260421's clang, -target aarch64-linux-gnu):
   - the crash's own word loads TEB+0x180c sign-extended into x28;
   - LDRSW, LDRSB and LDRSH into Xt sign-extend, and into Wt sign-extend to 32 bits and zero the
     upper half;
-  - PRFM is a no-op, and a load into XZR writes nothing;
+  - a load into XZR writes nothing;
+  - env.MADEIRA_X18_SIGNED_LOAD = 0 declines the signed loads again (and only them);
   - the cases that were already there are unchanged: LDR X/W/B/H, register-offset LDRSW,
     unscaled LDURSW with a negative offset;
   - no other register is touched.
@@ -30,6 +32,8 @@ start = src.index("if (rn == 18 || x18_derived)")
 start = src.index("switch (insn & 0xffc00000)", start)
 end = src.index("/* SIMD/FP register-offset + unsigned-offset loads/", start)
 block = src[start:end]
+f0 = src.index("static int ios_x18_signed_load( uint32_t insn, uintptr_t ea, uint64_t *val )\n{")
+func = src[f0:src.index("\n}\n", f0) + 3]
 
 # (word, assembly, offset from x18 the hardware reports as the fault address, Rt, expected Rt or None)
 SENT = 0xdeadbeefcafef00d
@@ -40,7 +44,6 @@ CASES = [
     (0x39c08a45, "ldrsb w5, [x18, #0x22]", 0x22, 5, 0x00000000ffffff81),
     (0x79804a46, "ldrsh x6, [x18, #0x24]", 0x24, 6, 0xffffffffffff8001),
     (0x79c04e47, "ldrsh w7, [x18, #0x26]", 0x26, 7, 0x00000000fffffffe),
-    (0xf9802240, "prfm pldl1keep, [x18, #0x40]", 0x40, 0, None),
     (0xf9401a48, "ldr x8, [x18, #0x30]", 0x30, 8, 0x1122334455667788),
     (0xb9403649, "ldr w9, [x18, #0x34]", 0x34, 9, 0x0000000011223344),
     (0x3940864a, "ldrb w10, [x18, #0x21]", 0x21, 10, 0x9c),
@@ -54,6 +57,8 @@ harness = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+''' + func + r'''
 static unsigned char mem[0x2000];
 static int run(uint32_t insn, uint64_t fault_addr, uint64_t *x)
 {
@@ -73,8 +78,10 @@ static int run(uint32_t insn, uint64_t fault_addr, uint64_t *x)
 static void put32(int off, uint32_t v) { memcpy(mem + 0x100 + off, &v, 4); }
 static void put16(int off, uint16_t v) { memcpy(mem + 0x100 + off, &v, 2); }
 static void put64(int off, uint64_t v) { memcpy(mem + 0x100 + off, &v, 8); }
-int main(void)
+int main(int argc, char **argv)
 {
+    /* "off": run with env.MADEIRA_X18_SIGNED_LOAD = 0; the signed immediate loads are then declined */
+    int off = argc > 1 && !strcmp(argv[1], "off");
     static const struct { uint32_t insn; uint64_t fa; int rt; int has; uint64_t want; const char *what; } c[] = {
 @CASES@
     };
@@ -93,7 +100,16 @@ int main(void)
         uint64_t x[32];
         unsigned r;
         for (r = 0; r < 32; r++) x[r] = 0xdeadbeefcafef00dull + r;
-        if (!run(c[i].insn, c[i].fa, x)) { printf("FAIL: %s (%08x) not emulated\n", c[i].what, c[i].insn); fails++; continue; }
+        int signed_imm = (c[i].insn & 0xff000000) == 0xb9000000 || (c[i].insn & 0xbf000000) == 0x39000000;
+        signed_imm = signed_imm && ((c[i].insn >> 23) & 1);   /* opc<1>: LDRSB/LDRSH/LDRSW */
+        int got = run(c[i].insn, c[i].fa, x);
+        if (off && signed_imm)
+        {
+            if (got) { printf("FAIL: %s (%08x) emulated with the switch off\n", c[i].what, c[i].insn); fails++; }
+            else printf("PASS: switch off: %s (%08x) declined\n", c[i].what, c[i].insn);
+            continue;
+        }
+        if (!got) { printf("FAIL: %s (%08x) not emulated\n", c[i].what, c[i].insn); fails++; continue; }
         for (r = 0; r < 32; r++)
         {
             uint64_t want = (c[i].has && (int)r == c[i].rt) ? c[i].want : 0xdeadbeefcafef00dull + r;
@@ -122,8 +138,12 @@ with tempfile.TemporaryDirectory() as d:
                          "-Wall", "-Wno-unused-variable", "-o", str(exe), str(c)], capture_output=True, text=True)
     if cc.returncode:
         sys.exit("FAIL: the emulator block did not compile:\n" + cc.stderr[-3000:])
-    r = subprocess.run([str(exe)], capture_output=True, text=True)
-    print(r.stdout, end="")
-    if r.returncode:
-        sys.exit("FAIL: %s" % r.stderr[-2000:])
+    import os
+    for mode, env in (("on", {}), ("off", {"MADEIRA_X18_SIGNED_LOAD": "0"})):
+        e = {k: v for k, v in os.environ.items() if k != "MADEIRA_X18_SIGNED_LOAD"}
+        e.update(env)
+        r = subprocess.run([str(exe), mode], capture_output=True, text=True, env=e)
+        print(r.stdout, end="")
+        if r.returncode:
+            sys.exit("FAIL (%s): %s" % (mode, r.stderr[-2000:]))
 print("check-x18-signed-loads: OK")

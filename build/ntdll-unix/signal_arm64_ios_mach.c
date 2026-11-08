@@ -222,6 +222,39 @@ int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
     return 1;
 }
 
+/* [x18-emul3]: sign-extending loads off a zeroed x18.
+ *
+ * iOS zeroes x18 when it preempts a thread, and the Mach handler repairs a TEB access that
+ * faults on the small offset by doing the load itself (the "[x18-emul3]" cases in
+ * ios_mach_exception_thread). It decoded the zero-extending unsigned-offset loads (LDR X, LDR W,
+ * LDRB, LDRH) but not the sign-extending ones, so the access was declined as "UNRECOGNIZED" and
+ * the thread died: `ldrsw x28, [x18, #0x180c]` (0xb9980e5c) is FEX's read of the 64-bit TEB's
+ * WowTebOffset in the WOW64 entry code, reached by 32-bit programs and 32-bit installer helpers
+ * alike. LDRSB/LDRSH take the same step. Returns 1 and the value for Rt when insn is one of these
+ * five encodings (unsigned immediate offset), else 0; the caller has ea = TEB + offset and writes
+ * Rt unless it is 31 (XZR). A W destination is zero-extended to 64 bits, as the CPU does.
+ * env.MADEIRA_X18_SIGNED_LOAD = 0 declines them as before. */
+static int ios_x18_signed_load( uint32_t insn, uintptr_t ea, uint64_t *val )
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_X18_SIGNED_LOAD" );
+        on = !(e && e[0] == '0');
+    }
+    if (!on) return 0;
+    switch (insn & 0xffc00000)
+    {
+    case 0xb9800000: *val = (uint64_t)(int64_t)*(int32_t *)ea; return 1;            /* LDRSW Xt */
+    case 0x39800000: *val = (uint64_t)(int64_t)*(int8_t *)ea; return 1;             /* LDRSB Xt */
+    case 0x39c00000: *val = (uint32_t)(int32_t)*(int8_t *)ea; return 1;             /* LDRSB Wt */
+    case 0x79800000: *val = (uint64_t)(int64_t)*(int16_t *)ea; return 1;            /* LDRSH Xt */
+    case 0x79c00000: *val = (uint32_t)(int32_t)*(int16_t *)ea; return 1;            /* LDRSH Wt */
+    default: return 0;
+    }
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -1248,28 +1281,6 @@ static void *ios_mach_exception_thread( void *arg )
                         case 0x79400000: /* LDRH Wt */
                             if (rt != 31) state.__x[rt] = *(uint16_t *)ea;
                             emulated = 1; break;
-                        /* unsigned-offset sign-extending loads, base x18. `ldrsw
-                         * x28,[x18,#0x180c]` (b9980e5c) fell through to the
-                         * UNRECOGNIZED path and the access violation ended the
-                         * game: 14 of 26 iPad sessions, 2026-11-05..08, "the game
-                         * freezes" (the last frame stays up). */
-                        case 0xb9800000: /* LDRSW Xt */
-                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int32_t *)ea;
-                            emulated = 1; break;
-                        case 0x39800000: /* LDRSB Xt */
-                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int8_t *)ea;
-                            emulated = 1; break;
-                        case 0x39c00000: /* LDRSB Wt (upper half zero) */
-                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int8_t *)ea;
-                            emulated = 1; break;
-                        case 0x79800000: /* LDRSH Xt */
-                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int16_t *)ea;
-                            emulated = 1; break;
-                        case 0x79c00000: /* LDRSH Wt (upper half zero) */
-                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int16_t *)ea;
-                            emulated = 1; break;
-                        case 0xf9800000: /* PRFM (unsigned offset): a hint, no-op */
-                            emulated = 1; break;
                         /* unsigned-offset immediate stores, base x18 */
                         case 0xf9000000: /* STR Xt */
                             *(uint64_t *)ea = (rt == 31) ? 0 : state.__x[rt];
@@ -1284,6 +1295,17 @@ static void *ios_mach_exception_thread( void *arg )
                             *(uint16_t *)ea = (rt == 31) ? 0 : (uint16_t)state.__x[rt];
                             emulated = 1; break;
                         default: break;
+                        }
+
+                        /* LDRSW/LDRSB/LDRSH, unsigned offset (ios_x18_signed_load; MADEIRA_X18_SIGNED_LOAD). */
+                        if (!emulated)
+                        {
+                            uint64_t sv;
+                            if (ios_x18_signed_load( insn, ea, &sv ))
+                            {
+                                if (rt != 31) state.__x[rt] = sv;
+                                emulated = 1;
+                            }
                         }
 
                         /* LDP/STP Xt,Xt2,[x18,#imm] signed-offset (no writeback) */
