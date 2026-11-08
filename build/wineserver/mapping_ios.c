@@ -20,6 +20,14 @@
 
 #include "config.h"
 
+/* The madeira.cfg reader comes before Wine's headers: winnt.h poisons strncpy, which
+ * the header-only reader uses. env.MADEIRA_ILONLY_WOW64 is read before the bridge
+ * exports env. lines (ml1236). */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "../madeira_cfg.h"
+#pragma GCC diagnostic pop
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -30,6 +38,7 @@ extern void ws_log(const char *fmt, ...);
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>   /* ilonly-machine: strdup, strtok_r */
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -788,6 +797,76 @@ static int load_cfg_header( IMAGE_LOAD_CONFIG_DIRECTORY64 *cfg, size_t va, size_
     return 1;
 }
 
+/* Madeira ilonly-machine: an IL-only PE32 .NET image without
+ * COMIMAGE_FLAGS_32BITREQUIRED (AnyCPU) is "native ready": upstream runs it as a
+ * process of the NATIVE machine, here ARM64 (map_image_view and the ios child
+ * bring-up read the flag). A native ARM64 process loads its .NET host, mscoree.dll,
+ * from the aarch64 set, and that set has none (Wine Mono has no ARM64 build; the
+ * arm64ec set's and the i386 set's mscoree.dll belong to other machines), so such an
+ * image ended with "mscoree.dll not found, IL-only binary ... cannot be loaded",
+ * c000007b. Without the flag the image keeps its own machine, i386, and runs as a
+ * WoW64 process with the i386 mscoree.dll and Wine Mono, as 32BITREQUIRED .NET
+ * programs already do. The flag is withheld only while the native set has no
+ * mscoree.dll, so a set that gets one runs AnyCPU images natively again.
+ * MADEIRA_ILONLY_WOW64=0 (env or madeira.cfg env. line) restores upstream's flag. */
+
+/* Kill switch, read once: 0 turns the check off. */
+static int ios_ilonly_wow64_enabled( void )
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        char buf[16];
+        const char *v = madeira_cfg_get( "env.MADEIRA_ILONLY_WOW64", buf, sizeof(buf) ) ? buf
+                        : getenv( "MADEIRA_ILONLY_WOW64" );
+        enabled = !(v && !strcmp( v, "0" ));
+    }
+    return enabled;
+}
+
+/* Can the native machine run an IL-only image: is there an mscoree.dll in its set under
+ * one of the WINEDLLPATH directories? 1 when it cannot be told (no path, a native machine
+ * other than ARM64), which is upstream's answer. */
+static int ios_native_has_mscoree( const char *dll_path, unsigned short native )
+{
+    char *copy, *tok, *save = NULL, file[1024];
+    int found = 0;
+
+    if (native != IMAGE_FILE_MACHINE_ARM64 || !dll_path || !*dll_path) return 1;
+    if (!(copy = strdup( dll_path ))) return 1;
+    for (tok = strtok_r( copy, ":", &save ); tok && !found; tok = strtok_r( NULL, ":", &save ))
+        found = snprintf( file, sizeof(file), "%s/aarch64-windows/mscoree.dll", tok ) < (int)sizeof(file) &&
+                access( file, R_OK ) == 0;
+    free( copy );
+    return found;
+}
+
+/* The image flags of an IL-only PE32 image (COMIMAGE_FLAGS_ILONLY seen): upstream's three,
+ * ComPlusNativeReady only while the native machine can run it. */
+static unsigned int ios_ilonly_image_flags( DWORD clr_flags, int native_runs_ilonly )
+{
+    unsigned int flags = IMAGE_FLAGS_ComPlusILOnly;
+
+    if (!(clr_flags & COMIMAGE_FLAGS_32BITREQUIRED) && native_runs_ilonly)
+        flags |= IMAGE_FLAGS_ComPlusNativeReady;
+    if (clr_flags & COMIMAGE_FLAGS_32BITPREFERRED)
+        flags |= IMAGE_FLAGS_ComPlusPrefer32bit;
+    return flags;
+}
+
+/* The first few times the flag is withheld, with the image's CLR flags (the log never had them). */
+static void ios_ilonly_say( DWORD clr_flags, unsigned short machine )
+{
+    static int said;
+
+    if (said++ < 6)
+        fprintf( stderr, "[ilonly-machine] an IL-only PE32 image (CLR flags=%#x, machine=%#x) is not promoted to the "
+                 "native machine %#x: its set has no mscoree.dll, so it runs as its own machine (WoW64) "
+                 "(MADEIRA_ILONLY_WOW64=0 restores the native promotion)\n",
+                 (unsigned int)clr_flags, (unsigned int)machine, (unsigned int)native_machine );
+}
+
 /* retrieve the mapping parameters for an executable (PE) image */
 static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_size, int unix_fd )
 {
@@ -1026,10 +1105,12 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         mapping->image.image_flags |= IMAGE_FLAGS_ComPlusILOnly;
         if (nt.opt.hdr32.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         {
-            if (!(clr.Flags & COMIMAGE_FLAGS_32BITREQUIRED))
-                mapping->image.image_flags |= IMAGE_FLAGS_ComPlusNativeReady;
-            if (clr.Flags & COMIMAGE_FLAGS_32BITPREFERRED)
-                mapping->image.image_flags |= IMAGE_FLAGS_ComPlusPrefer32bit;
+            /* Madeira ilonly-machine: ComPlusNativeReady only while the native machine has an mscoree.dll */
+            int native_ilonly = !ios_ilonly_wow64_enabled() ||
+                                ios_native_has_mscoree( getenv( "WINEDLLPATH" ), native_machine );
+            mapping->image.image_flags |= ios_ilonly_image_flags( clr.Flags, native_ilonly );
+            if (!native_ilonly && !(clr.Flags & COMIMAGE_FLAGS_32BITREQUIRED))
+                ios_ilonly_say( clr.Flags, nt.FileHeader.Machine );
         }
     }
 
