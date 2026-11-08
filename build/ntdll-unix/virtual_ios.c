@@ -2391,6 +2391,32 @@ static size_t ios_jit_data_align_delta( const void *image_base, size_t image_siz
     return (0x4000 - (first_w & 0x3fff)) & 0x3fff;
 }
 
+/* where an image's x18 trampolines start in its pool allocation
+ * (log 2026-10-26 23:43). With a .data shift the image starts data_delta into
+ * the allocation, and its last 16 KB page can hold .data, which the pool maps
+ * without exec. Trampolines right behind the image (offset + image_alloc) shared
+ * that page, and the first patched instruction faulted (BUS EXEC in JIT .data,
+ * mprotect RX refused): vkd3d-proton's d3d12.dll in a launcher's Direct3D 12
+ * check. The child copy put them data_delta past the end of its allocation. They
+ * now start on the 16 KB page after the image, which the allocation's extra page
+ * (allocated whenever data_delta is) leaves room for. `offset` is the shifted
+ * image offset. MADEIRA_X18_TRAMP_ALIGN=0 restores the old offsets. */
+static int ios_jit_tramp_align_on( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_X18_TRAMP_ALIGN" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static size_t ios_jit_tramp_offset( size_t offset, size_t image_alloc, size_t data_delta )
+{
+    return data_delta ? offset - data_delta + image_alloc + 0x4000 : offset + image_alloc;
+}
+
 static void ios_va_gap_probe( const char *why )
 {
     const mach_vm_address_t CARVE_LO = 0x1000000000ULL;   /* 64G  */

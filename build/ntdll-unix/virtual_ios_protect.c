@@ -2131,7 +2131,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                          * copy diverged from the source and patching it
                          * would emit copy-specific branches — refuse (x18
                          * insns degrade to recoverable runtime faults). */
-                        size_t tramp_pool_off = offset + image_alloc;
+                        size_t tramp_pool_off = ios_jit_tramp_align_on()
+                            ? ios_jit_tramp_offset( offset, image_alloc, data_delta ) : offset + image_alloc;
                         if (tramp_alloc > tramp_prealloc)
                         {
                             dprintf(2, "[x18-tramp] REFUSED: budget 0x%lx > prealloc 0x%lx (source/copy divergence?)\n",
@@ -2521,7 +2522,9 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         /* task #34: trampolines live in the fixed image-relative region
          * pre-reserved above — same offset in every copy, so patched .text
          * and tramps are byte-identical across copies (page-shareable). */
-        size_t tramp_off = offset + (alloc_size - child_tramp_prealloc);
+        size_t tramp_off = ios_jit_tramp_align_on()
+            ? ios_jit_tramp_offset( offset, (m->size + pg - 1) & ~(pg - 1), ios_jit_data_align_delta( m->pe_base, m->size ) )
+            : offset + (alloc_size - child_tramp_prealloc);
         int patched = ios_jit_patch_x18(
             rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
             (char *)ios_jit_rw_base_global + tramp_off,
