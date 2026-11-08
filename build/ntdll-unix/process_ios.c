@@ -4004,7 +4004,31 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         len = sizeof(ULONG_PTR);
         if (size != len) return STATUS_INFO_LENGTH_MISMATCH;
         if (handle == GetCurrentProcess())
-            *(ULONG_PTR *)info = is_old_wow64() ? (ULONG_PTR)peb : (ULONG_PTR)wow_peb;
+        {
+            /* Madeira wow64-peb-self: wow_peb is a session global that init_peb()
+             * sets for a 32-bit child and loader_ios.c temporarily clears while a
+             * 64-bit child runs unix_init_startup_info().  A 32-bit thread querying
+             * ProcessWow64Information during that window read NULL and faulted in
+             * wow64.dll at [0+0x480], while a 64-bit process querying itself after
+             * any 32-bit child had booted read the child's wow_peb.  Derive this
+             * process's PEB32 from its own PEB and guest window
+             * ((char *)cur_peb + page_size), matching init_peb().
+             * env.MADEIRA_WOW64_PEB_SELF=0 answers the session global as before. */
+            static int self_off = -1;
+            if (self_off < 0)
+            {
+                const char *e = getenv( "MADEIRA_WOW64_PEB_SELF" );
+                self_off = (e && e[0] == '0' && !e[1]) ? 1 : 0;
+            }
+            if (self_off)
+                *(ULONG_PTR *)info = is_old_wow64() ? (ULONG_PTR)peb : (ULONG_PTR)wow_peb;
+            else
+            {
+                PEB *cur_peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : peb;
+                *(ULONG_PTR *)info = is_old_wow64() ? (ULONG_PTR)cur_peb
+                    : (ios_wow_base_for_peb( cur_peb ) ? (ULONG_PTR)((char *)cur_peb + page_size) : 0);
+            }
+        }
         else
         {
             ULONG_PTR val = 0;
