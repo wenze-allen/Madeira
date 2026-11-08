@@ -4049,6 +4049,10 @@ done:
 }
 
 
+#ifdef WINE_IOS
+static unsigned int ios_fd_reuse( const void *addr, SIZE_T size, ULONG type );   /* defined below */
+#endif
+
 /***********************************************************************
  *             virtual_map_section
  *
@@ -4179,6 +4183,10 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
         return res;
     }
 
+#ifdef WINE_IOS
+    /* a view at the program's own address over its held releases (ios_fd_reuse) */
+    if (base && !(alloc_type & MEM_REPLACE_PLACEHOLDER)) ios_fd_reuse( base, size, MEM_RESERVE );
+#endif
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );

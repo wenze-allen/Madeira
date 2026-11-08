@@ -2383,6 +2383,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 else { *ret = saved; *size_ptr = want; }   /* fall back to normal */
                 }   /* ml462 per-tid cap else-block */
             }
+            /* a reservation at the program's own address over its held releases (ios_fd_reuse) */
+            if (!ios_steered && *ret) ios_fd_reuse( *ret, *size_ptr, type );
             if (!ios_steered)
                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
 
