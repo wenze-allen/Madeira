@@ -1478,12 +1478,33 @@ static int winios_desktop_fit_enabled(void) {
     if (enabled < 0) { const char *e = getenv("MADEIRA_DESKTOP_FIT"); enabled = !(e && e[0] == '0'); }
     return enabled;
 }
+/* A FRAME PUSHED OFF THE DESKTOP IS NOT A WINDOW TOO BIG FOR IT. A client rect
+ * that covers the whole desktop and overhangs it by no more than a window's
+ * non-client parts (border, caption, menu: WINIOS_FIT_FRAME_PX on a side) is
+ * the usual full screen of a framed window, placed so that its frame is off
+ * the screen; Windows shows its on-screen part 1:1, and so does this.
+ * Sabbat of the Witch (KiriKiri) hides its menu bar in full screen by keeping
+ * the window at y=-19 and dropping the menu, so its client is
+ * {0,-19 2360x1659} on a 2360x1640 desktop: the fit scaled it by 0.989 and
+ * left 13.5 px of the window's own white GDI surface on each side (iPad,
+ * 2026-11-08). MADEIRA_DESKTOP_FIT_FRAME=0 fits such windows as before. */
+#define WINIOS_FIT_FRAME_PX 64
+static int winios_fit_frame_offscreen(CGRect desk, CGRect c) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_DESKTOP_FIT_FRAME"); enabled = !(e && e[0] == '0'); }
+    return enabled && CGRectContainsRect(c, desk)
+        && CGRectGetMinX(desk) - CGRectGetMinX(c) <= WINIOS_FIT_FRAME_PX
+        && CGRectGetMinY(desk) - CGRectGetMinY(c) <= WINIOS_FIT_FRAME_PX
+        && CGRectGetMaxX(c) - CGRectGetMaxX(desk) <= WINIOS_FIT_FRAME_PX
+        && CGRectGetMaxY(c) - CGRectGetMaxY(desk) <= WINIOS_FIT_FRAME_PX;
+}
 static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
     int desk_w = 0, desk_h = 0;
     winios_screen_size(&desk_w, &desk_h);
     CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
     BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
-        && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
+        && !CGRectContainsRect(CGRectInset(desk, -8, -8), c)
+        && !winios_fit_frame_offscreen(desk, c);
     if (!winios_desktop_fit_enabled() || !outside || !ml.superlayer || !g_compositor_view) {
         if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
         return NO;
