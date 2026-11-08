@@ -1449,6 +1449,86 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* 3.4. [il2cpp-gc-vtable]: GC-marked vtable pointer (klass | 1) recovery at DispatcherLoopTop.
+             *
+             * In IL2CPP runtimes Boehm GC's stop-the-world mark pass temporarily sets bit 0 of
+             * Il2CppObject::klass (e.g. 0x7c737be990 -> 0x7c737be991). Because
+             * MADEIRA_REAL_SUSPEND is off by default on iOS, a mutator thread can execute
+             *   mov rax, [rcx]          ; loads RAX = klass | 1
+             *   mov rdx, [rax + 0x210]  ; 1-byte misaligned read -> (slot1 >> 8) | (slot2 << 56)
+             *   call [rax + 0x208]      ; 1-byte misaligned read -> (slot0 >> 8) | (slot1 << 56)
+             * while bit 0 is set. The shifted read places the low byte of slot1 (MethodInfo*) into
+             * the top byte of RipReg (x12), which immediately faults 4 instructions into
+             * DispatcherLoopTop at `ldr x10, [x10, x11, lsl #3]` (0xf86b794a) after
+             * `lsr x11, x12, #18` (0xd352fd8b). Verify that an odd pointer register's aligned table
+             * produces the exact misaligned 8-byte pattern in x12, restore the aligned call target
+             * (and RDX MethodInfo* if it came from the adjacent slot), and resume at fault_pc.
+             * Without the repair the fault ends the process. env.MADEIRA_ODD_VTABLE_REPAIR = 0
+             * leaves the fault alone, as before. */
+            static int odd_vtable_repair = -1;
+            if (odd_vtable_repair < 0)
+            {
+                const char *e = getenv( "MADEIRA_ODD_VTABLE_REPAIR" );
+                odd_vtable_repair = !(e && e[0] == '0');
+            }
+            if (!handled && odd_vtable_repair && state.__x[12] >= 0x0000800000000000ULL)
+            {
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                uint32_t insn = 0, prev_insn = 0;
+                if (fault_pc >= 0x100000000ULL &&
+                    ios_fault_read_insn( fault_pc, &insn ) && insn == 0xf86b794aU &&
+                    ios_fault_read_insn( fault_pc - 4, &prev_insn ) && prev_insn == 0xd352fd8bU)
+                {
+                    static const int cand_regs[] = { 8, 0, 1, 2, 3, 4, 5, 6, 7, 9, 13, 14, 15, 16, 17 };
+                    uint64_t bad_rip = state.__x[12];
+                    unsigned ci;
+                    for (ci = 0; ci < sizeof(cand_regs) / sizeof(cand_regs[0]) && !handled; ci++)
+                    {
+                        int r = cand_regs[ci];
+                        uint64_t rval = state.__x[r];
+                        uint64_t clean_base = rval & ~7ULL;
+                        uint64_t tbl[129];
+                        mach_vm_size_t got = 0;
+                        unsigned idx;
+
+                        if ((rval & 7ULL) != 1ULL || clean_base < 0x10000ULL || clean_base >= 0x0000800000000000ULL)
+                            continue;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)clean_base, sizeof(tbl),
+                                                    (mach_vm_address_t)&tbl[0], &got ) != KERN_SUCCESS || got < 16)
+                            continue;
+                        for (idx = 0; (idx + 1) * 8 < got; idx++)
+                        {
+                            uint64_t s0 = tbl[idx], s1 = tbl[idx + 1];
+                            if (((s0 >> 8) | (s1 << 56)) == bad_rip &&
+                                s0 >= 0x10000ULL && s0 < 0x0000800000000000ULL)
+                            {
+                                static volatile int gc_vt_fixes;
+                                int fn = __sync_add_and_fetch( &gc_vt_fixes, 1 );
+                                state.__x[r] = clean_base;
+                                if ((idx + 2) * 8 <= got &&
+                                    ((s1 >> 8) | (tbl[idx + 2] << 56)) == state.__x[1])
+                                    state.__x[1] = s1;
+                                if (state.__x[6] == bad_rip) state.__x[6] = s0;
+                                state.__x[12] = s0;
+                                state.__x[11] = s0 >> 18;
+                                if (state.__x[28] >= 0x100000ULL && state.__x[28] < 0x0000800000000000ULL)
+                                    mach_vm_write( mach_task_self(), (mach_vm_address_t)(state.__x[28] + 0x18),
+                                                   (vm_offset_t)(uintptr_t)&s0, sizeof(s0) );
+                                if (fn <= 16 || (fn % 256) == 0)
+                                    dprintf( STDERR_FILENO,
+                                             "[il2cpp-gc-vtable] #%d repaired odd vtable x%d=0x%llx+0x%x "
+                                             "bad_rip=0x%llx -> 0x%llx (rdx=0x%llx)\n",
+                                             fn, r, (unsigned long long)rval, idx * 8,
+                                             (unsigned long long)bad_rip, (unsigned long long)s0,
+                                             (unsigned long long)state.__x[1] );
+                                handled = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             /* 3.5. FEX unaligned LDAR/LDAPR/STLR backpatch.
              *
              * x86 has TSO ordering. FEX's MemoryOps lowers x86 TSO loads/stores
