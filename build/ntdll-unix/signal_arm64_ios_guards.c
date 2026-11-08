@@ -195,17 +195,133 @@ static int ios_thread_port_gone( thread_t port )
  * unexpected query failure counts as alive (keep the memory). */
 int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
 {
+    extern int ios_peb_is_dead( const void *peb );
+    static int reap_dead = -1;
     int count = ios_thread_registry_count(), i;
 
     for (i = 0; i < count; i++)
     {
         uintptr_t teb = ios_thread_registry[i].teb;
         thread_t port = ios_thread_registry[i].mach_thread;
+        struct thread_basic_info info;
+        mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+        kern_return_t kr;
+        void *peb = NULL;
+        vm_size_t got = sizeof(peb);
 
         if (!port || !teb || teb < base || teb - base >= size) continue;
-        if (!ios_thread_port_gone( port )) return 1;
+        kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+        if (kr == KERN_INVALID_ARGUMENT || kr == MACH_SEND_INVALID_DEST || kr == KERN_TERMINATED) continue;
+        /* [wow-reap]: a thread of an EXITED process that is held suspended (the [zombie] rule's or
+         * ios_thread_registry_end_dead_range's fallback when thread_terminate is refused) never runs again, so it cannot
+         * touch the window: it does not hold it. Without this, two such threads can keep two windows and a launcher
+         * finds no window for its next helper. Its TEB is read before the window goes. MADEIRA_WOW_REAP_DEAD=0 (the
+         * same switch as the reaper in virtual_ios.c) counts them as alive, as before. */
+        if (reap_dead < 0)
+        {
+            const char *e = getenv( "MADEIRA_WOW_REAP_DEAD" );
+            reap_dead = !(e && e[0] == '0');
+        }
+        if (reap_dead && kr == KERN_SUCCESS && info.suspend_count > 0 &&
+            vm_read_overwrite( mach_task_self(), (vm_address_t)(teb + offsetof(TEB, Peb)), sizeof(peb),
+                               (vm_address_t)&peb, &got ) == KERN_SUCCESS && got == sizeof(peb) && ios_peb_is_dead( peb ))
+            continue;
+        return 1;
     }
     return 0;
+}
+
+/* 1 for an address inside the JIT pool or region C: the places FEX's generated code and its
+ * dispatcher thunks live, so x28 is the CpuStateFrame there. */
+static int ios_fault_pc_is_jit( uint64_t pc )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+
+    return (rx && pc >= rx && pc < rx + ios_jit_pool_size_global) || ios_jit_low_contains( (uintptr_t)pc );
+}
+
+/* [wow-reap]: END THE LEFTOVER THREADS OF AN EXITED 32-BIT PROCESS, LAST RESORT.
+ *
+ * A launcher that starts a helper process every few seconds can find every start failing with "guest window reserve
+ * returned 0xc0000017" while windows are "still held by an exited process whose teardown did not complete": a worker
+ * thread of the exited process, busy in translated code, keeps its TEB inside the window, so the live-thread guard
+ * (ios_wow_reclaim_dead_windows) never lets the window go. Windows ends every thread of a process at ExitProcess; a
+ * thread that never leaves translated code here never notices.
+ *
+ * Called only by the window reservation (virtual_ios.c, ios_wow_reap_dead_windows; MADEIRA_WOW_REAP_DEAD=0 turns it
+ * off) when a 32-bit process could not get a window, for a dead window still held by threads. A thread is ended only
+ * when all of these hold:
+ *   - its TEB lies in the window and its Peb (read with vm_read_overwrite, the window is still mapped) is the dead
+ *     process's, which is on the dead-PEB list;
+ *   - after thread_suspend, its pc is in guest code (the window itself), in the JIT pool / region C (FEX's translated
+ *     code and thunks), or in libsystem_kernel (blocked in a system call). There it holds none of the app's own host
+ *     locks. Anywhere else (malloc, FEX's compiler, a Wine unix call) it is resumed and kept, and the window stays held.
+ * thread_terminate, as the [zombie] rule does; when iOS refuses it the thread stays suspended for good (parked), which
+ * ios_thread_registry_range_busy accepts. Returns how many threads were ended or parked; *kept counts those resumed. */
+int ios_thread_registry_end_dead_range( uintptr_t base, uintptr_t size, void *dead_peb, int *kept )
+{
+    extern int ios_peb_is_dead( const void *peb );
+    int count = ios_thread_registry_count(), i, ended = 0;
+    thread_t self = pthread_mach_thread_np( pthread_self() );
+    static int said;
+
+    if (kept) *kept = 0;
+    if (!dead_peb || !ios_peb_is_dead( dead_peb )) return 0;
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+        thread_t port = ios_thread_registry[i].mach_thread;
+        void *peb = NULL;
+        vm_size_t got = sizeof(peb);
+        arm_thread_state64_t st;
+        mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+        const char *where = NULL;
+        Dl_info di;
+        uint64_t pc;
+        kern_return_t kr;
+
+        if (!port || port == self || !teb || teb < base || teb - base >= size) continue;
+        if (vm_read_overwrite( mach_task_self(), (vm_address_t)(teb + offsetof(TEB, Peb)), sizeof(peb),
+                               (vm_address_t)&peb, &got ) != KERN_SUCCESS || got != sizeof(peb) || peb != dead_peb)
+        {
+            if (kept) (*kept)++;
+            continue;
+        }
+        kr = thread_suspend( port );
+        if (kr == KERN_INVALID_ARGUMENT || kr == MACH_SEND_INVALID_DEST || kr == KERN_TERMINATED) continue;   /* already gone */
+        if (kr != KERN_SUCCESS) { if (kept) (*kept)++; continue; }
+        if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &n ) != KERN_SUCCESS)
+        {
+            thread_resume( port );
+            if (kept) (*kept)++;
+            continue;
+        }
+        pc = (uint64_t)__darwin_arm_thread_state64_get_pc( st );
+        if (pc >= base && pc - base < size) where = "guest code";
+        else if (ios_fault_pc_is_jit( pc )) where = "translated code";
+        else if (dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_fname && strstr( di.dli_fname, "libsystem_kernel" ))
+            where = "a system call";
+        if (!where)
+        {
+            thread_resume( port );
+            if (kept) (*kept)++;
+            if (said++ < 16)
+                dprintf( 2, "[wow-reap] teb=%p of exited peb=%p kept: pc=0x%llx (%s) is host code that may hold a lock\n",
+                         (void *)teb, dead_peb, (unsigned long long)pc,
+                         dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_fname ? di.dli_fname : "?" );
+            continue;
+        }
+        kr = thread_terminate( port );
+        /* a refused terminate leaves the thread suspended: it never runs again, and
+         * ios_thread_registry_range_busy no longer counts it, so the window can go too */
+        ended++;
+        if (said++ < 16)
+            dprintf( 2, "[wow-reap] teb=%p of exited peb=%p in %s (pc=0x%llx): %s (kr=%d)\n", (void *)teb, dead_peb, where,
+                     (unsigned long long)pc, kr == KERN_SUCCESS ? "ended" : "parked, suspended for good", (int)kr );
+    }
+    return ended;
 }
 
 /* An entry a full registry may give to a new thread: one its guest window's

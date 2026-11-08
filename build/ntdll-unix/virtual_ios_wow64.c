@@ -1385,7 +1385,58 @@ static void ios_wow_reclaim_dead_windows(void)
  * ios_wow_map_allows_window) or, on a small map, when the maximum number of
  * concurrent windows is already alive.
  */
+static NTSTATUS ios_wow_window_reserve_once(void);
+
+/* [wow-reap]: LAST RESORT before a 32-bit process is refused its window. Dead windows that the
+ * live-thread guard keeps (an exited process's threads still exist, see ios_wow_reclaim_dead_windows) have those threads
+ * ended where that is safe (ios_thread_registry_end_dead_range, signal_arm64_ios.c), then they are reclaimed and the
+ * reservation is tried once more. A launcher's agent process could not start for 80 s ("guest window reserve
+ * returned 0xc0000017", every 3 s) while two windows were held by threads of exited helpers. Only the path that fails
+ * today runs it; MADEIRA_WOW_REAP_DEAD=0 turns it off. Returns how many threads were ended. */
+static int ios_wow_reap_dead_windows(void)
+{
+    extern int ios_thread_registry_end_dead_range( uintptr_t base, uintptr_t size, void *dead_peb, int *kept );
+    const char *env = getenv( "MADEIRA_WOW_REAP_DEAD" );
+    unsigned i;
+    int ended = 0;
+
+    if (env && !strcmp( env, "0" )) return 0;
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        ULONG_PTR base;
+        void *dead_peb;
+        int n, kept = 0;
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        if (!ios_wow_windows[i].base || ios_wow_windows[i].dead != 1)
+        {
+            pthread_mutex_unlock( &ios_wow_mutex );
+            continue;
+        }
+        base     = ios_wow_windows[i].base;
+        dead_peb = ios_wow_windows[i].dead_peb;
+        pthread_mutex_unlock( &ios_wow_mutex );
+        n = ios_thread_registry_end_dead_range( (uintptr_t)base, IOS_WOW_WINDOW_SIZE, dead_peb, &kept );
+        dprintf( 2, "[wow-reap] B=%p of exited peb=%p: %d leftover thread(s) ended, %d kept\n", (void *)base, dead_peb, n, kept );
+        ended += n;
+    }
+    return ended;
+}
+
 NTSTATUS ios_wow_window_reserve(void)
+{
+    NTSTATUS status = ios_wow_window_reserve_once();
+
+    if (status == STATUS_NO_MEMORY && ios_wow_reap_dead_windows() > 0)
+    {
+        status = ios_wow_window_reserve_once();   /* its first step reclaims the windows just freed of their threads */
+        dprintf( 2, "[wow-reap] second reservation after ending leftover threads: %s\n",
+                 status == STATUS_SUCCESS ? "a window was found" : "still no window" );
+    }
+    return status;
+}
+
+static NTSTATUS ios_wow_window_reserve_once(void)
 {
     struct ios_wow_window *slot = NULL;
     unsigned guard_owned = 0, held = 0;

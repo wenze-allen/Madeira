@@ -68,17 +68,6 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
 static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc );
 static uint64_t ios_app_text_lo, ios_app_text_hi;
 
-/* 1 for an address inside the JIT pool or region C: the places FEX's generated code and its
- * dispatcher thunks live, so x28 is the CpuStateFrame there. */
-static int ios_fault_pc_is_jit( uint64_t pc )
-{
-    extern void *ios_jit_rx_base_global;
-    extern size_t ios_jit_pool_size_global;
-    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
-
-    return (rx && pc >= rx && pc < rx + ios_jit_pool_size_global) || ios_jit_low_contains( (uintptr_t)pc );
-}
-
 /* [redeliv] child-only ending: WHAT THE REDELIVERY GUARD ENDS WHEN IT GIVES UP ON A STORM.
  *
  * The guard below ("2000 identical redeliveries") has always ended the whole app with task_terminate(). Wine runs
