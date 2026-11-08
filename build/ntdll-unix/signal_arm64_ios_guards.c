@@ -1325,6 +1325,96 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
     return 1;
 }
 
+/* [excl-store]: the instructions an exclusive pair holds between its LDXR/LDAXR and its
+ * STXR/STLXR, as operations on the loaded value (ml1284's emulation below).
+ *
+ *   add:  ADD/SUB immediate, Rd == Rn == the loaded register (arg = what it adds, two's complement)
+ *   and/orr/eor: AND, ORR, EOR, BIC, ORN, EON (shifted register, no shift), Rd == Rn == the loaded
+ *                register, Rm another register (arg = its value, inverted for BIC/ORN/EON)
+ * Anything else that writes the loaded register is not understood (the caller refuses). A pair
+ * with a logical operation cannot be replayed as a compare-and-swap on the value the load
+ * saw (AND loses it), so the emulation applies the operations to the memory's current value
+ * instead, in a compare-and-swap loop: the result a retry of the guest's loop would reach.
+ * env.MADEIRA_EXCL_LOGICAL = 0 understands ADD/SUB only, and a pair with a logical operation is
+ * refused as before. */
+enum { IOS_EXCL_ADD, IOS_EXCL_AND, IOS_EXCL_ORR, IOS_EXCL_EOR };
+typedef struct { int kind; uint64_t arg; int rm; } ios_excl_op;
+
+static int ios_excl_logical_on( void )
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_EXCL_LOGICAL" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static int ios_excl_decode_op( uint32_t insn, int ld_rt, int size, const uint64_t *x, ios_excl_op *op )
+{
+    const int rd = insn & 0x1f, rn = (insn >> 5) & 0x1f, rm = (insn >> 16) & 0x1f;
+
+    if (rd != ld_rt || rn != ld_rt || (insn >> 31) != (size == 3)) return 0;
+    if ((insn & 0x1f800000) == 0x11000000)             /* ADD/SUB(S) immediate */
+    {
+        uint64_t imm = (insn >> 10) & 0xfff;
+        if (insn & 0x400000) imm <<= 12;
+        op->kind = IOS_EXCL_ADD; op->rm = -1;
+        op->arg = (insn & 0x40000000) ? (uint64_t)0 - imm : imm;
+        return 1;
+    }
+    if ((insn & 0x1f000000) == 0x0a000000 && ios_excl_logical_on())   /* logical, shifted register */
+    {
+        const unsigned opc = (insn >> 29) & 3;
+        if (opc == 3 || ((insn >> 22) & 3) != 0 || ((insn >> 10) & 0x3f) != 0 || rm == ld_rt) return 0;   /* ANDS; shifted; Rm is the loaded register */
+        op->kind = opc == 0 ? IOS_EXCL_AND : opc == 1 ? IOS_EXCL_ORR : IOS_EXCL_EOR;
+        op->arg = rm == 31 ? 0 : x[rm];
+        if (insn & 0x200000) op->arg = ~op->arg;       /* BIC / ORN / EON */
+        op->rm = rm;
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t ios_excl_apply( const ios_excl_op *ops, int n, uint64_t v, uint64_t mask )
+{
+    int i;
+    for (i = 0; i < n; i++)
+    {
+        switch (ops[i].kind)
+        {
+        case IOS_EXCL_ADD: v += ops[i].arg; break;
+        case IOS_EXCL_AND: v &= ops[i].arg; break;
+        case IOS_EXCL_ORR: v |= ops[i].arg; break;
+        default:           v ^= ops[i].arg; break;
+        }
+        v &= mask;
+    }
+    return v;
+}
+
+/* The compare-and-swap loop: *result = the value written. size is the access size's log2. */
+static void ios_excl_rmw( void *p, unsigned size, const ios_excl_op *ops, int n, uint64_t mask, uint64_t *result )
+{
+    switch (size)
+    {
+    case 0: { uint8_t  c = __atomic_load_n( (uint8_t  *)p, __ATOMIC_SEQ_CST ), w;
+              do w = (uint8_t) ios_excl_apply( ops, n, c, mask ); while (!__atomic_compare_exchange_n( (uint8_t  *)p, &c, w, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+              *result = w; break; }
+    case 1: { uint16_t c = __atomic_load_n( (uint16_t *)p, __ATOMIC_SEQ_CST ), w;
+              do w = (uint16_t)ios_excl_apply( ops, n, c, mask ); while (!__atomic_compare_exchange_n( (uint16_t *)p, &c, w, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+              *result = w; break; }
+    case 2: { uint32_t c = __atomic_load_n( (uint32_t *)p, __ATOMIC_SEQ_CST ), w;
+              do w = (uint32_t)ios_excl_apply( ops, n, c, mask ); while (!__atomic_compare_exchange_n( (uint32_t *)p, &c, w, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+              *result = w; break; }
+    default:{ uint64_t c = __atomic_load_n( (uint64_t *)p, __ATOMIC_SEQ_CST ), w;
+              do w = ios_excl_apply( ops, n, c, mask ); while (!__atomic_compare_exchange_n( (uint64_t *)p, &c, w, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+              *result = w; break; }
+    }
+}
+
 /* x18-derived base register.
  *
  * Wine's EC kernelbase TlsGetValue is `add x8, x18, w0, uxtw #3;

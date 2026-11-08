@@ -2745,8 +2745,9 @@ static void *ios_mach_exception_thread( void *arg )
                         const int rs = (insn >> 16) & 0x1f, rn = (insn >> 5) & 0x1f, rt = insn & 0x1f;
                         const uint64_t mask = size == 3 ? ~0ull : ((1ull << (8u << size)) - 1);
                         const uint64_t ea = rn == 31 ? state.__sp : state.__x[rn];
-                        int ld_rt = -1, k, clobbered = 0;
+                        int ld_rt = -1, k, clobbered = 0, nops = 0, nlogical = 0, rmw = 0;
                         uint64_t delta = 0;   /* what in-place ADD/SUB immediates added to it */
+                        ios_excl_op ops[8];   /* the instructions between, in order (ios_excl_decode_op) */
                         uint32_t prev;
 
                         for (k = 1; k <= 8 && ld_rt < 0 && !clobbered; k++)
@@ -2761,19 +2762,23 @@ static void *ios_mach_exception_thread( void *arg )
                             for (k = k - 2; k >= 1 && !clobbered; k--)  /* the instructions between */
                             {
                                 if (!ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc - 4u * k, &prev )) { clobbered = 1; break; }
+                                { int j; for (j = 0; j < nops; j++) if (ops[j].rm >= 0 && (int)(prev & 0x1f) == ops[j].rm) clobbered = 1; }   /* an earlier operation's Rm written after it */
+                                if (clobbered) break;
                                 if ((int)(prev & 0x1f) != ld_rt) continue;
                                 if ((prev & 0x7e000000) == 0x34000000          /* CBZ / CBNZ */
                                     || (prev & 0x7e000000) == 0x36000000       /* TBZ / TBNZ */
                                     || (prev & 0xff000010) == 0x54000000)      /* B.cond */
                                     continue;
-                                /* ADD/SUB(S) immediate, Rd == Rn == the loaded register, at the
-                                 * load's width: sf op S 100010 sh imm12 Rn Rd */
-                                if ((prev & 0x1f800000) == 0x11000000 && (int)((prev >> 5) & 0x1f) == ld_rt
-                                    && (prev >> 31) == (size == 3))
+                                /* ADD/SUB(S) immediate (sf op S 100010 sh imm12 Rn Rd) or (an
+                                 * RtlpInterlockedClearBit-shaped LDAXR W11; AND W11, W11, W10;
+                                 * STLXR W12, W11 on a critical-section word in a Mono runtime's
+                                 * RWX memory was refused here until the redelivery guard ended
+                                 * the app) AND/ORR/EOR/BIC/ORN/EON of another register:
+                                 * Rd == Rn == the loaded register, at its width. */
+                                if (nops < 8 && ios_excl_decode_op( prev, ld_rt, size, (const uint64_t *)state.__x, &ops[nops] ))
                                 {
-                                    uint64_t imm = (prev >> 10) & 0xfff;
-                                    if (prev & 0x400000) imm <<= 12;
-                                    delta += (prev & 0x40000000) ? (uint64_t)0 - imm : imm;
+                                    if (ops[nops].kind == IOS_EXCL_ADD) delta += ops[nops].arg; else nlogical++;
+                                    nops++;
                                     continue;
                                 }
                                 clobbered = 1;
@@ -2784,6 +2789,21 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                             const uint64_t expect = (state.__x[ld_rt] - delta) & mask, val = IOS_STORE_SRC(rt) & mask;
                             int ok = 0;
+                            if (nlogical)
+                            {
+                                /* A logical operation lost the loaded value: apply the operations to what
+                                 * the memory holds now, atomically. Only when the stored register is the
+                                 * loaded one (AND W11, W11, W10; STLXR W12, W11): another register's value
+                                 * was computed from the old load and cannot be recomputed. */
+                                if (rt == ld_rt)
+                                {
+                                    uint64_t written = 0;
+                                    ios_excl_rmw( rw_addr, size, ops, nops, mask, &written );
+                                    state.__x[ld_rt] = written;
+                                    ok = 1; rmw = 1;
+                                }
+                            }
+                            else
                             switch (size)
                             {
                             case 0: { uint8_t  e = (uint8_t)expect;  ok = __atomic_compare_exchange_n( (uint8_t  *)rw_addr, &e, (uint8_t)val,  0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
@@ -2791,8 +2811,12 @@ static void *ios_mach_exception_thread( void *arg )
                             case 2: { uint32_t e = (uint32_t)expect; ok = __atomic_compare_exchange_n( (uint32_t *)rw_addr, &e, (uint32_t)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
                             default:{ uint64_t e = expect;           ok = __atomic_compare_exchange_n( (uint64_t *)rw_addr, &e, val,           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
                             }
-                            if (rs != 31) state.__x[rs] = ok ? 0 : 1;
-                            emulated = 1;
+                            if (nlogical && !rmw) emulated = 0;          /* refused: see above */
+                            else
+                            {
+                                if (rs != 31) state.__x[rs] = ok ? 0 : 1;
+                                emulated = 1;
+                            }
                         }
                         {
                             static int excl_n;
@@ -2801,7 +2825,8 @@ static void *ios_mach_exception_thread( void *arg )
                                     "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d delta=%lld%s %s\n",
                                     ++excl_n, insn, 1u << size, (unsigned long long)ea, ld_rt,
                                     (long long)delta, clobbered ? " (overwritten)" : "",
-                                    emulated ? (rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
+                                    emulated ? (rmw ? "emulated: read-modify-write on the current value"
+                                                    : rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
                                              : "REFUSED: no matching LDXR/LDAXR");
                         }
                     }
