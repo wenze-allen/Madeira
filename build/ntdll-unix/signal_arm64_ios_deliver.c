@@ -735,16 +735,30 @@ dispatch:
          * was one of 16 chosen by a hash of the port, so two storming threads
          * sharing a slot restarted each other's run on every delivery and the
          * terminal never fired. */
+        /* A protection change between two deliveries (FEX's self-modifying-code cycle:
+         * unprotect, recompile, protect again) is real progress: the slot keeps the protection
+         * sequence number of its last delivery, and a different one starts a new run
+         * (upstream 0a2e6ed tags its guest-RIP key with it; this guard has no such key).
+         * MADEIRA_REDELIV_VPROTECT=0 restores the old counting. */
+        extern volatile unsigned long long ios_vprotect_seq;
+        static int redeliv_vprotect = -1;
         static struct ios_guard_table redeliv_tab;
-        static struct { uint64_t key; uint32_t n; } redeliv[IOS_GUARD_SLOTS];
+        static struct { uint64_t key; uint32_t n; uint64_t vp_seq; } redeliv[IOS_GUARD_SLOTS];
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
+        uint64_t cur_vp_seq = ios_vprotect_seq;
         int rfresh;
         int rslot = ios_guard_slot( &redeliv_tab, (uint64_t)thread, mach_absolute_time(), &rfresh );
-        if (rfresh || redeliv[rslot].key != rkey)
+        if (redeliv_vprotect < 0)
+        {
+            const char *e = getenv( "MADEIRA_REDELIV_VPROTECT" );
+            redeliv_vprotect = !(e && e[0] == '0');
+        }
+        if (rfresh || redeliv[rslot].key != rkey || (redeliv_vprotect && redeliv[rslot].vp_seq != cur_vp_seq))
         {
             redeliv[rslot].key = rkey;
             redeliv[rslot].n = 1;
+            redeliv[rslot].vp_seq = cur_vp_seq;
         }
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",

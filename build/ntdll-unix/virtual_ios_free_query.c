@@ -1817,6 +1817,12 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
 #endif
 
 
+/* Monotonic counter incremented on every successful NtProtectVirtualMemory call so
+ * signal_arm64_ios.c's [redeliv] storm guard can distinguish a genuinely stuck fault
+ * from a legitimate FEX SMC untrap -> retire -> recompile -> retrap cycle (seen in two
+ * 32-bit titles that patch their own code). */
+volatile unsigned long long ios_vprotect_seq = 0;
+
 /***********************************************************************
  *             NtProtectVirtualMemory   (NTDLL.@)
  *             ZwProtectVirtualMemory   (NTDLL.@)
@@ -1959,7 +1965,11 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     }
     else status = STATUS_INVALID_PARAMETER;
 
-    if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+    if (!status)
+    {
+        __sync_fetch_and_add( &ios_vprotect_seq, 1 );
+        VIRTUAL_DEBUG_DUMP_VIEW( view );
+    }
 
 #ifdef WINE_IOS
     /* madeira-bcd: [prot-img] -- protection changes of 64 KB or more on the
