@@ -2597,6 +2597,38 @@ static void register_view( struct file_view *view )
  *
  * Create a view. virtual_mutex must be held by caller.
  */
+/* create-view refuse: a title died here 89 s in, while FEX started a thread and asked for 16 MB:
+ * "Assertion failed: (view->protect & VPROT_SYSTEM), function create_view", exit 0x80000101. A new view overlapped a
+ * view that is NOT a system view (one Wine itself maps and unmaps); the assert ended the whole process. The overlap is now refused
+ * with STATUS_CONFLICTING_ADDRESSES, which every caller already handles (map_view unmaps what it mapped, free_pages and
+ * virtual_create_builtin_view pass the status on), and this line says which two views and who made the old one. The first four
+ * times, then every 256th. MADEIRA_CREATE_VIEW_REFUSE=0 restores the assert. */
+static int ios_create_view_refuse_enabled( void )
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_CREATE_VIEW_REFUSE" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+static void ios_create_view_conflict( const struct file_view *old, void *base, size_t size, unsigned int vprot )
+{
+    static int n;
+    int c = __sync_add_and_fetch( &n, 1 );
+
+    if (c > 4 && (c & 255)) return;
+    dprintf( 2, "[create-view] #%d REFUSED (was an assert that ended the process): new view %p+0x%lx protect=0x%x overlaps "
+                "view %p+0x%lx protect=0x%x, which is not a system view; asked by tid %04x, guest rip 0x%llx (context 0x%llx)\n",
+             c, base, (unsigned long)size, vprot, old->base, (unsigned long)old->size, old->protect,
+             NtCurrentTeb() ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+             (unsigned long long)ios_guest_rip_now(), (unsigned long long)ios_guest_ctx_rip() );
+    if (c <= 2) ios_vh_dump( old->base );   /* who created and removed views at the old view's base (1 MB and up) */
+}
+
 static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t size, unsigned int vprot )
 {
     struct file_view *view;
@@ -2612,6 +2644,12 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     {
         TRACE( "overlapping view %p-%p for %p-%p\n",
                view->base, (char *)view->base + view->size, base, (char *)base + size );
+        if (!(view->protect & VPROT_SYSTEM) && ios_create_view_refuse_enabled())
+        {
+            /* create-view refuse: this was an assert that the overlapped view is a system view */
+            ios_create_view_conflict( view, base, size, vprot );
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
         assert( view->protect & VPROT_SYSTEM );
         delete_view( view );
     }
