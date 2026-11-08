@@ -344,6 +344,52 @@ static int ios_pool_range_execable(size_t off, size_t range_size,
     return 1;
 }
 
+/* tail-carve exec check: the first page of a tail carve's range that has lost EXEC.
+ *
+ * Several 32-bit titles whose FEX code buffer grew to 128 MB ended in a redelivery
+ * storm of EXECUTE faults inside the pool: the new carve's first page read prot=3 max=3
+ * ("[mach_exc] vm_region: addr=0x13522c000 size=0x4000 prot=0x3 max_prot=0x3"), and a
+ * page that max_prot has lost EXEC never gets it back (mprotect(RX) fails with EACCES).
+ * The head allocator already refuses such ranges (ios_pool_range_execable, [pool-poison]);
+ * the tail carve never asked. Walks [off, off + min(size, limit)) like
+ * ios_pool_range_execable but says WHERE the first non-exec region starts. Returns 1 when
+ * one exists (bad_at is its offset in the range, cur/max its protections), 0 when the
+ * prefix is executable or a region query fails (a failed query never refuses a carve). */
+static int ios_pool_range_first_nonexec( size_t off, size_t size, size_t limit,
+                                         size_t *bad_at, unsigned int *cur_out, unsigned int *max_out )
+{
+    mach_vm_address_t base, a, end;
+
+    if (!ios_jit_rx_base_global || !size) return 0;
+    if (size > limit) size = limit;
+    base = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+    end  = base + size;
+
+    for (a = base; a < end; )
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS) return 0;
+        if (q >= end) break;
+        if (q > a) { a = q; continue; }      /* gap: skip to the next real region */
+        if (!sz) break;
+        if (!(info.max_protection & VM_PROT_EXECUTE))
+        {
+            if (bad_at) *bad_at = (size_t)(a - base);
+            if (cur_out) *cur_out = (unsigned int)info.protection;
+            if (max_out) *max_out = (unsigned int)info.max_protection;
+            return 1;
+        }
+        a = q + sz;
+    }
+    return 0;
+}
+
 /* madeira-bcd: the parts of a POISONED freed range that are still executable.
  *
  * Every range the dead SocialClubHelper.exe processes freed was dropped as

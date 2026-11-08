@@ -845,6 +845,65 @@ retry_code_carve_reuse:
         {
             void *jit_rx = (char *)ios_jit_rx_base_global + pool_tail_off;
             void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
+
+            /* tail-carve exec check: REFUSE A CARVE WHOSE FIRST PAGES CANNOT EXECUTE.
+             *
+             * In several 32-bit titles, after the program's unnamed image copy a run of
+             * pool pages had lost EXEC for good (max_prot 3, "[pool-rot] ... LOST EXEC",
+             * "[pool-poison] HANDED OUT NON-EXEC"), the pool was only 400-560 MB, and the 128 MB
+             * code buffer FEX asked for lay on top of that run. Nothing checked it. FEX wrote its
+             * first block through the RW alias, executed it at base+0x1c, got an exec fault
+             * ([exec-recover] mprotect_rx=-1 errno=13; [fault_rip] ... entryprot=3), and the
+             * guest exception dispatcher compiled into the same dead page faulted again until the
+             * redelivery guard ended the process. Such a buffer can never run a block, so the
+             * request is refused the way an exhausted tail is (ml421): FEX's CodeBuffer ctor
+             * halves the size, which moves the next carve up, away from the run (a 64 MB or
+             * 32 MB buffer lay above it in all three logs). Only the first 2 MB are looked at (the dead pages in the four logs lay at +0..+0x39e3c;
+             * FEX's first blocks go there at once); a dead page deeper in is logged and the carve
+             * kept, as before. A carve whose first 2 MB can execute is granted exactly as it was;
+             * no log line, no change. */
+            {
+                enum { CARVE_EXEC_PREFIX = 0x200000 };   /* 2 MB: the dead pages in all four logs lay within it */
+                size_t bad_at = 0;
+                unsigned int bcur = 0, bmax = 0;
+                /* env.MADEIRA_TAIL_CARVE_EXEC_CHECK = 0 turns the check off (every carve granted, as before). */
+                static int carve_check = -1;
+                if (carve_check < 0)
+                {
+                    const char *e = getenv( "MADEIRA_TAIL_CARVE_EXEC_CHECK" );
+                    carve_check = !(e && e[0] == '0');
+                }
+                if (carve_check &&
+                    ios_pool_range_first_nonexec( pool_tail_off, alloc_size, CARVE_EXEC_PREFIX, &bad_at, &bcur, &bmax ))
+                {
+                    static unsigned nonexec_n;
+                    ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,
+                                             ios_jit_hole_end > ios_jit_hole_off );
+                    if (nonexec_n++ < 16)
+                        dprintf(2, "[jit-pool] tail carve NOT EXECUTABLE: want=0x%lx at rx=%p: +0x%lx has prot=%x "
+                                   "max=%x (EXEC gone for good) -- REFUSING so FEX halves down, a buffer whose first "
+                                   "blocks fault is fatal (tail_resv=0x%lx head_used=0x%lx/0x%lx)\n",
+                                (unsigned long)alloc_size, jit_rx, (unsigned long)bad_at, bcur, bmax,
+                                (unsigned long)reserve_offset, (unsigned long)jit_pool_offset,
+                                (unsigned long)ios_jit_pool_size_global);
+                    return STATUS_NO_MEMORY;
+                }
+                if (alloc_size > CARVE_EXEC_PREFIX)
+                {
+                    static unsigned deep_n;
+                    if (deep_n < 8 &&
+                        ios_pool_range_first_nonexec( pool_tail_off + CARVE_EXEC_PREFIX, alloc_size - CARVE_EXEC_PREFIX,
+                                                      alloc_size, &bad_at, &bcur, &bmax ))
+                    {
+                        deep_n++;
+                        dprintf(2, "[jit-pool] tail carve rx=%p size=0x%lx has a non-exec page at +0x%lx (prot=%x max=%x), "
+                                   "beyond the first 2 MB: kept\n",
+                                jit_rx, (unsigned long)alloc_size,
+                                (unsigned long)(bad_at + CARVE_EXEC_PREFIX), bcur, bmax);
+                    }
+                }
+            }
+
             *ret = jit_rx;
             *size_ptr = alloc_size;
             /* iOS-Madeira: pre-fill the buffer with NOPs (0xd503201f) via the RW
