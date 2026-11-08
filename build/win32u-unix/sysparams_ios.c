@@ -2469,6 +2469,46 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
     return map_dpi_rect( rect, dpi_from, dpi );
 }
 
+#ifdef WINE_IOS
+/* iOS-Madeira: the virtual monitor's Win32 names.
+ *
+ * This port reports one adapter, "\\.\DISPLAY1" (NtUserEnumDisplayDevices'
+ * synthesized branch; DXGI_OUTPUT_DESC::DeviceName says the same), and one
+ * monitor under it, the virtual monitor, which has no source. Upstream's code
+ * gives a sourceless monitor the GDI name "WinDisc" -- Windows' name for a
+ * DISCONNECTED display -- and leaves the monitor's DeviceID and DeviceKey
+ * empty, so a program that walks adapter -> monitor -> device interface
+ * (EnumDisplayDevices(L"\\.\DISPLAY1", 0, EDD_GET_DEVICE_INTERFACE_NAME)) or
+ * matches GetMonitorInfo's szDevice against the DXGI output / NVAPI display
+ * name finds no monitor on the GPU and reports no graphics card.
+ * MADEIRA_VMON_IDS=0 restores upstream's answers. */
+static int ios_vmon_ids_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VMON_IDS" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* The monitor's DeviceID: its device interface path with
+ * EDD_GET_DEVICE_INTERFACE_NAME, its device instance id without. */
+static void ios_vmon_device_id( DWORD flags, char *buffer, size_t size )
+{
+    if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
+        snprintf( buffer, size, "\\\\?\\DISPLAY#Default_Monitor#4&madeira&0&UID0#%s", guid_devinterface_monitorA );
+    else
+        snprintf( buffer, size, "MONITOR\\Default_Monitor\\%s\\0000", guid_devclass_monitorA );
+}
+
+static void ios_vmon_device_key( char *buffer, size_t size )
+{
+    snprintf( buffer, size, "%s\\Class\\%s\\0000", control_keyA, guid_devclass_monitorA );
+}
+#endif
+
 /* display_lock must be held */
 static void monitor_get_info( struct monitor *monitor, MONITORINFO *info, UINT dpi )
 {
@@ -2484,11 +2524,22 @@ static void monitor_get_info( struct monitor *monitor, MONITORINFO *info, UINT d
 #ifdef WINE_IOS
         /* iOS-Madeira: the virtual monitor is the one EnumDisplayDevices and
          * DXGI call "\\.\DISPLAY1"; "WinDisc" is Windows' name for a
-         * disconnected display, so a program matching the two found none. */
-        else if (monitor == &virtual_monitor) strcpy( buffer, "\\\\.\\DISPLAY1" );
+         * disconnected display, so a program matching the two found none.
+         * MADEIRA_VMON_IDS=0 restores "WinDisc" (ios_vmon_ids_enabled). */
+        else if (monitor == &virtual_monitor && ios_vmon_ids_enabled()) strcpy( buffer, "\\\\.\\DISPLAY1" );
 #endif
         else strcpy( buffer, "WinDisc" );
         asciiz_to_unicode( ((MONITORINFOEXW *)info)->szDevice, buffer );
+#ifdef WINE_IOS
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf( 2, "[vmon] GetMonitorInfo(EX) monitor=%p szDevice=%s rc={%d,%d,%d,%d} flags=%#x "
+                         "(MADEIRA_VMON_IDS=0 restores \"WinDisc\")\n", monitor->handle, buffer,
+                         (int)info->rcMonitor.left, (int)info->rcMonitor.top, (int)info->rcMonitor.right,
+                         (int)info->rcMonitor.bottom, (unsigned)info->dwFlags );
+        }
+#endif
     }
 }
 
@@ -4545,46 +4596,46 @@ NTSTATUS WINAPI NtUserEnumDisplayDevices( UNICODE_STRING *device, DWORD index,
             else
                 info->StateFlags = DISPLAY_DEVICE_ATTACHED | DISPLAY_DEVICE_ACTIVE;
         }
+        /* The adapter is the GPU ios_register_virtual_gpu writes to the
+         * registry (Apple, or NVIDIA with DXMT_ENABLE_NVEXT=1), with its PCI
+         * ids and the driver key, so engines that read the driver version
+         * through EnumDisplayDevices find one. Under display_lock, as
+         * lock_display_devices calls it (upstream). */
+        if (is_adapter)
         {
-            /* The adapter is the GPU ios_register_virtual_gpu writes to the
-             * registry, with its PCI id and driver key; the monitor has its
-             * device instance id, or its device interface path with
-             * EDD_GET_DEVICE_INTERFACE_NAME (an adapter has none, on Windows
-             * either). Programs walk adapter -> monitor -> interface to find the
-             * GPU that drives their monitor (Ghost of Tsushima asks
-             * EnumDisplayDevices(L"\\.\DISPLAY1", 0, EDD_GET_DEVICE_INTERFACE_NAME)). */
+            pthread_mutex_lock( &display_lock );
+            ios_register_virtual_gpu();
+            pthread_mutex_unlock( &display_lock );
+        }
+        {
+            /* What DeviceID / DeviceKey say; also for the log line. */
             char id[MAX_PATH] = "", key[MAX_PATH] = "";
 
-            if (is_adapter)
+            if (is_adapter && !(flags & EDD_GET_DEVICE_INTERFACE_NAME))
             {
                 UINT16 vendor, device_id;
-
-                pthread_mutex_lock( &display_lock );
-                ios_register_virtual_gpu();
-                pthread_mutex_unlock( &display_lock );
                 ios_virtual_gpu_ids( &vendor, &device_id );
-                if (!(flags & EDD_GET_DEVICE_INTERFACE_NAME))
-                    snprintf( id, sizeof(id), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00", vendor, device_id );
+                snprintf( id, sizeof(id), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00", vendor, device_id );
+            }
+            /* The monitor's ids, which upstream leaves empty (an adapter has
+             * no interface name, on Windows either). Programs walk adapter ->
+             * monitor -> interface to find the GPU that drives their monitor. */
+            else if (!is_adapter && ios_vmon_ids_enabled()) ios_vmon_device_id( flags, id, sizeof(id) );
+            if (is_adapter)
                 snprintf( key, sizeof(key), "%s\\Video\\%s\\0000", control_keyA, ios_video_guidA );
-            }
-            else
-            {
-                if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
-                    snprintf( id, sizeof(id), "\\\\?\\DISPLAY#Default_Monitor#4&madeira&0&UID0#%s", guid_devinterface_monitorA );
-                else
-                    snprintf( id, sizeof(id), "MONITOR\\Default_Monitor\\%s\\0000", guid_devclass_monitorA );
-                snprintf( key, sizeof(key), "%s\\Class\\%s\\0000", control_keyA, guid_devclass_monitorA );
-            }
+            else if (ios_vmon_ids_enabled()) ios_vmon_device_key( key, sizeof(key) );
+
             if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceID) + sizeof(info->DeviceID))
                 asciiz_to_unicode( info->DeviceID, id );
             if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceKey) + sizeof(info->DeviceKey))
                 asciiz_to_unicode( info->DeviceKey, key );
-        }
-        {
-            static int logged;
-            if (logged++ < 4)
-                dprintf(2, "[vmode] synthesized EnumDisplayDevices %s idx=%u\n",
-                        is_adapter ? "adapter" : "monitor", index);
+            {
+                static int logged;
+                if (logged++ < 8)
+                    dprintf(2, "[vmode] synthesized EnumDisplayDevices %s idx=%u flags=%#x cb=%u id=%s key=%s\n",
+                            is_adapter ? "adapter" : "monitor", index, (unsigned)flags,
+                            (unsigned)info->cb, id[0] ? id : "(empty)", key[0] ? key : "(empty)");
+            }
         }
         return STATUS_SUCCESS;
     }
@@ -8591,7 +8642,26 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (target_name->header.id != monitor->output_id) continue;
-            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+#ifdef WINE_IOS
+            /* iOS-Madeira: MADEIRA_VDCFG_PATH = 1 lists the virtual monitor's path (QueryDisplayConfig); this
+             * names its target. Off (default): skipped as before. */
+            if (!monitor->source && ios_vdcfg_lists_sourceless( ios_vdcfg_path_enabled(), 1, monitor == &virtual_monitor ))
+            {
+                LUID virtual_luid;
+                char path[128];
+
+                ios_virtual_luid_locked( &virtual_luid );
+                if (memcmp( &target_name->header.adapterId, &virtual_luid, sizeof(virtual_luid) )) continue;
+                target_name->outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+                snprintf( buffer, ARRAY_SIZE(buffer), "Display%u", monitor->output_id + 1 );
+                asciiz_to_unicode( target_name->monitorFriendlyDeviceName, buffer );
+                ios_vmon_device_id( EDD_GET_DEVICE_INTERFACE_NAME, path, sizeof(path) );
+                asciiz_to_unicode( target_name->monitorDevicePath, path );
+                ret = STATUS_SUCCESS;
+                break;
+            }
+#endif
+            /* iOS-Madeira: the virtual monitor (the only one on iOS since the WoW64
              * series) has no source; QueryDisplayConfig reports no path for it either. */
             if (!monitor->source) continue;
             if (memcmp( &target_name->header.adapterId, &monitor->source->gpu->luid,
