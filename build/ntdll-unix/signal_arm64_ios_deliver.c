@@ -1305,3 +1305,37 @@ static inline void ios_track_signal( int sig, ucontext_t *context )
 #endif
 
 
+#ifdef WINE_IOS
+/* [syscall-fault] A protection fault inside a system call that guards itself with __TRY.
+ *
+ * Darwin reports a fault on a mapped PROT_NONE page (a reserved, never-committed page of a Wine view) as SIGBUS. bus_handler
+ * turned it into a guest exception even when the faulting code was a unix-side system call inside __TRY; only segv_handler
+ * asked handle_syscall_fault() for the jmp_buf. The guest exception was then dispatched on the kernel stack, where no guest
+ * frame is inside the stack limits, and the process ended. A program that probes memory the IsBadReadPtr way (for example
+ * NtReadVirtualMemory on a guard page of its own stack) expects the call to fail with a status, not to die.
+ *
+ * When a __TRY is active (the thread's jmp_buf is set) and handle_syscall_fault accepts the fault, return to the __EXCEPT
+ * block exactly as segv_handler does. Everything else goes on as before. One capped line per hit.
+ * MADEIRA_BUS_SYSCALL_FAULT=0 restores the old SIGBUS handling. */
+static int ios_bus_syscall_fault( ucontext_t *ctx, EXCEPTION_RECORD *rec )
+{
+    static volatile int said;
+    static int enabled = -1;
+    uintptr_t pc = (uintptr_t)PC_sig(ctx), lr = (uintptr_t)LR_sig(ctx);
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_BUS_SYSCALL_FAULT" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return 0;
+    if (!NtCurrentTeb() || !ntdll_get_thread_data()->jmp_buf) return 0;
+    if (!handle_syscall_fault( ctx, rec )) return 0;
+    if (said < 16 && __sync_add_and_fetch( &said, 1 ) <= 16)
+        dprintf( 2, "[syscall-fault] a protection fault (SIGBUS) at %p inside a system call with a __TRY: the call fails (pc=%p lr=%p) "
+                    "instead of the process ending\n",(void *)(uintptr_t)rec->ExceptionInformation[1], (void *)pc, (void *)lr );
+    return 1;
+}
+#endif
+
+

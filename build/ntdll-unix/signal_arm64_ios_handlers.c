@@ -372,6 +372,14 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 return;
             }
 
+            /* [syscall-fault] the page cannot be repaired. If a system call is reading or writing it inside a __TRY (a
+             * ReadProcessMemory probe of the process's own memory), that call fails; it must not become a guest exception. */
+            if (ios_bus_syscall_fault( bus_ctx, &vrec ))
+            {
+                ios_fixup_x18_for_return( bus_ctx );
+                return;
+            }
+
             rd_kr = mach_vm_read_overwrite( mach_task_self(),
                                             (mach_vm_address_t)(uintptr_t)siginfo->si_addr & ~7ULL,
                                             8, (mach_vm_address_t)(uintptr_t)&rd_buf, &rd_out );
@@ -783,6 +791,14 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 if ((ec == 0x24 || ec == 0x25) && (esr & 0x3f) != 0x21)
                 {
                     static unsigned protection_av_logs;
+                    /* [syscall-fault] a permission fault of a system call's __TRY (a write probe of a read-only buffer, a read
+                     * of a page that lost READ) fails the call, as above; guest code never reaches this (its stack pointer is not
+                     * on the kernel stack and it has no jmp_buf). */
+                    if (ios_bus_syscall_fault( bus_ctx, &vrec ))
+                    {
+                        ios_fixup_x18_for_return( bus_ctx );
+                        return;
+                    }
                     if (protection_av_logs++ < 16)
                         dprintf( 2, "[bus-data-av] pc=%p addr=%p esr=%08x rw=%lu\n",
                                  pc, siginfo->si_addr, esr,
