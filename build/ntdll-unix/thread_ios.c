@@ -2370,16 +2370,30 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
      *
      * So swallow it and continue, exactly as the DBG_CONTINUE path above does. This
      * does not paper over the stuck unwind (task #38) -- it stops a benign event from
-     * being fatal while that is fixed. Real faults still terminate. */
+     * being fatal while that is fixed. Real faults still terminate.
+     *
+     * The thread-naming exception (MS_VC_EXCEPTION, 0x406D1388) is the same kind
+     * of event: a hint for a debugger that a program raises inside its own
+     * __try. When it reaches second chance anyway, a continuable one is
+     * swallowed too. env.MADEIRA_THREADNAME_SWALLOW = 0 lets it end the process
+     * as before. */
+    static int threadname_swallow = -1;
+    if (threadname_swallow < 0)
+    {
+        const char *e = getenv( "MADEIRA_THREADNAME_SWALLOW" );
+        threadname_swallow = !(e && e[0] == '0');
+    }
     if (rec->ExceptionCode == DBG_PRINTEXCEPTION_C ||
-        rec->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C)
+        rec->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C ||
+        (threadname_swallow && rec->ExceptionCode == 0x406D1388 && !(rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE)))
     {
         static int swallowed;
         if (swallowed++ < 8)
             ERR_(seh)("[dbgprint] swallowing %s that reached second chance "
                       "(flags=%x addr=%p) -- continuing instead of dying\n",
-                      rec->ExceptionCode == DBG_PRINTEXCEPTION_C ? "DBG_PRINTEXCEPTION_C"
-                                                                : "DBG_PRINTEXCEPTION_WIDE_C",
+                      rec->ExceptionCode == 0x406D1388 ? "MS_VC_EXCEPTION (0x406D1388)"
+                      : (rec->ExceptionCode == DBG_PRINTEXCEPTION_C ? "DBG_PRINTEXCEPTION_C"
+                                                                    : "DBG_PRINTEXCEPTION_WIDE_C"),
                       rec->ExceptionFlags, rec->ExceptionAddress );
         return NtContinue( context, FALSE );
     }
