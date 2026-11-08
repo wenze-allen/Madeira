@@ -353,6 +353,94 @@ int ios_peb_is_dead( const void *peb )
     for (i = 0; i < IOS_DEAD_PEB_MAX; i++) if (ios_dead_pebs[i] == peb) return 1;
     return 0;
 }
+
+/* Madeira storm-end: is this the PEB of a LIVE child pseudo-process (one that registered a master socket with the wineserver)?
+ * The session's first process has no entry here, and neither has a PEB nobody knows: both answer 0. Lock-free, like
+ * ios_peb_is_dead (read from the Mach exception thread). */
+int ios_peb_is_live_child( const void *peb )
+{
+    int i, n = ios_proc_socket_count;
+    if (!peb) return 0;
+    if (n > IOS_MAX_PROC_SOCKETS) n = IOS_MAX_PROC_SOCKETS;
+    for (i = 0; i < n; i++) if (ios_proc_sockets[i].peb == peb) return 1;
+    return 0;
+}
+
+/* Madeira storm-end: END ONE CHILD PSEUDO-PROCESS FROM OUTSIDE ITS THREADS.
+ *
+ * The redelivery guard (signal_arm64_ios.c, "[redeliv] 2000 identical redeliveries") used to end the whole app, whichever
+ * Windows process the storm was in. A storm in a child (a launcher's network-service helper) now ends that process only
+ * (the caller's switch and policy are in signal_arm64_ios_deliver.c, ios_storm_end_child_only). process_exit_wrapper does the bookkeeping on the dying process's own thread; the storming thread cannot be
+ * made to run it (its stack is the problem), so the same steps run here, keyed by the PEB, on a short-lived worker thread
+ * (the Mach exception thread must never wait on a lock a Windows thread holds):
+ *   - the master socket closes: the wineserver sees EOF, wakes the process's waiters and kills its threads server-side;
+ *   - the child table (process_ios.c), the dead-PEB list, the fd cache, the sub-floor windows, the JIT pool allocations and the
+ *     guest window are released exactly as process_exit_wrapper releases them.
+ * Not done here: ios_retire_own_fixed_base_image (it needs the owning thread's server connection); the caller does not use this
+ * path for a process that owns the fixed-base image. The process's other threads are left as an ordinary exit leaves them: the
+ * ones that wake into reclaimed memory are ended one by one by the [zombie] rule in signal_arm64_ios.c. */
+struct ios_storm_end { void *peb; int status; };
+static struct ios_storm_end ios_storm_end_args[8];   /* no malloc on the Mach exception thread; a few at a time at most */
+static unsigned ios_storm_end_next;
+
+static void *ios_storm_end_thread( void *arg )
+{
+    struct ios_storm_end a = *(struct ios_storm_end *)arg;
+    extern int ios_child_slot_name( void *peb, char *out, size_t len );
+    extern void ios_child_slot_exited( void *peb );
+    extern void ios_jit_reclaim_process( void *peb );
+    extern void ios_fd_cache_release( void *peb );
+    extern void ios_subfloor_release_owner( void *owner );
+    extern void ios_wow_window_release( void *peb_id );
+    char name[64];
+    int i, n, fd = -1;
+
+    pthread_setname_np( "wine-storm-end" );
+    ios_child_slot_name( a.peb, name, sizeof(name) );
+    n = ios_proc_socket_count;
+    if (n > IOS_MAX_PROC_SOCKETS) n = IOS_MAX_PROC_SOCKETS;
+    for (i = 0; i < n; i++)
+    {
+        /* claim the entry the way an ordinary exit clears it: whoever gets there first does the closing, once */
+        if (ios_proc_sockets[i].peb != a.peb) continue;
+        fd = ios_proc_sockets[i].fd;
+        if (!__sync_bool_compare_and_swap( &ios_proc_sockets[i].peb, a.peb, NULL )) fd = -1;
+        break;
+    }
+    if (fd < 0)
+    {
+        wine_log_write( "[redeliv] the Windows process %s (peb=%p) had already ended; nothing more to release rev=storm-end", name, a.peb );
+        return NULL;
+    }
+    wine_log_write( "[redeliv] ending only the Windows process %s (peb=%p, master socket %d): the app and the other processes keep running "
+                    "rev=storm-end", name, a.peb, fd );
+    ios_fdt_note_close( fd, "exit-master-storm", a.peb );
+    close( fd );
+    ios_child_slot_exited( a.peb );
+    ios_dead_pebs[__sync_fetch_and_add( &ios_dead_peb_next, 1 ) % IOS_DEAD_PEB_MAX] = a.peb;
+    ios_fd_cache_release( a.peb );
+    ios_subfloor_release_owner( a.peb );
+    ios_jit_reclaim_process( a.peb );
+    ios_wow_window_release( a.peb );
+    wine_log_write( "[redeliv] the Windows process %s (peb=%p) is released: socket, child table, JIT allocations, guest window rev=storm-end",
+                    name, a.peb );
+    return NULL;
+}
+
+/* 1: a worker thread was started and will end the process; 0: nothing was done (the caller keeps its old behaviour). */
+int ios_end_child_process_async( void *peb, int status )
+{
+    struct ios_storm_end *a;
+    pthread_t t;
+
+    if (!ios_peb_is_live_child( peb )) return 0;
+    a = &ios_storm_end_args[__sync_fetch_and_add( &ios_storm_end_next, 1 ) % 8];
+    a->peb = peb;
+    a->status = status;
+    if (pthread_create( &t, NULL, ios_storm_end_thread, a )) return 0;
+    pthread_detach( t );
+    return 1;
+}
 #endif
 static _Thread_local int initial_cwd = -1;
 static pid_t server_pid;
@@ -5117,6 +5205,10 @@ void process_exit_wrapper( int status )
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
+        {   /* Madeira child-exit: this child's process ended; its slot in process_ios.c must not keep a session alive */
+            extern void ios_child_slot_exited( void *peb );
+            ios_child_slot_exited( dead_peb );
+        }
         ios_dead_pebs[__sync_fetch_and_add( &ios_dead_peb_next, 1 ) % IOS_DEAD_PEB_MAX] = dead_peb;
         /* ml571: drop this pseudo-process's fd cache and close what it held.
          * Must happen on the SAME identity used to key it, and before the JIT
@@ -5879,6 +5971,11 @@ size_t server_init_process_child( int child_fd_socket )
     if (fcntl( child_fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
         wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", child_fd_socket);
     ios_register_proc_socket( ios_jit_current_peb(), child_fd_socket );
+    {   /* Madeira child-exit: the child's slot in process_ios.c learns its PEB, so process_exit_wrapper can mark
+         * it ended whichever thread ends the process (a child that exits off its boot thread never releases it) */
+        extern void ios_child_slot_bind_peb( void *peb );
+        ios_child_slot_bind_peb( ios_jit_current_peb() );
+    }
 
     wine_log_write("[Wine child] server_init_process_child: fd_socket=%d (peb=%p)",
                    child_fd_socket, ios_jit_current_peb());

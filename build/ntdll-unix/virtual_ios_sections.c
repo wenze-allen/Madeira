@@ -417,6 +417,21 @@ void ios_retire_own_fixed_base_image( void *dying_peb )
 }
 
 
+/* ios_exe_win_owned_by: does this pseudo-process own the fixed-base main image (OWNED)?  The storm guard ends a child process from a
+ * worker thread (server_ios.c, ios_end_child_process_async), which cannot do the retire above, so it leaves such a process to
+ * the old whole-app ending. */
+int ios_exe_win_owned_by( void *peb )
+{
+    int owned;
+
+    if (!peb) return 0;
+    pthread_mutex_lock( &ios_exewin_lock );
+    owned = ios_exewin_st == IOS_EXEWIN_OWNED && peb == ios_exe_win_img_peb;
+    pthread_mutex_unlock( &ios_exewin_lock );
+    return owned;
+}
+
+
 /***********************************************************************
  *           ios_exe_win_mark_ready                               (ml988)
  *

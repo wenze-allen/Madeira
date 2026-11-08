@@ -440,13 +440,40 @@ struct ios_child_args {
  * as long as the game and used to end with it. */
 #define IOS_CHILD_SLOTS 32
 static pthread_mutex_t ios_child_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { char name[64]; double started; int used; } ios_child_slots[IOS_CHILD_SLOTS];
+/* Madeira child-exit: peb = the child's PEB once it registered with the wineserver (ios_child_slot_bind_peb);
+ * exited = its process ended (ios_child_slot_exited, from process_exit_wrapper, the chokepoint every exit
+ * reaches). A child whose process ended on a thread other than its boot thread never returns from
+ * wine_ios_child_main, so ios_child_slot_release below never ran for it and its slot stayed "used" for good:
+ * the launcher wait in WineProcessBridge.m then waited for a program that was long dead (an abort_process
+ * 0xc0000005 on a worker thread, "still running ... 60 s", and the session never ended). Used only to decide
+ * whether anything still runs; the slot itself is released as before. env.MADEIRA_CHILD_EXIT_TRACK=0 counts an
+ * ended child as running until its boot thread returns, as before. */
+static struct { char name[64]; double started; int used; void *peb; int exited; double exited_at; } ios_child_slots[IOS_CHILD_SLOTS];
+/* the slot of the child whose boot thread this is (set by ios_child_thread_entry) */
+static _Thread_local int ios_child_slot_current = -1;
 
 static double ios_child_now(void)
 {
     struct timespec ts;
     clock_gettime( CLOCK_MONOTONIC, &ts );
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* A child whose process ended and whose boot thread has not released the slot for this long never will (its
+ * ExitProcess ran on another thread). A child that ends on its boot thread releases it within milliseconds, so a
+ * healthy session sees no change: the slot counts until then, as it always did. */
+#define IOS_CHILD_EXIT_SETTLE 2.0
+
+static int ios_child_slot_gone( int i, double now )
+{
+    static int off = -1;   /* env.MADEIRA_CHILD_EXIT_TRACK=0: an ended child counts until its boot thread returns */
+    if (off < 0)
+    {
+        const char *e = getenv( "MADEIRA_CHILD_EXIT_TRACK" );
+        off = (e && e[0] == '0' && !e[1]) ? 1 : 0;
+    }
+    if (off) return 0;
+    return ios_child_slots[i].exited && now - ios_child_slots[i].exited_at >= IOS_CHILD_EXIT_SETTLE;
 }
 
 static int ios_child_is_helper( const char *name )
@@ -490,7 +517,64 @@ static void ios_child_slot_release( int slot )
     if (slot < 0 || slot >= IOS_CHILD_SLOTS) return;
     pthread_mutex_lock( &ios_child_lock );
     ios_child_slots[slot].used = 0;
+    ios_child_slots[slot].peb = NULL;
+    ios_child_slots[slot].exited = 0;
+    ios_child_slots[slot].exited_at = 0;
     pthread_mutex_unlock( &ios_child_lock );
+}
+
+/* The child whose boot thread this is has registered its PEB with the wineserver (server_init_process_child). */
+void ios_child_slot_bind_peb( void *peb )
+{
+    int slot = ios_child_slot_current;
+
+    if (slot < 0 || slot >= IOS_CHILD_SLOTS || !peb) return;
+    pthread_mutex_lock( &ios_child_lock );
+    if (ios_child_slots[slot].used) { ios_child_slots[slot].peb = peb; ios_child_slots[slot].exited = 0; ios_child_slots[slot].exited_at = 0; }
+    pthread_mutex_unlock( &ios_child_lock );
+}
+
+/* The child process with this PEB ended (process_exit_wrapper). Marks the slot that holds it, whichever thread
+ * ended it; the slot itself is released when the child's boot thread returns, if it ever does. */
+void ios_child_slot_exited( void *peb )
+{
+    unsigned i;
+    double now = ios_child_now();
+
+    if (!peb) return;
+    pthread_mutex_lock( &ios_child_lock );
+    for (i = 0; i < IOS_CHILD_SLOTS; i++)
+        if (ios_child_slots[i].used && !ios_child_slots[i].exited && ios_child_slots[i].peb == peb)
+        {
+            ios_child_slots[i].exited = 1;
+            ios_child_slots[i].exited_at = now;
+        }
+    pthread_mutex_unlock( &ios_child_lock );
+}
+
+/* Madeira storm-end: the file name (lower case) of the child process with this PEB, for the one log line that says which Windows
+ * process the redelivery storm guard ended (server_ios.c, ios_end_child_process_async). 1 and the name in `out`, or 0 (the table
+ * has no such process: out is "?"). Never the path. */
+int ios_child_slot_name( void *peb, char *out, size_t len )
+{
+    unsigned i;
+    int found = 0;
+
+    if (!out || !len) return 0;
+    out[0] = '?'; if (len > 1) out[1] = 0;
+    if (!peb) return 0;
+    pthread_mutex_lock( &ios_child_lock );
+    for (i = 0; i < IOS_CHILD_SLOTS && !found; i++)
+        if (ios_child_slots[i].used && ios_child_slots[i].peb == peb)
+        {
+            size_t n = strlen( ios_child_slots[i].name );
+            if (n > len - 1) n = len - 1;
+            memcpy( out, ios_child_slots[i].name, n );
+            out[n] = 0;
+            found = 1;
+        }
+    pthread_mutex_unlock( &ios_child_lock );
+    return found;
 }
 
 /* Children still running that are not helpers, started at most max_age
@@ -506,7 +590,7 @@ int madeira_live_game_children( char *buf, int len, double max_age )
     pthread_mutex_lock( &ios_child_lock );
     for (i = 0; i < IOS_CHILD_SLOTS; i++)
     {
-        if (!ios_child_slots[i].used || ios_child_is_helper( ios_child_slots[i].name )) continue;
+        if (!ios_child_slots[i].used || ios_child_slot_gone( i, now ) || ios_child_is_helper( ios_child_slots[i].name )) continue;
         if (max_age >= 0 && now - ios_child_slots[i].started > max_age) continue;
         count++;
         if (buf && len - used > 1)
@@ -550,6 +634,7 @@ static void *ios_child_thread_entry( void *arg )
     /* Set up exit handling for this child thread */
     wine_ios_main_thread = pthread_self();
     wine_ios_exit_initialized = 1;
+    ios_child_slot_current = args->slot;   /* child-exit: server_init_process_child binds the PEB to it */
 
     if (setjmp(wine_ios_exit_jmpbuf) == 0) {
         /* Change working directory if requested */

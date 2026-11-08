@@ -68,6 +68,76 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
 static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc );
 static uint64_t ios_app_text_lo, ios_app_text_hi;
 
+/* 1 for an address inside the JIT pool or region C: the places FEX's generated code and its
+ * dispatcher thunks live, so x28 is the CpuStateFrame there. */
+static int ios_fault_pc_is_jit( uint64_t pc )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+
+    return (rx && pc >= rx && pc < rx + ios_jit_pool_size_global) || ios_jit_low_contains( (uintptr_t)pc );
+}
+
+/* [redeliv] child-only ending: WHAT THE REDELIVERY GUARD ENDS WHEN IT GIVES UP ON A STORM.
+ *
+ * The guard below ("2000 identical redeliveries") has always ended the whole app with task_terminate(). Wine runs
+ * in-process here, so a storm in a helper process of a launcher (a browser-engine helper storming on an unmapped
+ * stack, say) closed the app while the launcher itself was fine. Now, when the storming thread is in guest code (the
+ * JIT pool or region C, where it holds no host lock):
+ *   - its PEB is on the dead list (a laggard of a child that has already ended): only that thread is ended;
+ *   - its PEB is a live child of the session (not the first process, not one that owns the fixed-base main image,
+ *     whose retirement needs its own thread's server connection): that process is ended the way an exit ends it
+ *     (ios_end_child_process_async, from a worker thread), then the thread;
+ *   - anything else (the session's first process, an unknown identity, host code): the whole app, as before.
+ * At most 32 such endings per session; past that the old ending comes back. Called on the Mach exception thread with
+ * the storming thread held in its exception; the PEB is read with vm_read_overwrite. 1 = dealt with, the app goes on;
+ * 0 = the guard ends the app as it always did. env.MADEIRA_REDELIV_CHILD_ONLY = 0 brings the old ending back for every
+ * storm. */
+static int ios_storm_end_child_only( thread_t thread, uintptr_t thread_teb, uint64_t pc )
+{
+    extern int ios_peb_is_dead( const void *peb );
+    extern int ios_peb_is_live_child( const void *peb );
+    extern int ios_exe_win_owned_by( void *peb );
+    extern int ios_end_child_process_async( void *peb, int status );
+    static int enabled = -1;
+    static volatile int ended;
+    void *peb = NULL;
+    vm_size_t got = sizeof(peb);
+    int whole_process;
+    kern_return_t kr;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_REDELIV_CHILD_ONLY" );
+        enabled = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!enabled || !thread_teb || ended >= 32) return 0;
+    if (!ios_fault_pc_is_jit( pc )) return 0;   /* host code may hold a lock: keep the old ending */
+    if (vm_read_overwrite( mach_task_self(), (vm_address_t)(thread_teb + offsetof(TEB, Peb)), sizeof(peb),
+                           (vm_address_t)&peb, &got ) != KERN_SUCCESS || got != sizeof(peb) || !peb)
+        return 0;
+    if (ios_peb_is_dead( peb )) whole_process = 0;
+    else if (ios_peb_is_live_child( peb ) && !ios_exe_win_owned_by( peb )) whole_process = 1;
+    else return 0;
+
+    if (whole_process)
+    {
+        dprintf( 2, "[redeliv] the storm is in a child Windows process (peb=%p, thread teb=0x%llx), not the session's first one: "
+                    "ending that process and that thread only, the app keeps running\n",
+                 peb, (unsigned long long)thread_teb );
+        if (!ios_end_child_process_async( peb, (int)STATUS_ACCESS_VIOLATION )) return 0;   /* could not start: the old ending */
+    }
+    else
+        dprintf( 2, "[redeliv] the storm is in a thread of a child process that has already ended (peb=%p, teb=0x%llx): "
+                    "ending that thread only\n", peb, (unsigned long long)thread_teb );
+    kr = thread_terminate( thread );
+    if (kr != KERN_SUCCESS) kr = thread_suspend( thread );
+    __sync_fetch_and_add( &ended, 1 );
+    dprintf( 2, "[redeliv] the storming thread is ended (kr=%d)\n", (int)kr );
+    return 1;
+}
+
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
                                                    int exception, uintptr_t fault_addr,
@@ -800,6 +870,14 @@ dispatch:
                          (unsigned long long)words[2], (unsigned long long)words[3],
                          (unsigned long long)words[4], (unsigned long long)words[5],
                          (unsigned long long)words[6], (unsigned long long)words[7] );
+            }
+            /* a storm in a CHILD Windows process ends that process, not the app (MADEIRA_REDELIV_CHILD_ONLY) */
+            if (ios_storm_end_child_only( thread, thread_teb, pc ))
+            {
+                redeliv[rslot].key = 0;   /* a new run starts from 1 on whatever thread comes next */
+                redeliv[rslot].n = 0;
+                ios_redeliv_terminating = 0;
+                return 1;   /* the thread is gone: the caller's thread_set_state on it is harmless, as for [zombie] */
             }
             dprintf( 2, "[redeliv] terminating process rev=ml465\n" );
             task_terminate( mach_task_self() );
