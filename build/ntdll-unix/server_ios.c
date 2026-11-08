@@ -3398,6 +3398,64 @@ static NTSTATUS invoke_user_apc( CONTEXT *context, const struct user_apc *apc, N
 }
 
 
+/* Madeira iosb-guard: an async I/O completion in a 32-bit pseudo-process writes an
+ * IO_STATUS_BLOCK32 (status + information, 8 bytes) to the address the request carried.
+ * ntdll picks the 32-bit layout from the calling pseudo-process, not from the call, so
+ * a write issued by 64-bit native code running inside a 32-bit process (the emulator's
+ * own console output, with an uninitialised 64-bit status block) hands back a stale
+ * stack value as that address. The store then faulted on an unmapped page, the
+ * redelivery guard looped on it, and on an unlucky day it could land somewhere mapped.
+ *
+ * The store is kept when the address is in the process's own 4 GB guest window, when
+ * the fault path would serve it below the iOS floor (a sub-floor image window or a low
+ * allocation), or when all 8 bytes lie in some task mapping (any protection: the fault
+ * path may heal it); a pointer into a hole is dropped with an "[iosb-guard]" line.
+ * 64-bit processes are never checked. env.MADEIRA_IOSB_DEAD_TARGET=0 always stores.
+ * The two probes live in signal_arm64_ios.c and never dereference the address. */
+extern int ios_iosb_probe_mapped( unsigned long long addr, unsigned long long len );
+extern int ios_iosb_probe_served_low( unsigned long long addr, unsigned long long len );
+
+#define IOS_IOSB_GUARD_BYTES   8ull             /* IO_STATUS_BLOCK32 */
+#define IOS_IOSB_GUARD_WINDOW  0x100000000ull   /* one guest window */
+#define IOS_IOSB_GUARD_FLOOR   0x100000000ull   /* iOS maps nothing below 4 GB */
+
+static int ios_iosb_guard_on( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_IOSB_DEAD_TARGET" );
+        on = !(e && e[0] == '0' && !e[1]);
+    }
+    return on;
+}
+
+/* 1 when an IO_STATUS_BLOCK32 written at `addr` reaches memory (or might), 0 for a hole. */
+static int ios_iosb32_store_lands( unsigned long long addr, unsigned long long window )
+{
+    if (addr + IOS_IOSB_GUARD_BYTES < addr) return 0;
+    if (window && addr >= window && addr - window < IOS_IOSB_GUARD_WINDOW) return 1;
+    if (addr < IOS_IOSB_GUARD_FLOOR) return ios_iosb_probe_served_low( addr, IOS_IOSB_GUARD_BYTES );
+    return ios_iosb_probe_mapped( addr, IOS_IOSB_GUARD_BYTES );
+}
+
+static void ios_set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR info )
+{
+    if (iosb && in_wow64_call() && ios_iosb_guard_on() && !ios_iosb32_store_lands( iosb, ios_wow_base() ))
+    {
+        static volatile unsigned dropped;
+        unsigned n = __sync_add_and_fetch( &dropped, 1 );
+
+        if (n <= 8 || !(n & (n - 1)))
+            dprintf( 2, "[iosb-guard] #%u 32-bit process (window %p): async completion status=%#x info=%#llx not stored, "
+                     "%#llx is not memory (env.MADEIRA_IOSB_DEAD_TARGET=0 stores anyway)\n",
+                     n, (void *)ios_wow_base(), (unsigned)status, (unsigned long long)info, (unsigned long long)iosb );
+        return;
+    }
+    set_async_iosb( iosb, status, info );
+}
+
+
 /***********************************************************************
  *              invoke_system_apc
  */
@@ -3425,7 +3483,7 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
             result->async_io.status = status;
             result->async_io.total = info;
             /* the server will pass us NULL if a call failed synchronously */
-            set_async_iosb( call->async_io.sb, result->async_io.status, info );
+            ios_set_async_iosb( call->async_io.sb, result->async_io.status, info );
         }
         else result->async_io.status = STATUS_PENDING; /* restart it */
         break;

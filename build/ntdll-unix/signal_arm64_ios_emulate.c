@@ -740,6 +740,53 @@ static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
     return any;
 }
 
+/* Two address probes for server_ios.c's check before an async I/O completion stores an IO_STATUS_BLOCK32
+ * into a 32-bit process (server_ios.c, ios_set_async_iosb). Neither dereferences the address.
+ *
+ * ios_iosb_probe_mapped: is [addr, addr + len) inside the task's mappings, with ANY protection? Only a hole counts as "not mapped": a
+ * page with the wrong protection may be healed by the fault path, and then the store happens as it always did. Mach region queries only,
+ * the recurse form (no port is handed back per call). A failure other than "no region" answers "mapped": in doubt the store is left alone. */
+int ios_iosb_probe_mapped( unsigned long long addr, unsigned long long len );
+int ios_iosb_probe_mapped( unsigned long long addr, unsigned long long len )
+{
+    const unsigned long long end = addr + len;
+    unsigned long long p = addr;
+
+    if (end < addr) return 0;
+    while (p < end)
+    {
+        mach_vm_address_t rb = (mach_vm_address_t)p;
+        mach_vm_size_t    rs = 0;
+        natural_t         depth = 0;
+        vm_region_submap_short_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        kern_return_t kr;
+
+        memset( &info, 0, sizeof(info) );
+        kr = mach_vm_region_recurse( mach_task_self(), &rb, &rs, &depth, (vm_region_recurse_info_t)&info, &cnt );
+        if (kr == KERN_INVALID_ADDRESS) return 0;               /* nothing at or above p: a hole to the end of the address space */
+        if (kr != KERN_SUCCESS || !rs) return 1;                /* cannot tell: leave the store alone */
+        if (rb > (mach_vm_address_t)p) return 0;                /* the region starts past p: p is in a hole */
+        p = rb + rs;
+    }
+    return 1;
+}
+
+/* ios_iosb_probe_served_low: below the iOS floor nothing can be mapped; an access there is only ever answered by the fault path's own
+ * registries, a sub-floor image window (ml938) or a low allocation / alias (ml966, ml969). Ask them as the fault path does, for any
+ * owner (a NULL peb), so a hit anywhere keeps the store. */
+int ios_iosb_probe_served_low( unsigned long long addr, unsigned long long len );
+int ios_iosb_probe_served_low( unsigned long long addr, unsigned long long len )
+{
+    extern int ios_lowalloc_translate( unsigned long long addr, unsigned long long len,
+                                       unsigned long long *real_out, void **owner_out );
+    unsigned long long real = 0;
+    void *owner = NULL;
+
+    if (ios_subfloor_translate( addr, NULL ) || ios_subfloor_translate( addr + (len ? len - 1 : 0), NULL )) return 1;
+    return ios_lowalloc_translate( addr, len, &real, &owner );
+}
+
 /* Read `size` bytes at `a` with the opc-implied extension. memcpy, not a cast
  * deref: the faulting address can be unaligned (the case that found this was a
  * 64-bit load from ...2ce) and a typed deref lets the compiler assume it is
