@@ -113,6 +113,17 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
      * pLdrSystemDllInitBlock->pRtlUserThreadStart is already published guest.
      * Without a guest window wow_base is 0 and this is the upstream code. */
     ULONG_PTR wow_base = ios_wow_base_for_peb( teb->Peb );
+    /* A thread of a child process in its own guest window gets THAT process's PEB32 (the page
+     * after its PEB), not the main process's wow_peb, when its argument is the PEB.
+     * MADEIRA_WOW_CHILD_PEB=0 always passes wow_peb as before. */
+    static int wow_child_peb = -1;
+    if (wow_child_peb < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_CHILD_PEB" );
+        wow_child_peb = !(e && e[0] == '0');
+    }
+    void *proc_peb = wow_child_peb ? (void *)teb->Peb : (void *)peb;
+    void *proc_wow_peb = (wow_child_peb && wow_base) ? (char *)teb->Peb + page_size : (void *)wow_peb;
 #define IOS_WOW_GUEST_IN(ptr) ios_wow_guest_in( (ptr), wow_base )
 
     if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
@@ -120,7 +131,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
         i386_context->ContextFlags = CONTEXT_I386_ALL;
         i386_context->Eax = IOS_WOW_GUEST_IN( entry );
-        i386_context->Ebx = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
+        i386_context->Ebx = IOS_WOW_GUEST_IN( (arg == proc_peb || arg == peb) ? proc_wow_peb : arg );
         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
         i386_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         i386_context->SegCs = 0x23;
@@ -138,7 +149,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     {
         arm_context->ContextFlags = CONTEXT_ARM_ALL;
         arm_context->R0 = IOS_WOW_GUEST_IN( entry );
-        arm_context->R1 = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
+        arm_context->R1 = IOS_WOW_GUEST_IN( (arg == proc_peb || arg == peb) ? proc_wow_peb : arg );
         arm_context->Sp = get_wow_teb( teb )->Tib.StackBase;
         arm_context->Pc = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         if (arm_context->Pc & 1) arm_context->Cpsr |= 0x20; /* thumb mode */
