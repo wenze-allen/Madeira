@@ -112,6 +112,31 @@ files that do not carry another license notice are licensed under
 GPL-3.0-or-later.** Files carrying their own copyright or license header are
 governed by that header.
 
+## Code from BCD (thebcd69/bcd-games)
+
+[BCD](https://github.com/thebcd69/bcd-games) is a GPL-3.0-or-later fork of Madeira by
+**thebcd69** (the same person as bahacan16 in the README's credits). Upstream Madeira found
+(`46e9b2e`, willfaust/Madeira#575, 2026-11-05) that two sets of his work entered its repository
+through pull request #516 (merged 2026-11-01) without naming him: his pull requests
+willfaust/Madeira#337 to #346, opened on 2026-10-15 and closed before they were merged, and code
+copied from his public fork as of 2026-10-26.
+
+This tree took engine fixes from #516 on 2026-11-08 (the commits that cite "upstream 0a2e6ed"),
+and with them part of that code. As upstream determined, the code is his under
+GPL-3.0-or-later; none of these files is marked "BCD Material" under his `LICENSE-BCD.md`, so its
+section 7 terms do not attach. The files of this tree that carry it have his copyright line and
+the date of modification, as GPL-3.0 section 5 requires:
+
+- `build/ntdll-unix/virtual_ios.c` and `build/ntdll-unix/signal_arm64_ios.c`, with their
+  `#include`d parts (each part has the same copyright and licence as its unit);
+- `build/ntdll-unix/server_ios.c`, `process_ios.c`, `thread_ios.c` and `loader_ios.c`;
+- `build/win32u-unix/sysparams_ios.c` and `build/wineserver/mapping_ios.c`;
+- `tests/host/check-tail-carve-exec.py` and `tests/host/check-vmon-identity.py`.
+
+Upstream's notice lists more files, with line counts for its own tree: the memory-host
+extension, the community game lists in `GameRecommendations.swift`, and engine and D3D12 code
+this tree did not take. They are not here, or not in the form that notice counts.
+
 ## Microsoft Visual C++ runtime redistributables — NOT DISTRIBUTED
 
 Games built with MSVC require Microsoft's Visual C++ runtime DLLs. Those are
