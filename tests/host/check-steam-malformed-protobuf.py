@@ -2,13 +2,16 @@
 """Malformed Steam protobuf data throws instead of stopping the app.
 
 Compiles app/Madeira/SwiftSteam/Proto/SteamProtoMessages.swift with
-SteamLANPeer.swift and DepotManifest.swift and feeds them bytes no Steam
-client sends: a tag whose field number does not fit in 32 bits, a 4-7 byte
-manifest blob, and uint32 manifest fields above 2^32. Their callers use try?
-(LAN discovery datagrams from any sender on UDP 27036, a cached manifest, the
+DepotManifest.swift and feeds them bytes no Steam client sends: a tag whose
+field number does not fit in 32 bits, a 4-7 byte manifest blob, and uint32
+manifest fields above 2^32. Their callers use try? (a cached manifest, the
 plain-manifest attempt before decryption), so each must throw or parse; a Swift
 trap there stops the app. Valid manifests must still parse as before.
 Never contacts Steam. Needs swiftc (macOS or Linux) and python3.
+
+Upstream's check (#604) also feeds the decoder through SteamLANPeer.swift, the LAN
+discovery of upstream's LAN downloads. This tree has no LAN downloads, so that file
+and its two datagram cases are left out; the decoder is the same.
 """
 import os
 import shutil
@@ -52,7 +55,6 @@ def field(num, wire, payload):
     return tag + varint(len(payload)) + payload
 
 
-MAGIC = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x21, 0x4C, 0x5F, 0xA0])  # LAN discovery packets
 MANIFEST_MAGIC = bytes([0xD0, 0x17, 0xF6, 0x71])                  # 8-byte header before the payload
 MAX_FIELD = (1 << 32) - 1                                          # the largest field number readTag returns
 HUGE_TAG = varint(((1 << 37) - 1) << 3)                            # field 2^37 - 1, wire type varint
@@ -98,10 +100,6 @@ func manifest(_ data: Data) -> String {
             do {
                 if let t = try decoder.readTag() { print("\(t.fieldNumber) \(t.wireType.rawValue)") } else { print("end") }
             } catch { print("threw") }
-        case "type":
-            print(SteamLANPeer.packetType([UInt8](input)).map(String.init) ?? "nil")
-        case "status":
-            print(SteamLANPeer.parseStatus(input).map { String($0.clientID) } ?? "nil")
         case "manifest":
             print(manifest(input))
         case "noise":
@@ -142,7 +140,7 @@ with tempfile.TemporaryDirectory() as tmp:
     exe = tmp / 'check'
     build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-o', str(exe),
                             str(steam / 'Proto/SteamProtoMessages.swift'), str(steam / 'Core/SteamError.swift'),
-                            str(steam / 'Content/SteamLANPeer.swift'), str(steam / 'Content/DepotManifest.swift'),
+                            str(steam / 'Content/DepotManifest.swift'),
                             str(tmp / 'stub.swift'), str(tmp / 'main.swift')],
                            capture_output=True, text=True)
     if build.returncode != 0:
@@ -164,11 +162,6 @@ with tempfile.TemporaryDirectory() as tmp:
     require(run('tag', varint(MAX_FIELD << 3 | 2).hex()) == f'{MAX_FIELD} 2', 'field number 2^32 - 1 decodes')
     require(run('tag', varint((MAX_FIELD + 1) << 3).hex()) == 'threw', 'field number 2^32 throws')
     require(run('tag', HUGE_TAG.hex()) == 'threw', 'field number 2^37 - 1 throws')
-
-    # A LAN datagram whose header holds that tag (22 bytes, from any sender on UDP 27036).
-    datagram = MAGIC + struct.pack('<I', len(HUGE_TAG)) + HUGE_TAG + struct.pack('<I', 0)
-    require(run('type', datagram.hex()) is not None, 'packetType of a datagram with an oversized tag returns')
-    require(run('status', datagram.hex()) == 'nil', 'that datagram is not taken for a PC\'s status')
 
     # Depot manifests: valid ones parse, bare and behind the 8-byte header.
     good = field(1, 2, mapping(b'game.exe', 5, 0, chunk(5, 5)))
