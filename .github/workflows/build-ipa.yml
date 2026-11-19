@@ -1,0 +1,162 @@
+name: build-ipa
+
+# The Debug, unsigned IPA, built on a GitHub-hosted Mac with build/build-mac-reuse.sh: the source
+# of this branch plus the reuse overlay (a release asset of this repository). The overlay carries
+# what the 21e6697 Mac build made and what has not changed since (DXMT and its LLVM, FEX, the
+# i386 farm but mf.dll and wined3d.dll, the pairing library), so LLVM is never built here and
+# the job fits a standard runner. What changed is built from this checkout. See the overlay's
+# REUSE-README.md and reuse/MANIFEST.md.
+
+on:
+  push:
+    branches: [experiment/claude-fixes-20261028]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OVERLAY_TAG: reuse-overlay-b9a353c
+  OVERLAY_ASSET: Madeira-reuse-overlay-b9a353c-ci.tar.xz
+  OVERLAY_SHA256: 6b0d529c5c6e94d5e5c3450db7623b01eb5a894dfeaed0506411f17ad1cb0a19
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: The runner
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h /
+          ls -d /Applications/Xcode*.app
+          xcode-select -p
+
+      # FEX's archives in the overlay are LLVM bitcode from Xcode build 27C5020n (27.3 beta),
+      # which an older Xcode cannot read. The newest Xcode 27 on the runner is used; when it is
+      # older than 27C5020n, FEX is built here instead (the overlay's copy is removed below).
+      - name: Choose Xcode
+        run: |
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import glob, re, subprocess, os
+          def key(b):
+              m = re.match(r"(\d+)([A-Z])(\d+)([a-z]?)$", b)
+              return (int(m[1]), m[2], int(m[3])) if m else (0, "A", 0)
+          found = []
+          for x in sorted(glob.glob("/Applications/Xcode*.app")):
+              try:
+                  out = subprocess.run(["xcodebuild", "-version"], capture_output=True, text=True, timeout=120,
+                                       env=dict(os.environ, DEVELOPER_DIR=x + "/Contents/Developer")).stdout
+              except Exception:
+                  continue
+              m = re.search(r"Build version (\S+)", out)
+              v = re.search(r"Xcode (\S+)", out)
+              if m and v and v[1].startswith("27"):
+                  found.append((key(m[1]), x, m[1], v[1]))
+          for k, x, b, v in sorted(found):
+              print(f"# {x}: Xcode {v} ({b})", file=__import__("sys").stderr)
+          k, x, b, v = max(found)
+          print(f"MADEIRA_XCODE={x}")
+          print(f"XCODE_BUILD={b}")
+          print(f"REBUILD_FEX={'0' if k >= key('27C5020n') else '1'}")
+          PY
+          cat "$GITHUB_ENV"
+
+      # This build needs the chosen Xcode's iOS SDK and nothing else from the image.
+      - name: Make room
+        run: |
+          avail() { df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }'; }
+          echo "free: $(avail) GB"
+          if [ "$(avail)" -lt 45 ]; then
+            for x in /Applications/Xcode*.app; do
+              [ "$x" = "$MADEIRA_XCODE" ] || [ "$(readlink -f "$x")" = "$(readlink -f "$MADEIRA_XCODE")" ] || sudo rm -rf "$x"
+            done
+            echo "free after the other Xcodes: $(avail) GB"
+          fi
+          if [ "$(avail)" -lt 45 ]; then
+            sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" "$HOME/hostedtoolcache/CodeQL" \
+              "$HOME/.ghcup" /usr/local/lib/node_modules || true
+            echo "free after the SDKs this build does not use: $(avail) GB"
+          fi
+          df -h /
+
+      - name: The reuse overlay
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$OVERLAY_TAG" -p "$OVERLAY_ASSET" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP"
+          echo "$OVERLAY_SHA256  $RUNNER_TEMP/$OVERLAY_ASSET" | shasum -a 256 -c
+          tar -xJf "$RUNNER_TEMP/$OVERLAY_ASSET" -C "$GITHUB_WORKSPACE"
+          (cd reuse && shasum -a 256 -c --quiet SHA256SUMS)
+          if [ "$REBUILD_FEX" = 1 ]; then
+            echo "Xcode $XCODE_BUILD is older than 27C5020n: FEX is built here"
+            rm -rf reuse/FEX
+          fi
+          rm -f "$RUNNER_TEMP/$OVERLAY_ASSET"
+
+      - name: Restore what earlier runs built
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/host-tools
+            toolchains/llvm-mingw-20260421-ucrt-macos-universal
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            toolchains/ffmpeg-ios
+            build/ffmpeg/obj
+            research/freetype
+            build/freetype-ios/build
+          key: mac-build-v1-${{ github.run_id }}
+          restore-keys: mac-build-v1-
+
+      - name: Plan
+        run: build/build-mac-reuse.sh --plan
+
+      - name: Build
+        env:
+          MADEIRA_MIN_FREE_GB: "15"
+        run: |
+          export JOBS="$(sysctl -n hw.ncpu)"
+          build/build-mac-reuse.sh
+
+      - name: Keep what this run built
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/host-tools
+            toolchains/llvm-mingw-20260421-ucrt-macos-universal
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            toolchains/ffmpeg-ios
+            build/ffmpeg/obj
+            research/freetype
+            build/freetype-ios/build
+          key: mac-build-v1-${{ github.run_id }}
+
+      - name: The IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-ipa
+          path: |
+            dist/*.ipa
+            dist/*.txt
+          if-no-files-found: error
+
+      - name: The build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build-logs
+          path: toolchains/mac-build/logs
+          if-no-files-found: ignore
