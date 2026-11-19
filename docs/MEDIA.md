@@ -39,7 +39,7 @@ has been tested game by game.
 | `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext, libavformat demux (mp3, wav, mov, asf), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
 | `build/ntdll-unix/wg_parser_apple_ios.c` | H.264/HEVC on VideoToolbox (NV12 out) and AAC on an AudioToolbox AudioConverter (float PCM out). Its own translation unit with no Wine or FFmpeg header. |
 | `build/ntdll-unix/wg_parser_backend_ios.h` | The contract between the core and a decoder backend; plain C types only, so the host test can supply stub backends. |
-| `build/ffmpeg/build.sh` | FFmpeg 7.1.1, pinned by SHA-256, LGPL-only configuration. |
+| `build/ffmpeg/build.sh` | FFmpeg 7.1.5, pinned by SHA-256, LGPL-only configuration. |
 
 FFmpeg is built with no H.264, HEVC or AAC decoder or parser: those streams go
 to the platform decoders. Windows Media video has no platform decoder on iOS,

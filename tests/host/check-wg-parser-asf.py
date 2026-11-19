@@ -11,7 +11,7 @@ wm_reader.c offers, its default first: bottom-up 24-bit BGR.
 1. Source checks: build/ffmpeg/build.sh enables the asf demuxer and the wmv1/wmv2/wmv3/vc1/msmpeg4v1-3
    decoders (and still no H.264/HEVC/AAC decoder); the glue asserts the new pixel-format values and
    describes WMV / WMA streams by their wg_format codec formats.
-2. Builds a host FFmpeg 7.1.1 from the tracked tarball with the port's demuxers and decoders, plus
+2. Builds a host FFmpeg 7.1.5 from the tracked tarball with the port's demuxers and decoders, plus
    TEST-ONLY encoders (wmv1, wmv2, msmpeg4v3, wmav2) and the asf muxer to synthesise inputs. Cached.
 3. Compiles the production core under ASan/UBSan with the PE read thread of media_source.c /
    wm_reader.c, and checks, against an independent libavcodec decode of the same file:
@@ -56,7 +56,7 @@ print("PASS: FFmpeg has the asf demuxer and the Windows Media decoders (still no
       "the glue maps the new pixel formats and the WMV / WMA codec formats")
 
 # ------------------------------------------------------------------ 2. host FFmpeg
-tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(root / "build/ffmpeg/src/ffmpeg-7.1.1.tar.xz")
+tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(root / "build/ffmpeg/src/ffmpeg-7.1.5.tar.xz")
 FLAGS = [
     "--disable-everything", "--disable-autodetect", "--disable-gpl", "--disable-nonfree", "--disable-version3",
     "--enable-decoder=wmav1,wmav2,wmapro,wmalossless", "--enable-decoder=mp1,mp2,mp3",
@@ -72,16 +72,16 @@ FLAGS = [
 prefix = os.environ.get("MADEIRA_HOST_FFMPEG_ASF")
 if not prefix:
     key = hashlib.sha256(" ".join(FLAGS).encode()).hexdigest()[:12]
-    prefix = str(Path.home() / ".cache/madeira-host-ffmpeg" / ("7.1.1-asf-" + key))
+    prefix = str(Path.home() / ".cache/madeira-host-ffmpeg" / ("7.1.5-asf-" + key))
     if not (Path(prefix) / "lib/libavformat.a").exists():
         assert Path(tarball).exists(), "no FFmpeg tarball at build/ffmpeg/src (tracked) and no MADEIRA_FFMPEG_TARBALL"
         src = Path(prefix + "-src"); src.mkdir(parents=True, exist_ok=True)
-        if not (src / "ffmpeg-7.1.1/configure").exists():
+        if not (src / "ffmpeg-7.1.5/configure").exists():
             subprocess.run(["tar", "-xJf", tarball, "-C", str(src)], check=True)
         bld = Path(prefix + "-build"); bld.mkdir(parents=True, exist_ok=True)
         print("building host FFmpeg into", prefix, flush=True)
         log = open(str(bld) + ".log", "w")
-        subprocess.run([str(src / "ffmpeg-7.1.1/configure"), "--prefix=" + prefix, "--cc=cc"] + FLAGS,
+        subprocess.run([str(src / "ffmpeg-7.1.5/configure"), "--prefix=" + prefix, "--cc=cc"] + FLAGS,
                        cwd=bld, check=True, stdout=log, stderr=subprocess.STDOUT)
         subprocess.run(["make", "-j%d" % (os.cpu_count() or 4)], cwd=bld, check=True, stdout=log, stderr=subprocess.STDOUT)
         subprocess.run(["make", "install"], cwd=bld, check=True, stdout=log, stderr=subprocess.STDOUT)
