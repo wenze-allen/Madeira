@@ -49,7 +49,7 @@ jobs:
   macos:
     # The checks that need Apple's SDK. This job was added without a macOS runner to try it on,
     # so until it has passed once its result does not fail the workflow.
-    runs-on: macos-14
+    runs-on: macos-15
     continue-on-error: true
     timeout-minutes: 120
     steps:
