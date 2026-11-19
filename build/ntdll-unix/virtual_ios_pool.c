@@ -1401,6 +1401,20 @@ static int ios_pool_preserve_code_carve( size_t available, size_t want, int low_
     return low_fits && want <= 0x10000 && available >= 0x100000 && available / 4 >= want;
 }
 
+/* Nor should any request take a free carve four or more times its size while the pool's
+ * budget still affords a fresh carve of the size asked: the carve stays with its taker for
+ * that process's life. One game's crashpad_handler.exe took a 16 MB carve for its
+ * 16 KB dispatcher and a 128 MB one for a 16 MB code buffer, and the game itself was then
+ * capped at 16 MB. When the fresh carve fails anyway, the allocator retries with every
+ * carve allowed (reuse_all_carves). MADEIRA_POOL_CODE_KEEP_BIG=0 restores the old policy. */
+static int ios_pool_preserve_big_carve( size_t available, size_t want, size_t budget_cap )
+{
+    const char *env = getenv( "MADEIRA_POOL_CODE_KEEP_BIG" );   /* 0: a code buffer request takes the smallest free buffer that fits, however much larger, as before */
+
+    if (env && !strcmp( env, "0" )) return 0;
+    return want && available / 4 >= want && want <= budget_cap;
+}
+
 /* ml557 (#74 REGRESSION): is any thread's PC currently INSIDE this tail carve?
  *
  * ml438 made a MEM_RELEASE of a live tail EC-buffer carve mark it free for reuse,
