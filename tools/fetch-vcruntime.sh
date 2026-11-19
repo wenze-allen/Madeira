@@ -31,15 +31,47 @@ fi
 
 "$SEVENZIP" x "$TMP/VC_redist.x64.exe" -o"$TMP/ext" -y >/dev/null
 
+# The installer is a WiX Burn bundle. Its payloads are cabinets, found by their MSCF signature,
+# not by name: the bundle of 2026-11 names them a0..a13, with no .cab extension, and 7-Zip
+# extracts only its first container (the installer's own UI). So the cabinets embedded in the
+# .exe are carved out by their headers too, and each cabinet's contents are searched again for
+# cabinets inside it, until no new one turns up.
+python3 - "$TMP/VC_redist.x64.exe" "$TMP/ext" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+at, n = 0, 0
+while True:
+    at = data.find(b"MSCF\0\0\0\0", at)
+    if at < 0:
+        break
+    size = int.from_bytes(data[at + 8:at + 12], "little")
+    if 36 <= size <= len(data) - at:
+        n += 1
+        with open("%s/embedded-%d.cab" % (sys.argv[2], n), "wb") as f:
+            f.write(data[at:at + size])
+    at += 4
+PY
+
+is_cab() { head -c 4 "$1" 2>/dev/null | cmp -s - <(printf MSCF); }
+
 i=0
-while IFS= read -r -d '' cab; do
-    i=$((i + 1))
-    out="$TMP/cab_out/$i"
-    mkdir -p "$out"
-    if ! "$SEVENZIP" x "$cab" -o"$out" -y >"$TMP/7z-$i.log" 2>&1; then
-        echo "warn: could not extract $cab (log: $TMP/7z-$i.log)" >&2
-    fi
-done < <(find "$TMP/ext" -type f -iname '*.cab' -print0)
+seen="$TMP/seen-cabs"
+: > "$seen"
+while :; do
+    new=0
+    while IFS= read -r -d '' f; do
+        grep -qxF "$f" "$seen" && continue
+        echo "$f" >> "$seen"
+        is_cab "$f" || continue
+        i=$((i + 1)); new=1
+        out="$TMP/cab_out/$i"
+        mkdir -p "$out"
+        if ! "$SEVENZIP" x "$f" -o"$out" -y >"$TMP/7z-$i.log" 2>&1; then
+            echo "warn: could not extract $f (log: $TMP/7z-$i.log)" >&2
+        fi
+    done < <(find "$TMP/ext" "$TMP/cab_out" -type f -print0)
+    [ "$new" = 1 ] || break
+done
 
 if [ "$i" -eq 0 ]; then
     echo "error: no cab files found in installer" >&2
