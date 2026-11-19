@@ -8644,25 +8644,6 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (target_name->header.id != monitor->output_id) continue;
-#ifdef WINE_IOS
-            /* iOS-Madeira: MADEIRA_VDCFG_PATH = 1 lists the virtual monitor's path (QueryDisplayConfig); this
-             * names its target. Off (default): skipped as before. */
-            if (!monitor->source && ios_vdcfg_lists_sourceless( ios_vdcfg_path_enabled(), 1, monitor == &virtual_monitor ))
-            {
-                LUID virtual_luid;
-                char path[128];
-
-                ios_virtual_luid_locked( &virtual_luid );
-                if (memcmp( &target_name->header.adapterId, &virtual_luid, sizeof(virtual_luid) )) continue;
-                target_name->outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
-                snprintf( buffer, ARRAY_SIZE(buffer), "Display%u", monitor->output_id + 1 );
-                asciiz_to_unicode( target_name->monitorFriendlyDeviceName, buffer );
-                ios_vmon_device_id( EDD_GET_DEVICE_INTERFACE_NAME, path, sizeof(path) );
-                asciiz_to_unicode( target_name->monitorDevicePath, path );
-                ret = STATUS_SUCCESS;
-                break;
-            }
-#endif
             /* iOS-Madeira: the virtual monitor (the only one on iOS since the WoW64
              * series) has no source; QueryDisplayConfig reports no path for it either. */
             if (!monitor->source) continue;
