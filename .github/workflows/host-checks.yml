@@ -43,6 +43,10 @@ jobs:
           done
           make -k -j"$(nproc)" "${targets[@]}" > headers.log 2>&1 || true
           echo "MADEIRA_WINE_BUILD=$RUNNER_TEMP/wine-build" >> "$GITHUB_ENV"
+      # check-steam-library reads Steam's zstd chunks with Python 3.14's compression.zstd.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - name: Host checks
         run: python3 tests/host/run-all.py -j "$(nproc)"
 

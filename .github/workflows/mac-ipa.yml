@@ -1,4 +1,4 @@
-name: build-ipa
+name: mac-ipa
 
 # The Debug, unsigned IPA, built on a GitHub-hosted Mac with build/build-mac-reuse.sh: the source
 # of this branch plus the reuse overlay (a release asset of this repository). The overlay carries
@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-ipa-${{ github.ref }}
+  group: mac-ipa-${{ github.ref }}
   cancel-in-progress: true
 
 env:
