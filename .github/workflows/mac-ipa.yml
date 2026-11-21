@@ -3,7 +3,7 @@ name: mac-ipa
 # The Debug, unsigned IPA, built on a GitHub-hosted Mac with build/build-mac-reuse.sh: the source
 # of this branch plus the reuse overlay (a release asset of this repository). The overlay carries
 # what the 21e6697 Mac build made and what has not changed since (DXMT and its LLVM, FEX, the
-# i386 farm but mf.dll, wined3d.dll and winegstreamer.dll, the pairing library), so LLVM is never built here and
+# i386 farm but the five DLLs the wine pin changed, the pairing library), so LLVM is never built here and
 # the job fits a standard runner. What changed is built from this checkout. See the overlay's
 # REUSE-README.md and reuse/MANIFEST.md.
 
@@ -20,9 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OVERLAY_TAG: reuse-overlay-8432ef2
-  OVERLAY_ASSET: Madeira-reuse-overlay-8432ef2-ci.tar.xz
-  OVERLAY_SHA256: b12ed187fcc1f1907130b33f24f8bc69f9cf1632abfe1cc74142b700d2732d54
+  OVERLAY_TAG: reuse-overlay-34c3444
+  OVERLAY_ASSET: Madeira-reuse-overlay-34c3444-ci.tar.xz
+  OVERLAY_SHA256: 2331408cbffb7ae5703302d3fea49332ff349fc076ec0644aa8b5d6a453e031f
 
 jobs:
   ipa:
