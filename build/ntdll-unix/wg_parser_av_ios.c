@@ -48,13 +48,15 @@
  *     the failure) instead of being accepted and never producing a sample.
  *     An unsupported codec is logged with its libavcodec id.
  *
- *   - STREAMS.  An MP3/WAV file exposes its first audio stream.  An MP4 or
- *     an ASF (WMV/WMA, the Windows Media Format reader's files: wm_reader.c)
- *     exposes its first video stream and its first audio stream, in container
- *     order.  A file whose video cannot be decoded is refused outright; one
- *     whose audio cannot be decoded exposes the video alone (logged).  An
- *     ASF's Windows Media video is decoded here, in software, by libavcodec
- *     (mav_lavc_video), its WMA by libavcodec like MPEG audio.
+ *   - STREAMS.  An MP3/WAV file exposes its first audio stream.  An MP4, an
+ *     ASF (WMV/WMA, the Windows Media Format reader's files: wm_reader.c) or
+ *     an MPEG program stream (.mpg: MPEG-1/2 video, MPEG audio) exposes its
+ *     first video stream and its first audio stream, in container order.  A
+ *     file whose video cannot be decoded is refused outright; one whose audio
+ *     cannot be decoded exposes the video alone (logged).  An ASF's Windows
+ *     Media video and an MPEG program stream's MPEG-1/2 video are decoded
+ *     here, in software, by libavcodec (mav_lavc_video), their WMA and MPEG
+ *     audio by libavcodec too.
  *
  *   - one demuxer, several consumers.  wg_parser.c runs a GStreamer thread
  *     that parks one buffer per stream; here decoding is LAZY, on the thread
@@ -81,12 +83,16 @@
  *
  *   - "output_compressed" parsers (MPEG-I splitter, WAVE parser, AVI
  *     splitter) hand the COMPRESSED stream to a separate decoder filter.  This
- *     port has no such decoder filters, so they accept PCM only; MP3 and MP4
- *     are refused there and quartz then tries the decoding splitter.  The WM
- *     reader's is the exception: an application that reads compressed samples
- *     (KiriKiri's movie plugin, into the WMV / WMA decoder DMOs) gets an
- *     ASF's Windows Media streams as the demuxer's packets
- *     (mav_enable_compressed); its other streams are decoded as usual.
+ *     port has decoder filters for Windows Media and MPEG only, so they accept
+ *     PCM, an ASF and an MPEG program stream; MP3 and MP4 are refused there
+ *     and quartz then tries the decoding splitter.  An application that reads
+ *     compressed samples (KiriKiri's movie plugin, into the WMV / WMA decoder
+ *     DMOs; a graph built by hand on quartz's MPEG-1 splitter, into the MPEG
+ *     video and audio decoders) gets an ASF's Windows Media streams and an
+ *     MPEG program stream's MPEG-1 video and MPEG audio as the demuxer's
+ *     packets (mav_enable_compressed); its other streams are decoded as usual
+ *     (and quartz's MPEG-1 splitter, which takes nothing else, gives way to
+ *     the decoding splitter).
  *
  *   - seek is accurate: the demuxer seeks at or before the target (to a video
  *     keyframe when there is video), decoders are flushed, and decoded output
@@ -186,6 +192,7 @@ enum mav_codec_kind
     MAV_CODEC_HEVC = 5,
     MAV_CODEC_WMA = 6,          /* WMA v1/v2/Pro/Lossless in ASF, on libavcodec */
     MAV_CODEC_WMV = 7,          /* WMV7/8/9, VC-1, MS-MPEG4 in ASF, on libavcodec (mav_lavc_video) */
+    MAV_CODEC_MPEG_VIDEO = 8,   /* MPEG-1 / MPEG-2 video in an MPEG program stream, on libavcodec */
 };
 
 /* Which Windows Media video a MAV_CODEC_WMV stream is (wg_format's WMV
@@ -299,6 +306,12 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
 /* An ISO media file with a recognisable ftyp/moov/mdat scores 100; half of
  * that is the floor for accepting one without a file name. */
 #define MAV_MIN_MOV_PROBE_SCORE (AVPROBE_SCORE_MAX / 2)
+/* An MPEG program stream's first pack and system headers score 26
+ * (AVPROBE_SCORE_EXTENSION / 2 + 1), where libavformat's probe stops; the
+ * scores below that are a stray start code or two. */
+#define MAV_MIN_MPEG_PROBE_SCORE (AVPROBE_SCORE_EXTENSION / 2)
+/* 100 ns: how far before the target an MPEG program stream is seeked (mav_seek) */
+#define MAV_MPEG_SEEK_LEAD 10000000
 /* Consecutive undecodable packets before the stream is ended rather than
  * spun on. */
 #define MAV_MAX_DECODE_ERRORS 512
@@ -441,6 +454,7 @@ enum
 {
     MAV_LAVC_WMV1 = 64, MAV_LAVC_WMV2, MAV_LAVC_WMV3, MAV_LAVC_VC1,
     MAV_LAVC_MSMPEG4V1, MAV_LAVC_MSMPEG4V2, MAV_LAVC_MSMPEG4V3,
+    MAV_LAVC_MPEG1, MAV_LAVC_MPEG2,
 };
 
 struct mav_lavc_vdec
@@ -449,6 +463,10 @@ struct mav_lavc_vdec
     AVPacket *pkt;
     AVFrame *frame;
     unsigned int bad_format_logged;
+    /* MPEG-1/2: an MPEG program stream seeks to a pack, not to a keyframe, and
+     * the pictures that refer to what came before are garbage; they are
+     * dropped until the first keyframe after opening or a flush. */
+    int key_only, need_key;
 };
 
 struct mav_lavc_picture
@@ -469,6 +487,8 @@ static enum AVCodecID mav_lavc_codec_id( int codec )
     case MAV_LAVC_MSMPEG4V1: return AV_CODEC_ID_MSMPEG4V1;
     case MAV_LAVC_MSMPEG4V2: return AV_CODEC_ID_MSMPEG4V2;
     case MAV_LAVC_MSMPEG4V3: return AV_CODEC_ID_MSMPEG4V3;
+    case MAV_LAVC_MPEG1:     return AV_CODEC_ID_MPEG1VIDEO;
+    case MAV_LAVC_MPEG2:     return AV_CODEC_ID_MPEG2VIDEO;
     default:                 return AV_CODEC_ID_NONE;
     }
 }
@@ -519,6 +539,7 @@ static void *mav_lavc_open( int codec, const uint8_t *extradata, uint32_t extrad
         snprintf( why, why_size, "decoder did not open" );
         goto fail;
     }
+    d->key_only = d->need_key = codec == MAV_LAVC_MPEG1 || codec == MAV_LAVC_MPEG2;
     return d;
 fail:
     mav_lavc_close( d );
@@ -532,6 +553,11 @@ static void mav_lavc_emit( struct mav_lavc_vdec *d, const AVFrame *f, mav_vframe
     uint32_t w = (uint32_t)f->width, h = (uint32_t)f->height, cw = (w + 1) / 2, ch = (h + 1) / 2, x, y;
     int64_t pts = f->pts != AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
 
+    if (d->need_key)
+    {
+        if (!(f->flags & AV_FRAME_FLAG_KEY)) return;
+        d->need_key = 0;
+    }
     if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P)
     {
         if (d->bad_format_logged++ < 3)
@@ -631,7 +657,10 @@ static void mav_lavc_release( void *frame )
 
 static void mav_lavc_flush( void *handle )
 {
-    avcodec_flush_buffers( ((struct mav_lavc_vdec *)handle)->ctx );
+    struct mav_lavc_vdec *d = handle;
+
+    avcodec_flush_buffers( d->ctx );
+    d->need_key = d->key_only;
 }
 
 static const struct mav_video_backend mav_lavc_video =
@@ -742,6 +771,7 @@ struct mav_parser
     AVPacket *read_pkt;
     int is_mov;
     int is_asf;
+    int is_mpeg;                /* an MPEG program stream */
     int ready;                  /* connected and streams exposed */
     int demux_eof;
     unsigned int read_errors_logged;
@@ -1037,7 +1067,7 @@ static void mav_teardown( struct mav_parser *p )
         av_freep( &p->avio->buffer );
         avio_context_free( &p->avio );
     }
-    p->ready = p->is_mov = p->is_asf = p->demux_eof = 0;
+    p->ready = p->is_mov = p->is_asf = p->is_mpeg = p->demux_eof = 0;
     p->read_errors_logged = 0;
     p->stop = -1;
 }
@@ -1246,13 +1276,27 @@ static int64_t mav_to_100ns( const struct mav_stream *s, int64_t ts )
     return av_rescale_q( ts - s->origin, s->time_base, (AVRational){ 1, 10000000 } );
 }
 
-/* A compressed-output parser's ASF hands out its Windows Media streams as
- * they are: the formats wg_format can describe (WMA, WMV1/2/3, WMVA, WVC1),
- * for the WM reader's compressed samples.  MS-MPEG4 has no wg_format. */
+/* The containers that carry video here: MP4 (platform decoders), ASF and
+ * MPEG program streams (libavcodec). */
+static int mav_video_container( const struct mav_parser *p )
+{
+    return p->is_mov || p->is_asf || p->is_mpeg;
+}
+
+/* A compressed-output parser hands out an ASF's Windows Media streams, and an
+ * MPEG program stream's MPEG-1 video and MPEG audio, as they are: the formats
+ * wg_format can describe (WMA, WMV1/2/3, WMVA, WVC1; MPEG-1 video, MPEG
+ * audio), for the WM reader's compressed samples and quartz's MPEG-1 splitter
+ * (which a graph built by hand connects to the MPEG video and audio decoders).
+ * MS-MPEG4 and MPEG-2 video have no wg_format. */
 static int mav_passes_compressed( const struct mav_parser *p, const struct mav_stream *s )
 {
-    return p->output_compressed && p->is_asf
-           && (s->info.kind == MAV_CODEC_WMA || (s->info.kind == MAV_CODEC_WMV && s->info.wmv != MAV_WMV_NONE));
+    if (!p->output_compressed) return 0;
+    if (p->is_asf)
+        return s->info.kind == MAV_CODEC_WMA || (s->info.kind == MAV_CODEC_WMV && s->info.wmv != MAV_WMV_NONE);
+    if (p->is_mpeg)
+        return s->info.kind == MAV_CODEC_MPEG_AUDIO || (s->info.kind == MAV_CODEC_MPEG_VIDEO && s->info.version == 1);
+    return 0;
 }
 
 /***********************************************************************
@@ -1286,9 +1330,16 @@ static struct mav_stream *mav_stream_new( struct mav_parser *p, AVStream *st, en
     s->time_base = st->time_base;
     /* MP4 timestamps are already on the presentation timeline (edit lists
      * applied by the demuxer), and so are ASF's (its preroll taken off by the
-     * demuxer), both on one clock for every stream; an MP3/WAV stream starts
-     * at its own start. */
-    s->origin = p->is_mov || p->is_asf ? 0 : (st->start_time != AV_NOPTS_VALUE ? st->start_time : 0);
+     * demuxer), both on one clock for every stream.  An MPEG program stream's
+     * clock starts anywhere, and its streams start a little apart on it: they
+     * all count from the earliest start, so they stay in sync.  An MP3/WAV
+     * stream starts at its own start. */
+    if (p->is_mov || p->is_asf)
+        s->origin = 0;
+    else if (p->is_mpeg && p->fmt->start_time != AV_NOPTS_VALUE)
+        s->origin = av_rescale_q( p->fmt->start_time, AV_TIME_BASE_Q, st->time_base );
+    else
+        s->origin = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
     s->last_dts = s->last_vpts = INT64_MIN;
     s->seek_target = -1;
     s->parser = p;
@@ -1321,7 +1372,7 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
     }
     /* An ASF's streams are all exposed either way (the WM reader asks for
      * the same streams again with compressed output); see mav_passes_compressed. */
-    if (p->output_compressed && !p->is_asf && s->info.kind != MAV_CODEC_PCM)
+    if (p->output_compressed && !p->is_asf && !p->is_mpeg && s->info.kind != MAV_CODEC_PCM)
     {
         snprintf( why, why_size, "compressed output requested and no decoder filter exists; "
                   "the decoding splitter is tried next" );
@@ -1436,19 +1487,22 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     case AV_CODEC_ID_MSMPEG4V1: codec = MAV_LAVC_MSMPEG4V1; break;
     case AV_CODEC_ID_MSMPEG4V2: codec = MAV_LAVC_MSMPEG4V2; break;
     case AV_CODEC_ID_MSMPEG4V3: codec = MAV_LAVC_MSMPEG4V3; break;
+    case AV_CODEC_ID_MPEG1VIDEO: codec = MAV_LAVC_MPEG1; s->info.version = 1; break;
+    case AV_CODEC_ID_MPEG2VIDEO: codec = MAV_LAVC_MPEG2; s->info.version = 2; break;
     default:
         snprintf( why, why_size, "no decoder for it in this port" );
         return MAV_E_UNSUPPORTED;
     }
     if (codec >= MAV_LAVC_WMV1)
     {
-        s->info.kind = MAV_CODEC_WMV;
+        s->info.kind = codec >= MAV_LAVC_MPEG1 ? MAV_CODEC_MPEG_VIDEO : MAV_CODEC_WMV;
         s->vbackend = &mav_lavc_video;
     }
     snprintf( s->info.codec, sizeof(s->info.codec), "%s", avcodec_get_name( par->codec_id ) );
-    if (p->is_asf != (s->info.kind == MAV_CODEC_WMV))
+    if (p->is_asf != (s->info.kind == MAV_CODEC_WMV) || p->is_mpeg != (s->info.kind == MAV_CODEC_MPEG_VIDEO))
     {
-        snprintf( why, why_size, "not in this container here (H.264 / HEVC in MP4, Windows Media video in ASF)" );
+        snprintf( why, why_size, "not in this container here (H.264 / HEVC in MP4, Windows Media video in ASF, "
+                  "MPEG-1/2 video in an MPEG program stream)" );
         return MAV_E_UNSUPPORTED;
     }
     if (!s->vbackend || !s->vbackend->supports( codec ))
@@ -1529,21 +1583,31 @@ static int mav_connect_locked( struct mav_parser *p )
     is_mp3 = !strcmp( name, "mp3" );
     p->is_mov = !strcmp( name, MAV_MOV_NAME );
     p->is_asf = !strcmp( name, "asf" );
-    if (!is_mp3 && strcmp( name, "wav" ) && !((p->is_mov || p->is_asf) && mav_video_allowed))
-        return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov || p->is_asf ? "container disabled by MADEIRA_WG_VIDEO=0"
-                                                                         : "container not in the allowlist" );
-    /* An ASF header object scores like a recognised MP4 (its GUID matches). */
-    if (p->fmt->probe_score < (p->is_mov || p->is_asf ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE))
+    /* An MPEG program stream.  MPEG video on its own (.m1v, the mpegvideo
+     * demuxer, which mpegps probes a program stream's video with) has no
+     * presentation times to play or seek by, and quartz's MPEG-1 splitter
+     * does not take it either: it is not in the allowlist. */
+    p->is_mpeg = !strcmp( name, "mpeg" );
+    if (!is_mp3 && strcmp( name, "wav" ) && !(mav_video_container( p ) && mav_video_allowed))
+        return mav_refuse( p, MAV_E_UNSUPPORTED, mav_video_container( p ) ? "container disabled by MADEIRA_WG_VIDEO=0"
+                                                                          : "container not in the allowlist" );
+    /* An ASF header object scores like a recognised MP4 (its GUID matches);
+     * an MPEG program stream has its own floor. */
     {
-        snprintf( why, sizeof(why), "probe score %d below %d", p->fmt->probe_score,
-                  p->is_mov || p->is_asf ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE );
-        return mav_refuse( p, MAV_E_UNSUPPORTED, why );
+        int floor = p->is_mpeg ? MAV_MIN_MPEG_PROBE_SCORE
+                  : mav_video_container( p ) ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE;
+        if (p->fmt->probe_score < floor)
+        {
+            snprintf( why, sizeof(why), "probe score %d below %d", p->fmt->probe_score, floor );
+            return mav_refuse( p, MAV_E_UNSUPPORTED, why );
+        }
     }
     /* The mp3 demuxer only ever carries MPEG audio and an MP4 only
      * compressed streams: a compressed-output parser is refused before the
      * stream analysis reads anything more.  An ASF is the WM reader's, which
-     * asks for compressed samples of its Windows Media streams. */
-    if (p->output_compressed && (is_mp3 || p->is_mov || (p->is_asf && !mav_compressed_asf)))
+     * asks for compressed samples of its Windows Media streams, and an MPEG
+     * program stream quartz's MPEG-1 splitter's. */
+    if (p->output_compressed && (is_mp3 || p->is_mov || ((p->is_asf || p->is_mpeg) && !mav_compressed_asf)))
         return mav_refuse( p, MAV_E_UNSUPPORTED,
                            "compressed output requested and no decoder filter exists; "
                            "the decoding splitter is tried next" );
@@ -1553,7 +1617,7 @@ static int mav_connect_locked( struct mav_parser *p )
     for (i = 0; i < p->fmt->nb_streams; i++)
     {
         enum AVMediaType type = p->fmt->streams[i]->codecpar->codec_type;
-        if (type != AVMEDIA_TYPE_AUDIO && !((p->is_mov || p->is_asf) && type == AVMEDIA_TYPE_VIDEO))
+        if (type != AVMEDIA_TYPE_AUDIO && !(mav_video_container( p ) && type == AVMEDIA_TYPE_VIDEO))
             p->fmt->streams[i]->discard = AVDISCARD_ALL;
     }
 
@@ -1568,12 +1632,12 @@ static int mav_connect_locked( struct mav_parser *p )
         if (s->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
         if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
         {
-            if (!p->is_mov && !p->is_asf) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
+            if (!mav_video_container( p )) return mav_refuse( p, MAV_E_UNSUPPORTED, "the file has a video stream" );
             if (!vst) vst = s;
         }
         if (s->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !ast) ast = s;
     }
-    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov || p->is_asf ? "no audio or video stream"
+    if (!vst && !ast) return mav_refuse( p, MAV_E_UNSUPPORTED, mav_video_container( p ) ? "no audio or video stream"
                                                                                      : "no audio stream" );
 
     if (!(p->read_pkt = av_packet_alloc())) return MAV_E_NOMEM;
@@ -1597,7 +1661,7 @@ static int mav_connect_locked( struct mav_parser *p )
         }
         if (status)
         {
-            /* An MP4's or ASF's audio is optional; its video, or the only stream, is not. */
+            /* An MP4's, ASF's or MPEG program stream's audio is optional; its video, or the only stream, is not. */
             if (st == ast && vst)
             {
                 char text[320];
@@ -3048,10 +3112,14 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
         int64_t target = (int64_t)(start > INT64_MAX / 2 ? INT64_MAX / 2 : start), ts;
         int err;
 
-        /* Seek on the video stream, so the demuxer lands on a keyframe. */
+        /* Seek on the video stream, so the demuxer lands on a keyframe.  An
+         * MPEG program stream seeks to a pack by its timestamp, not to a
+         * keyframe: a second earlier, the picture group that holds the target
+         * starts after it, and the pictures up to the target are trimmed. */
         for (i = 0; i < p->stream_count; i++)
             if (!ref || p->streams[i]->type == MAV_STREAM_VIDEO) ref = p->streams[i];
-        ts = av_rescale_q( target, (AVRational){ 1, 10000000 }, ref->time_base ) + ref->origin;
+        ts = av_rescale_q( p->is_mpeg ? (target > MAV_MPEG_SEEK_LEAD ? target - MAV_MPEG_SEEK_LEAD : 0) : target,
+                           (AVRational){ 1, 10000000 }, ref->time_base ) + ref->origin;
 
         /* A failed read (a NULL push) latches in the AVIOContext; a seek is
          * the PE side's way to start over, so it must not stay failed. */

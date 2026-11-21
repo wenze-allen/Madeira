@@ -47,7 +47,7 @@ widl-generated headers; default: wine/build-macos).
 from pathlib import Path
 import os, re, subprocess, sys, tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_ffmpeg import host_ffmpeg   # the shared host build, made under a lock
+from host_ffmpeg import host_ffmpeg, MEDIA_FLAGS   # the shared host build, made under a lock
 
 root = Path(__file__).resolve().parents[2]
 ntdll_unix = root / "build/ntdll-unix"
@@ -138,20 +138,8 @@ for need in [wine_build / "include/config.h", wine_build / "include/mfobjects.h"
         sys.exit("SKIP-FAIL: %s is missing; point MADEIRA_WINE_BUILD at a configured Wine tree" % need)
 
 # ------------------------------------------------------------------ 2. host FFmpeg
-# check-wg-parser-asf.py's list, verbatim: the same key, so one cached build serves both.
 tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(root / "build/ffmpeg/src/ffmpeg-7.1.5.tar.xz")
-FLAGS = [
-    "--disable-everything", "--disable-autodetect", "--disable-gpl", "--disable-nonfree", "--disable-version3",
-    "--enable-decoder=wmav1,wmav2,wmapro,wmalossless", "--enable-decoder=mp1,mp2,mp3",
-    "--enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le",
-    "--enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3",
-    "--enable-demuxer=mp3,wav,mov,asf", "--enable-parser=mpegaudio",
-    # TEST ONLY: input synthesis
-    "--enable-encoder=wmv1,wmv2,msmpeg4v3,wmav2", "--enable-muxer=asf",
-    "--disable-programs", "--disable-doc", "--disable-network", "--disable-avdevice", "--disable-swscale",
-    "--disable-avfilter", "--disable-postproc", "--enable-avformat", "--enable-avcodec", "--enable-swresample",
-    "--disable-asm", "--disable-shared", "--enable-static", "--enable-pic", "--disable-debug",
-]
+FLAGS = MEDIA_FLAGS   # tests/host/host_ffmpeg.py: one cached build for the media checks
 prefix = host_ffmpeg(FLAGS, tarball, tag="asf-", override=os.environ.get("MADEIRA_HOST_FFMPEG_ASF"))
 inc, lib = prefix / "include", prefix / "lib"
 
@@ -1270,7 +1258,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for label, extra_env, args, needles in [
         ("default", {}, [], ["[wmv] decoder created fmt=WMV2 176x144 fps=25/1 codec_data=4 -> nv12 176x144",
                              "[decoder not open: no sequence header",
-                             "is not a Windows Media video stream",
+                             "is not a Windows Media or MPEG video stream",
                              "[wmv] further lines suppressed after 100"]),
         ("MADEIRA_WG_WMV_TRANSFORM=0", {"MADEIRA_WG_WMV_TRANSFORM": "0"}, ["off"],
          ["[wmv] video transform refused: MADEIRA_WG_WMV_TRANSFORM=0"]),

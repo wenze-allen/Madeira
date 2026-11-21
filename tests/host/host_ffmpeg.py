@@ -13,6 +13,24 @@ from pathlib import Path
 
 VERSION = "7.1.5"
 
+# The media checks' common build (check-wg-parser-asf.py, check-wmv-transform.py,
+# check-wg-mpeg.py): the decoders, demuxers and parsers build/ffmpeg/build.sh ships for
+# Windows Media and MPEG, plus TEST-ONLY encoders and muxers that make their inputs.
+MEDIA_FLAGS = [
+    "--disable-everything", "--disable-autodetect", "--disable-gpl", "--disable-nonfree", "--disable-version3",
+    "--enable-decoder=wmav1,wmav2,wmapro,wmalossless", "--enable-decoder=mp1,mp2,mp3",
+    "--enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le",
+    "--enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3",
+    "--enable-decoder=mpeg1video,mpeg2video",
+    "--enable-demuxer=mp3,wav,mov,asf,mpegps,mpegvideo", "--enable-parser=mpegaudio,mpegvideo",
+    # TEST ONLY: input synthesis
+    "--enable-encoder=wmv1,wmv2,msmpeg4v3,wmav2,mpeg1video,mpeg2video,mp2",
+    "--enable-muxer=asf,mpeg1system,mpeg2dvd,mpeg1video,mpeg2video,mp2",
+    "--disable-programs", "--disable-doc", "--disable-network", "--disable-avdevice", "--disable-swscale",
+    "--disable-avfilter", "--disable-postproc", "--enable-avformat", "--enable-avcodec", "--enable-swresample",
+    "--disable-asm", "--disable-shared", "--enable-static", "--enable-pic", "--disable-debug",
+]
+
 
 def host_ffmpeg(flags, tarball, tag="", override=None):
     """The prefix (include/, lib/) of the host build for `flags`, built if needed.

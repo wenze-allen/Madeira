@@ -120,8 +120,9 @@ CONFIG_ARGS=(
     --enable-decoder=mp1,mp2,mp3
     --enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le
     --enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3
-    --enable-demuxer=mp3,wav,mov,asf
-    --enable-parser=mpegaudio
+    --enable-decoder=mpeg1video,mpeg2video
+    --enable-demuxer=mp3,wav,mov,asf,mpegps,mpegvideo
+    --enable-parser=mpegaudio,mpegvideo
     --disable-programs
     --disable-doc
     --disable-network

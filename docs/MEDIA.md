@@ -41,8 +41,8 @@ has been tested game by game.
 
 | File | What it is |
 |---|---|
-| `build/ntdll-unix/winegstreamer_unixlib_ios.c` | Both unix call tables (entry for entry with `dlls/winegstreamer/unixlib.h`), the wow64 thunks, and two kinds of `wg_transform` on libavcodec: the WMA decoder `wma_decoder.c` uses (WMA v1/v2/Pro/Lossless, XMA1/2) and the WMV decoder `video_decoder.c`'s WMVideo Decoder DMO/MFT uses (WMV1, WMV2, WMV3, WMVA, WVC1; see below). `transform_create` gives a create to the first kind that claims its input type; every other entry finds the kind by the magic its object starts with. Raw audio in is a third kind, the resampler `resampler.c` uses, on libswresample (see below). Other transforms (AAC, H.264, the colour converter) are refused at create, and `wg_muxer` returns `STATUS_NOT_IMPLEMENTED`. |
-| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext, libavformat demux (mp3, wav, mov, asf), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
+| `build/ntdll-unix/winegstreamer_unixlib_ios.c` | Both unix call tables (entry for entry with `dlls/winegstreamer/unixlib.h`), the wow64 thunks, and three kinds of `wg_transform` on libavcodec: the WMA decoder `wma_decoder.c` uses (WMA v1/v2/Pro/Lossless, XMA1/2), the video decoder `video_decoder.c`'s WMVideo Decoder DMO/MFT and `quartz_transform.c`'s MPEG video decoder use (WMV1, WMV2, WMV3, WMVA, WVC1; MPEG-1/2 video; see below), and the MPEG audio decoder `quartz_transform.c`'s MPEG audio and layer-3 decoders use (layers I-III). `transform_create` gives a create to the first kind that claims its input type; every other entry finds the kind by the magic its object starts with. Raw audio in is a third kind, the resampler `resampler.c` uses, on libswresample (see below). Other transforms (AAC, H.264, the colour converter) are refused at create, and `wg_muxer` returns `STATUS_NOT_IMPLEMENTED`. |
+| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext, libavformat demux (mp3, wav, mov, asf, mpegps), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) and MPEG-1/2 video decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
 | `build/ntdll-unix/wg_parser_apple_ios.c` | H.264/HEVC on VideoToolbox (NV12 out) and AAC on an AudioToolbox AudioConverter (float PCM out). Its own translation unit with no Wine or FFmpeg header. |
 | `build/ntdll-unix/wg_parser_backend_ios.h` | The contract between the core and a decoder backend; plain C types only, so the host test can supply stub backends. |
 | `build/ffmpeg/build.sh` | FFmpeg 7.1.5, pinned by SHA-256, LGPL-only configuration. |
@@ -50,14 +50,19 @@ has been tested game by game.
 FFmpeg is built with no H.264, HEVC or AAC decoder or parser: those streams go
 to the platform decoders. Windows Media video has no platform decoder on iOS,
 so FFmpeg's LGPL `wmv1`, `wmv2`, `wmv3`, `vc1` and `msmpeg4v1-3` decoders are
-built and decode it on the CPU (one thread, FFmpeg's C code: `--disable-asm`).
+built and decode it on the CPU (one thread, FFmpeg's C code: `--disable-asm`),
+and so are `mpeg1video` and `mpeg2video` for MPEG program streams (with the
+`mpegvideo` parser, and the `mpegvideo` demuxer, which `mpegps` probes a
+program stream's video with).
 See `THIRD-PARTY-NOTICES.md` for the exact component list and its licence.
 
 **Containers and codecs.** MP3/WAV: MPEG audio and PCM. MP4/MOV: H.264 or
 HEVC video (VideoToolbox) with AAC, MPEG audio or PCM. ASF (WMV/WMA): Windows
-Media video (libavcodec) with WMA v1/v2/Pro/Lossless or MPEG audio. AVI,
-MPEG program streams, Bink and the like are not handled here (Bink and most
-engines' own formats are decoded by the game itself). The codec format of an
+Media video (libavcodec) with WMA v1/v2/Pro/Lossless or MPEG audio. MPEG
+program streams (`.mpg`, MPEG-1 and MPEG-2): MPEG-1/2 video (libavcodec) with
+MPEG audio. AVI, MPEG video on its own (`.m1v`), transport streams, Bink and
+the like are not handled here (Bink and most engines' own formats are decoded
+by the game itself). The codec format of an
 ASF stream (`wg_parser_stream_get_codec_format`) is the one Wine's GStreamer
 backend reports: WMV1/WMV2/WMV3/WMVA/WVC1 video, WMA audio with its version,
 block alignment and codec data, so a game that reads the file's profile
@@ -102,6 +107,36 @@ count, so the next call wrote through a NULL array. Now:
 
 Each compressed stream logs `first compressed packet delivered` once.
 `MADEIRA_WG_COMPRESSED=0` refuses compressed output for an ASF again.
+
+**MPEG program streams (`.mpg`).** Older visual novels play their movies as
+MPEG-1 program streams through DirectShow, two ways:
+- `RenderFile`: quartz's MPEG-1 splitter takes nothing from a decoding parser,
+  so the graph falls through to winegstreamer's decoding splitter, which this
+  parser serves with decoded pictures and PCM.
+- A graph built by hand: KiriKiri's krmovie connects quartz's MPEG-1 splitter
+  to `CLSID_CMpegVideoCodec` and `CLSID_CMpegAudioCodec`, and from them to its
+  RGB32 buffer renderer (bottom-up) or VMR-9. BURIKO reads the picture size from
+  the splitter's MPEG video format while connecting (krkrwine's notes). A
+  compressed-output parser here hands out an MPEG program stream's MPEG-1 video
+  and MPEG audio as the demuxer's packets, and reports them as
+  `WG_MAJOR_TYPE_VIDEO_MPEG1` (size, frame rate) and `WG_MAJOR_TYPE_AUDIO_MPEG1`
+  (layer, rate, channels). MPEG-2 video has no `wg_format`: it stays decoded,
+  quartz's MPEG-1 splitter then gives way, and the decoding splitter plays it.
+
+A program stream's clock starts anywhere, and its streams start a little
+apart: they count from the earliest start, so audio and video stay in sync.
+It seeks to a pack by timestamp, not to a keyframe: the parser seeks a second
+early, drops pictures until the first keyframe, and trims to the target. The
+decoders behind quartz's MPEG filters are two more `wg_transform` kinds:
+- the video decoder (above and below) takes MPEG-1/2 too, through libavcodec's
+  `mpegvideo` parser, since a sample holds whatever the splitter cut; quartz's
+  probe (MPEG1Payload 1920x1080 to NV12) needs no sequence header;
+- the MPEG audio decoder (layers I-III, `WAVE_FORMAT_MPEG` and
+  `WAVE_FORMAT_MPEGLAYER3`) decodes through the `mpegaudio` parser into the PCM
+  or float the output type asks for. Media Foundation's MP3 decoder (`mp3dmod`)
+  is Wine's own.
+Both parsers read past the end of their input, so a sample is copied with
+FFmpeg's padding first.
 
 **The WMV decoder (`wg_transform`).** `video_decoder.c` probes a WMV3
 1920x1080 to I420 transform without codec private data when the DMO is
@@ -217,9 +252,10 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_64BIT` | off | `1`: 64-bit processes get the real unix side too (see above). |
 | `MADEIRA_WG_PARSER` | on | `0`: `wg_parser_create` returns `STATUS_NOT_IMPLEMENTED` again, as before this series; quartz and the MF source then fail the way they did. The WMA decoder is unaffected. |
 | `MADEIRA_WG_VIDEO` | on | `0`: MP3/WAV only; an MP4/MOV or ASF is refused at connect. |
-| `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: every video `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT cannot be created, as before. Read once per process. WMA is unaffected. |
+| `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: every video `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT and quartz's MPEG video decoder cannot be created, as before. Read once per process. WMA is unaffected. |
+| `MADEIRA_WG_MPEG_TRANSFORM` | on | `0`: the MPEG audio `wg_transform` is refused at create, so quartz's MPEG audio and layer-3 decoders cannot be created, as before. |
 | `MADEIRA_WG_RESAMPLER` | on | `0`: the resampler transform is refused at create, as before. |
-| `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF, as before: the WM reader's compressed samples are not available (see above). |
+| `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF and an MPEG program stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
 | `MADEIRA_WG_VIDEO_AHEAD` | on | `0`: video is decoded on the thread that asks for it, as before; a Media Foundation movie's audio then waits behind each picture (see above). |
 | `MADEIRA_WG_VIDEO_FORMAT` | `rgb32` | Native format a video stream reports: `nv12`, `i420`, `yv12`, `yuy2`, `rgb32`, `argb32` or `abgr32` (see above for why the default is `rgb32`). |
 | `MADEIRA_WMA_SEARCH` | on | `0`: keep the WMA v1/v2 decoder at the bit rate and flags it opened with; no search over other candidates when a bit-reservoir stream fails. A packet that fails is concealed with silence of its length and the next one is decoded as usual. (An xWMA stream still opens at the rate libavformat's xWMA table normalises to.) |
@@ -227,7 +263,7 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 
 Log tags: `[wma]` for the WMA decoder, `[wmv]` for the WMV decoder (one line
 per create and per destroy, refusals with their reason), `[resampler]` for the
-resampler (one line per create), `[wg-parser]` for the parser. All are
+resampler and the MPEG audio decoder (one line per create), `[wg-parser]` for the parser. All are
 rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]`, `[wmv]` and
 `[resampler]` caps).
 
@@ -296,6 +332,23 @@ rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]`, `[wmv]` and
   `MADEIRA_WG_WMV_TRANSFORM=0`. WMV3/WVC1/WMVA are covered by codec-id
   plumbing only (the DMO's probe, hand-built sequence headers, garbage
   frames): FFmpeg cannot encode them.
+- `tests/host/check-wg-mpeg.py` (the core on any host; the glue needs a
+  configured Wine tree, like the WMA test): synthesises MPEG-1 and MPEG-2
+  program streams (B-frames, MP2 audio) with FFmpeg's encoders. Checks:
+  - every picture bit-exact against an independent decode, in order, decoded
+    ahead; the tone; audio and video on one clock;
+  - an exact seek, and a rewind to 0 after the end (KiriKiri's
+    `put_CurrentPosition(0)`);
+  - compressed output for quartz's MPEG-1 splitter, packet by packet against an
+    independent demux; MPEG-2 video not passed; `MADEIRA_WG_COMPRESSED=0`;
+  - a `.m1v` refused;
+  - through the glue: the splitter's `WG_MAJOR_TYPE_VIDEO_MPEG1` size and frame
+    rate (BURIKO's) and MPEG audio formats; the MPEG video decoder's probe, the
+    MPEG-1 and MPEG-2 elementary streams pushed in 997-byte pieces, bit-exact,
+    and RGB32 bottom-up within 1 of BT.601; the MPEG audio decoder's probes and
+    MP2 in 333-byte pieces to S16 and float; refusals and
+    `MADEIRA_WG_MPEG_TRANSFORM=0`;
+  - the threaded cases again under ThreadSanitizer.
 - `tests/host/check-wg-resampler.py` (needs a configured Wine tree, like
   the WMA test): drives the resampler through the `wg_transform` entries under
   ASan/UBSan. It covers:

@@ -30,7 +30,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/madeira-host-ffmpeg
-          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py', 'tests/host/check-wmv-transform.py') }}
+          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py', 'tests/host/check-wmv-transform.py', 'tests/host/check-wg-resampler.py', 'tests/host/check-wg-mpeg.py', 'tests/host/host_ffmpeg.py') }}
       - name: Wine headers (a configured tree, for check-wma-decoder.py and check-wmv-transform.py)
         run: |
           mkdir -p "$RUNNER_TEMP/wine-build"
@@ -64,6 +64,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/madeira-host-ffmpeg
-          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py', 'tests/host/check-wmv-transform.py') }}
+          key: host-ffmpeg-${{ runner.os }}-${{ hashFiles('build/ffmpeg/src/SHA256SUMS', 'tests/host/check-wg-parser.py', 'tests/host/check-wg-parser-asf.py', 'tests/host/check-wma-decoder.py', 'tests/host/check-wmv-transform.py', 'tests/host/check-wg-resampler.py', 'tests/host/check-wg-mpeg.py', 'tests/host/host_ffmpeg.py') }}
       - name: Host checks
         run: python3 tests/host/run-all.py -j "$(sysctl -n hw.ncpu)"

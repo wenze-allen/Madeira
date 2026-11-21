@@ -40,14 +40,15 @@
  * port does not implement -- an index that drifts from the header silently
  * dispatches one call to another function's argument block.
  *
- * What is implemented is the wg_transform subset that wma_decoder.c and
- * video_decoder.c's WMV decoder use: create / destroy / push_data /
- * read_data / get_output_type / set_output_type / drain / flush / get_status
- * (+ notify_qos as a no-op, and wg_init_gstreamer as a benign success so
- * main.c's init_gstreamer_proc lets the DLL load), for three kinds of
- * transform: WMA audio (below), WMV video (the section "the WMV decoder") and
- * the audio resampler (resampler.c's; the section after it).  "Transform
- * kinds" is how a call finds its kind.  The wg_muxer
+ * What is implemented is the wg_transform subset that wma_decoder.c,
+ * video_decoder.c's WMV decoder, resampler.c and quartz_transform.c's MPEG
+ * decoders use: create / destroy / push_data / read_data / get_output_type /
+ * set_output_type / drain / flush / get_status (+ notify_qos as a no-op, and
+ * wg_init_gstreamer as a benign success so main.c's init_gstreamer_proc lets
+ * the DLL load), for four kinds of transform: WMA audio (below), Windows Media
+ * and MPEG-1/2 video (the section "the WMV decoder"), the audio resampler and
+ * MPEG audio (the sections after it).  "Transform kinds" is how a call finds
+ * its kind.  The wg_muxer
  * side returns STATUS_NOT_IMPLEMENTED.  Those callers already handle a
  * component that is not available; what they must never get is a success
  * with an untouched output field (no fake success).
@@ -63,13 +64,14 @@
  * restores the MP3/WAV-only parser.
  *
  * wg_transform_create also REFUSES anything that is not a WMA family
- * stream, Windows Media video (WMV1/WMV2/WMV3/WMVA/WVC1) or raw audio (the
- * resampler, on libswresample).  winegstreamer's other transforms (aac, h264,
- * the colour converter) are real GStreamer pipelines with no replacement
- * here, and a transform that accepts an H.264 stream and then emits nothing
- * is worse for the caller than one that never opened.
- * MADEIRA_WG_WMV_TRANSFORM=0 refuses the WMV one too, MADEIRA_WG_RESAMPLER=0
- * the resampler.
+ * stream, Windows Media video (WMV1/WMV2/WMV3/WMVA/WVC1), MPEG-1/2 video,
+ * MPEG audio (layers I-III) or raw audio (the resampler, on libswresample).
+ * winegstreamer's other transforms (aac, h264, the colour converter) are real
+ * GStreamer pipelines with no replacement here, and a transform that accepts
+ * an H.264 stream and then emits nothing is worse for the caller than one
+ * that never opened.  MADEIRA_WG_WMV_TRANSFORM=0 refuses the video one too
+ * (WMV and MPEG video), MADEIRA_WG_MPEG_TRANSFORM=0 MPEG audio,
+ * MADEIRA_WG_RESAMPLER=0 the resampler.
  *
  * DECODING
  * --------
@@ -2142,6 +2144,13 @@ static BOOL wma_claims( const struct wg_transform_create_params *params )
  * compressed ASF output of the parser and the reader's side are separate
  * pieces; this is the decoder.
  *
+ * The same decoder serves quartz's MPEG video decoder (CLSID_CMpegVideoCodec,
+ * quartz_transform.c): MPEG-1 and MPEG-2 video from quartz's MPEG-1 splitter,
+ * which a KiriKiri or BURIKO graph is built on.  Its samples hold whatever
+ * the splitter cut, so libavcodec's mpegvideo parser cuts pictures out of
+ * them first (wmv_parse); its constructor's probe is MPEG1Payload 1920x1080
+ * -> NV12, which needs no sequence header.
+ *
  * WHAT video_decoder.c DOES WITH ITS wg_transform
  * ------------------------------------------------
  *   create       check_video_transform_support() in wmv_decoder_create():
@@ -2282,6 +2291,7 @@ struct wmv_transform
     int codec;              /* MAV_LAVC_* */
     const char *name;       /* the input FourCC, for the log */
     void *dec;              /* the mav_lavc_video decoder; NULL: no sequence header (see above) */
+    AVCodecParserContext *parser;   /* MPEG-1/2: whole pictures out of whatever the samples hold */
     UINT32 width, height;   /* coded size, from the input type */
     INT64 frame_duration;   /* 100 ns, from the input type's frame rate; 0 without one */
     int bt709;
@@ -2306,8 +2316,9 @@ struct wmv_transform
 };
 
 /* MADEIRA_WG_WMV_TRANSFORM=0 refuses every video transform again, as before
- * this decoder existed: the WMVideo Decoder DMO and MFT then cannot be
- * created (32-bit programs; read once). */
+ * this decoder existed: the WMVideo Decoder DMO and MFT, and quartz's MPEG
+ * video decoder (CLSID_CMpegVideoCodec), then cannot be created (32-bit
+ * programs; read once). */
 static BOOL wmv_transform_switch_on(void)
 {
     static int on = -1;
@@ -2361,13 +2372,35 @@ static const char *wmv_subtype_name( const GUID *subtype, char buf[16] )
     return buf;
 }
 
+/* MPEG video, by quartz's and Media Foundation's names for it.  The
+ * MEDIASUBTYPE_MPEG1* and MPEG2_VIDEO GUIDs are not FourCC GUIDs. */
+static const GUID madeira_MEDIASUBTYPE_MPEG1Packet =
+    { 0xe436eb80, 0x524f, 0x11ce, { 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70 } };
+static const GUID madeira_MEDIASUBTYPE_MPEG1Payload =
+    { 0xe436eb81, 0x524f, 0x11ce, { 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70 } };
+static const GUID madeira_MEDIASUBTYPE_MPEG2_VIDEO =
+    { 0xe06d8026, 0xdb46, 0x11cf, { 0xb4, 0xd1, 0x00, 0x80, 0x5f, 0x6c, 0xbb, 0xea } };
+
 static int wmv_input_codec( const GUID *subtype, const char **name )
 {
     UINT tag;
 
+    if (IsEqualGUID( subtype, &madeira_MEDIASUBTYPE_MPEG1Packet )
+        || IsEqualGUID( subtype, &madeira_MEDIASUBTYPE_MPEG1Payload ))
+    {
+        *name = "MPEG-1";
+        return MAV_LAVC_MPEG1;
+    }
+    if (IsEqualGUID( subtype, &madeira_MEDIASUBTYPE_MPEG2_VIDEO ))
+    {
+        *name = "MPEG-2";
+        return MAV_LAVC_MPEG2;
+    }
     if (!madeira_subtype_tag( subtype, &tag )) return 0;
     switch (tag)
     {
+    case MAKEFOURCC('M','P','G','1'): *name = "MPEG-1"; return MAV_LAVC_MPEG1;   /* MFVideoFormat_MPG1 */
+    case MAKEFOURCC('M','P','G','2'): *name = "MPEG-2"; return MAV_LAVC_MPEG2;
     case MAKEFOURCC('W','M','V','1'): *name = "WMV1"; return MAV_LAVC_WMV1;
     case MAKEFOURCC('W','M','V','2'): *name = "WMV2"; return MAV_LAVC_WMV2;
     case MAKEFOURCC('W','M','V','3'): *name = "WMV3"; return MAV_LAVC_WMV3;
@@ -2478,10 +2511,41 @@ static void wmv_pop_picture( struct wmv_transform *transform )
     transform->picture_count--;
 }
 
+static void wmv_decode_frame( struct wmv_transform *transform, const BYTE *data, UINT32 size, INT64 pts,
+                              INT64 duration, int keyframe );
+
+/* MPEG video arrives as whatever the splitter put in a sample (quartz's MPEG-1
+ * splitter: the payload of its packets), so the parser cuts it into pictures
+ * first; each takes the time of the sample its first byte came in.  NULL data:
+ * the end of the stream, what the parser still holds. */
+static void wmv_parse( struct wmv_transform *transform, const BYTE *data, UINT32 size, INT64 pts )
+{
+    AVCodecContext *ctx = ((struct mav_lavc_vdec *)transform->dec)->ctx;
+
+    for (;;)
+    {
+        uint8_t *frame;
+        int frame_size, used;
+
+        used = av_parser_parse2( transform->parser, ctx, &frame, &frame_size, data, data ? (int)size : 0,
+                                 pts == INT64_MIN ? AV_NOPTS_VALUE : pts, AV_NOPTS_VALUE, 0 );
+        if (used < 0) break;
+        if (data)
+        {
+            data += used;
+            size -= used;
+            pts = INT64_MIN;   /* the rest of the sample has no time of its own */
+        }
+        if (frame_size)
+            wmv_decode_frame( transform, frame, frame_size,
+                              transform->parser->pts == AV_NOPTS_VALUE ? INT64_MIN : transform->parser->pts,
+                              INT64_MIN, transform->parser->key_frame == 1 );
+        if (!data ? !frame_size : !size) break;
+    }
+}
+
 static void wmv_decode_packet( struct wmv_transform *transform, const struct wmv_packet *packet )
 {
-    int err;
-
     if (packet->flags & WG_SAMPLE_FLAG_DISCONTINUITY) transform->discontinuity = TRUE;
     /* An empty packet would tell libavcodec the stream has ended. */
     if (!packet->size) return;
@@ -2492,8 +2556,21 @@ static void wmv_decode_packet( struct wmv_transform *transform, const struct wmv
                      "dropping what is pushed\n", transform, transform->name );
         return;
     }
-    err = mav_lavc_decode( transform->dec, packet->data, packet->size, packet->pts, packet->duration,
-                           !!(packet->flags & WG_SAMPLE_FLAG_SYNC_POINT), wmv_emit, transform );
+    if (transform->parser)
+    {
+        wmv_parse( transform, packet->data, packet->size, packet->pts );
+        return;
+    }
+    wmv_decode_frame( transform, packet->data, packet->size, packet->pts, packet->duration,
+                      !!(packet->flags & WG_SAMPLE_FLAG_SYNC_POINT) );
+}
+
+static void wmv_decode_frame( struct wmv_transform *transform, const BYTE *data, UINT32 size, INT64 pts,
+                              INT64 duration, int keyframe )
+{
+    int err;
+
+    err = mav_lavc_decode( transform->dec, data, size, pts, duration, keyframe, wmv_emit, transform );
     if (err < 0)
     {
         transform->rejected++;
@@ -2502,19 +2579,28 @@ static void wmv_decode_packet( struct wmv_transform *transform, const struct wmv
         {
             transform->rejected_logged++;
             WMV_LOG( "transform %p: %s frame of %u bytes rejected by the decoder (%u so far)\n",
-                     transform, transform->name, packet->size, transform->rejected );
+                     transform, transform->name, size, transform->rejected );
         }
     }
 }
 
 /* The end of the stream: what the decoder holds back.  After it the decoder
  * takes frames again only once flushed. */
+static void wmv_reset_parser( struct wmv_transform *transform )
+{
+    if (!transform->parser) return;
+    av_parser_close( transform->parser );
+    transform->parser = av_parser_init( mav_lavc_codec_id( transform->codec ) );
+}
+
 static void wmv_complete_drain( struct wmv_transform *transform )
 {
     transform->draining = FALSE;
     if (!transform->dec) return;
+    if (transform->parser) wmv_parse( transform, NULL, 0, INT64_MIN );
     mav_lavc_drain( transform->dec, wmv_emit, transform );
     mav_lavc_flush( transform->dec );
+    wmv_reset_parser( transform );
 }
 
 static void wmv_decode_until_picture( struct wmv_transform *transform )
@@ -2709,7 +2795,8 @@ static NTSTATUS wmv_create( struct wg_transform_create_params *params )
     if (!in) return STATUS_NOT_SUPPORTED;   /* a malformed block */
     if (!(codec = wmv_input_codec( &in->guidFormat, &name )))
     {
-        WMV_LOG( "input subtype %s is not a Windows Media video stream (WMV1/WMV2/WMV3/WMVA/WVC1); refusing\n",
+        WMV_LOG( "input subtype %s is not a Windows Media or MPEG video stream "
+                 "(WMV1/WMV2/WMV3/WMVA/WVC1, MPEG-1, MPEG-2); refusing\n",
                  wmv_subtype_name( &in->guidFormat, sub ) );
         return STATUS_NOT_SUPPORTED;
     }
@@ -2778,6 +2865,14 @@ static NTSTATUS wmv_create( struct wg_transform_create_params *params )
         goto fail;
     }
     if (transform->dec) ((struct mav_lavc_vdec *)transform->dec)->ctx->opaque = WMV_DECODER_MARKER;
+    if (transform->dec && (codec == MAV_LAVC_MPEG1 || codec == MAV_LAVC_MPEG2)
+        && !(transform->parser = av_parser_init( mav_lavc_codec_id( codec ) )))
+    {
+        WMV_LOG( "%s: no MPEG video parser in this FFmpeg build; refusing\n", name );
+        mav_lavc_close( transform->dec );
+        status = STATUS_NOT_SUPPORTED;
+        goto fail;
+    }
 
     params->transform = (wg_transform_t)(UINT_PTR)transform;
     WMV_LOG( "decoder created fmt=%s %ux%u fps=%u/%u codec_data=%u -> %s %ux%u%s queue=%u%s (transform %p)%s\n",
@@ -2813,6 +2908,7 @@ static NTSTATUS wmv_destroy( wg_transform_t handle )
     wmv_report( transform, "destroy" );
     transform->magic = 0;
     wmv_clear( transform );
+    if (transform->parser) av_parser_close( transform->parser );
     if (transform->dec) mav_lavc_close( transform->dec );
     free( transform->packets );
     free( transform->pictures );
@@ -2895,7 +2991,8 @@ static NTSTATUS wmv_push_data( wg_transform_t handle, struct wg_sample *sample, 
     }
     packet = &transform->packets[transform->packet_count];
     memset( packet, 0, sizeof(*packet) );
-    if (sample->size && !(packet->data = malloc( sample->size )))
+    /* padded: the MPEG video parser reads past the end of what it is given */
+    if (sample->size && !(packet->data = calloc( 1, (size_t)sample->size + AV_INPUT_BUFFER_PADDING_SIZE )))
     {
         pthread_mutex_unlock( &transform->lock );
         return STATUS_NO_MEMORY;
@@ -3041,6 +3138,7 @@ static NTSTATUS wmv_flush( wg_transform_t handle )
     if (transform->rejected || transform->dropped || transform->lost) wmv_report( transform, "flush" );
     wmv_clear( transform );
     if (transform->dec) mav_lavc_flush( transform->dec );
+    wmv_reset_parser( transform );
     transform->draining = FALSE;
     transform->next_pts = 0;
     pthread_mutex_unlock( &transform->lock );
@@ -3215,6 +3313,21 @@ static int rs_open( struct rs_transform *transform )
 
 /* Converts `frames` frames of the caller's input (NULL: what libswresample
  * still holds) onto the end of pcm_buf. */
+/* S32 samples back down to packed 24-bit, in place: each 3-byte sample lands
+ * at or before its source. */
+static void rs_pack24( uint8_t *buf, size_t samples )
+{
+    size_t i;
+
+    for (i = 0; i < samples; i++)
+    {
+        UINT32 v = ((UINT32 *)buf)[i];
+        buf[3 * i] = (BYTE)(v >> 8);
+        buf[3 * i + 1] = (BYTE)(v >> 16);
+        buf[3 * i + 2] = (BYTE)(v >> 24);
+    }
+}
+
 static NTSTATUS rs_convert( struct rs_transform *transform, const BYTE *data, UINT32 frames )
 {
     const uint8_t *in = data;
@@ -3243,18 +3356,7 @@ static NTSTATUS rs_convert( struct rs_transform *transform, const BYTE *data, UI
         RS_LOG( "swr_convert failed (%d) on %u frames (transform %p)\n", n, frames, transform );
         return STATUS_INTERNAL_ERROR;
     }
-    if (transform->out.bits == 24)
-    {
-        /* back down from S32, in place: each 3-byte sample lands at or before its source */
-        size_t samples = (size_t)n * transform->out.channels;
-        for (i = 0; i < (int)samples; i++)
-        {
-            UINT32 v = ((UINT32 *)out)[i];
-            out[3 * i] = (BYTE)(v >> 8);
-            out[3 * i + 1] = (BYTE)(v >> 16);
-            out[3 * i + 2] = (BYTE)(v >> 24);
-        }
-    }
+    if (transform->out.bits == 24) rs_pack24( out, (size_t)n * transform->out.channels );
     transform->pcm_len += (size_t)n * transform->out.frame_size;
     return STATUS_SUCCESS;
 }
@@ -3537,6 +3639,452 @@ static NTSTATUS rs_flush( wg_transform_t handle )
 }
 
 /***********************************************************************
+ *           wg_transform: the MPEG audio decoder   (MADEIRA)
+ *
+ * quartz's MPEG audio decoder (CLSID_CMpegAudioCodec, layers I and II) and
+ * its MPEG layer-3 decoder (CLSID_mpeg_layer3_decoder), quartz_transform.c,
+ * are wg_transforms: the audio of an MPEG program stream that a graph takes
+ * through quartz's MPEG-1 splitter, and MP3 in an AVI.  This is libavcodec's
+ * mp1/mp2/mp3 decoder behind the mpegaudio parser (a sample holds whatever the
+ * splitter cut), into the PCM or float the output type asks for, converted by
+ * libswresample.  Same protocol as the resampler above.  Media Foundation's
+ * MP3 decoder (mp3dmod) is Wine's own and needs none of this.
+ * MADEIRA_WG_MPEG_TRANSFORM=0 refuses it again.
+ */
+#define MADEIRA_WG_MPA_MAGIC 0x4d504144  /* 'MPAD' */
+#define MADEIRA_WAVE_FORMAT_MPEG 0x0050
+#define MADEIRA_WAVE_FORMAT_MPEGLAYER3 0x0055
+
+struct mpa_transform
+{
+    UINT32 magic;
+    pthread_mutex_t lock;
+    AVCodecContext *ctx;
+    AVCodecParserContext *parser;
+    AVPacket *pkt;
+    AVFrame *frame;
+    SwrContext *swr;
+    int swr_fmt, swr_rate;
+    AVChannelLayout swr_layout;     /* what swr was set up for */
+    BYTE *in_buf;                   /* the pushed sample, padded for the parser */
+    size_t in_cap;
+    struct rs_format out;
+    BYTE *out_format;
+    UINT32 out_format_size;
+    const char *name;
+    BYTE *pcm_buf;
+    size_t pcm_cap, pcm_pos, pcm_len;
+    INT64 anchor;                   /* as the resampler's */
+    UINT64 anchor_frames;
+    BOOL have_pts, discontinuity;
+    UINT32 errors, errors_logged;
+};
+
+/* MADEIRA_WG_MPEG_TRANSFORM=0 refuses MPEG audio transforms again: quartz's
+ * MPEG audio and layer-3 decoders then cannot be created, as before. */
+static BOOL mpa_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_MPEG_TRANSFORM" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
+static struct mpa_transform *get_mpa_transform( wg_transform_t handle )
+{
+    struct mpa_transform *transform = (struct mpa_transform *)(UINT_PTR)handle;
+
+    if (!transform || transform->magic != MADEIRA_WG_MPA_MAGIC) return NULL;
+    return transform;
+}
+
+static BOOL mpa_claims( const struct wg_transform_create_params *params )
+{
+    const WAVEFORMATEX *wfx = audio_format( &params->input_type );
+    UINT tag;
+
+    if (!wfx) return FALSE;
+    tag = format_tag( wfx, params->input_type.format_size );
+    return tag == MADEIRA_WAVE_FORMAT_MPEG || tag == MADEIRA_WAVE_FORMAT_MPEGLAYER3;
+}
+
+/* Decoded frames, converted, onto the end of pcm_buf. */
+static NTSTATUS mpa_append( struct mpa_transform *transform, const AVFrame *frame )
+{
+    UINT32 swr_frame = transform->out.channels * av_get_bytes_per_sample( transform->out.fmt );
+    uint8_t *out;
+    int max, n;
+
+    if (!transform->swr || transform->swr_fmt != frame->format || transform->swr_rate != frame->sample_rate
+        || av_channel_layout_compare( &transform->swr_layout, &frame->ch_layout ))
+    {
+        swr_free( &transform->swr );
+        av_channel_layout_uninit( &transform->swr_layout );
+        if (swr_alloc_set_opts2( &transform->swr, &transform->out.layout, transform->out.fmt, transform->out.rate,
+                                 &frame->ch_layout, frame->format, frame->sample_rate, 0, NULL ) < 0
+            || swr_init( transform->swr ) < 0)
+        {
+            swr_free( &transform->swr );
+            return STATUS_INTERNAL_ERROR;
+        }
+        transform->swr_fmt = frame->format;
+        transform->swr_rate = frame->sample_rate;
+        av_channel_layout_copy( &transform->swr_layout, &frame->ch_layout );
+    }
+    if ((max = swr_get_out_samples( transform->swr, frame->nb_samples )) <= 0) return STATUS_SUCCESS;
+    if (!buffer_reserve( &transform->pcm_buf, &transform->pcm_cap, transform->pcm_len + (size_t)max * swr_frame ))
+        return STATUS_NO_MEMORY;
+    out = transform->pcm_buf + transform->pcm_len;
+    if ((n = swr_convert( transform->swr, &out, max, (const uint8_t **)frame->extended_data, frame->nb_samples )) < 0)
+        return STATUS_INTERNAL_ERROR;
+    if (transform->out.bits == 24) rs_pack24( out, (size_t)n * transform->out.channels );
+    transform->pcm_len += (size_t)n * transform->out.frame_size;
+    return STATUS_SUCCESS;
+}
+
+/* One frame (NULL: the end) into the decoder, and what comes out. */
+static NTSTATUS mpa_decode( struct mpa_transform *transform, const uint8_t *data, int size )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    int err;
+
+    transform->pkt->data = (uint8_t *)data;
+    transform->pkt->size = size;
+    if ((err = avcodec_send_packet( transform->ctx, data ? transform->pkt : NULL )) < 0 && err != AVERROR_EOF)
+    {
+        transform->discontinuity = TRUE;
+        if (transform->errors_logged < 3)
+        {
+            transform->errors_logged++;
+            RS_LOG( "%s: a %d-byte frame rejected by the decoder (%d)\n", transform->name, size, err );
+        }
+        transform->errors++;
+    }
+    transform->pkt->data = NULL;
+    transform->pkt->size = 0;
+    while (!status && avcodec_receive_frame( transform->ctx, transform->frame ) >= 0)
+    {
+        status = mpa_append( transform, transform->frame );
+        av_frame_unref( transform->frame );
+    }
+    return status;
+}
+
+/* A sample's bytes, cut into frames (NULL: what the parser still holds). */
+static NTSTATUS mpa_parse( struct mpa_transform *transform, const BYTE *data, UINT32 size )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    while (!status)
+    {
+        uint8_t *frame;
+        int frame_size, used;
+
+        if ((used = av_parser_parse2( transform->parser, transform->ctx, &frame, &frame_size, data,
+                                      data ? (int)size : 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 )) < 0)
+            break;
+        if (data)
+        {
+            data += used;
+            size -= used;
+        }
+        if (frame_size) status = mpa_decode( transform, frame, frame_size );
+        if (!data ? !frame_size : !size) break;
+    }
+    return status;
+}
+
+static void mpa_free( struct mpa_transform *transform )
+{
+    if (transform->parser) av_parser_close( transform->parser );
+    avcodec_free_context( &transform->ctx );
+    av_packet_free( &transform->pkt );
+    av_frame_free( &transform->frame );
+    swr_free( &transform->swr );
+    av_channel_layout_uninit( &transform->swr_layout );
+    av_channel_layout_uninit( &transform->out.layout );
+    free( transform->out_format );
+    free( transform->pcm_buf );
+    free( transform->in_buf );
+    free( transform );
+}
+
+/* After a flush, or the end of the stream: a fresh decoder state. */
+static void mpa_restart( struct mpa_transform *transform )
+{
+    avcodec_flush_buffers( transform->ctx );
+    av_parser_close( transform->parser );
+    transform->parser = av_parser_init( transform->ctx->codec_id );
+    if (transform->swr) swr_init( transform->swr );
+}
+
+static NTSTATUS mpa_create( struct wg_transform_create_params *params )
+{
+    const WAVEFORMATEX *in = audio_format( &params->input_type );
+    const WAVEFORMATEX *out = audio_format( &params->output_type );
+    struct mpa_transform *transform;
+    enum AVCodecID id;
+    UINT tag, layer = 0;
+
+    params->transform = 0;
+    if (!mpa_switch_on())
+    {
+        RS_LOG( "MPEG audio: disabled by MADEIRA_WG_MPEG_TRANSFORM=0; refusing\n" );
+        return STATUS_NOT_SUPPORTED;
+    }
+    tag = format_tag( in, params->input_type.format_size );
+    if (tag == MADEIRA_WAVE_FORMAT_MPEGLAYER3) layer = 3;
+    else if (params->input_type.format_size >= sizeof(WAVEFORMATEX) + 2)
+    {
+        /* MPEG1WAVEFORMAT.fwHeadLayer: ACM_MPEG_LAYER1, 2 or 3 (1, 2, 4) */
+        WORD head_layer = *(const WORD *)((const BYTE *)in + sizeof(WAVEFORMATEX));
+        layer = head_layer == 1 ? 1 : head_layer == 4 ? 3 : 2;
+    }
+    else layer = 2;
+    id = layer == 1 ? AV_CODEC_ID_MP1 : layer == 2 ? AV_CODEC_ID_MP2 : AV_CODEC_ID_MP3;
+    if (!in->nChannels || in->nChannels > 2 || !in->nSamplesPerSec || in->nSamplesPerSec > 48000)
+    {
+        RS_LOG( "MPEG audio: %u Hz %u channels is not MPEG audio; refusing\n", (UINT)in->nSamplesPerSec,
+                (UINT)in->nChannels );
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (!(transform = calloc( 1, sizeof(*transform) ))) return STATUS_NO_MEMORY;
+    transform->name = layer == 1 ? "MPEG-1 layer I" : layer == 2 ? "MPEG-1 layer II" : "MP3";
+    if (!out || !rs_parse( &params->output_type, &transform->out ))
+    {
+        RS_LOG( "%s: output is not 8/16/24/32-bit PCM or 32/64-bit float; refusing\n", transform->name );
+        free( transform );
+        return STATUS_NOT_SUPPORTED;
+    }
+    pthread_once( &wma_av_log_once, wma_install_av_log );
+    if (!(transform->out_format = malloc( params->output_type.format_size ))
+        || !(transform->pkt = av_packet_alloc()) || !(transform->frame = av_frame_alloc())
+        || !(transform->ctx = avcodec_alloc_context3( avcodec_find_decoder( id ) )))
+    {
+        mpa_free( transform );
+        return STATUS_NO_MEMORY;
+    }
+    memcpy( transform->out_format, out, params->output_type.format_size );
+    transform->out_format_size = params->output_type.format_size;
+    transform->ctx->sample_rate = in->nSamplesPerSec;
+    av_channel_layout_default( &transform->ctx->ch_layout, in->nChannels );
+    if (!transform->ctx->codec || avcodec_open2( transform->ctx, transform->ctx->codec, NULL ) < 0
+        || !(transform->parser = av_parser_init( id )))
+    {
+        RS_LOG( "%s: no decoder or parser for it in this FFmpeg build; refusing\n", transform->name );
+        mpa_free( transform );
+        return STATUS_NOT_SUPPORTED;
+    }
+    pthread_mutex_init( &transform->lock, NULL );
+    transform->magic = MADEIRA_WG_MPA_MAGIC;
+    transform->discontinuity = TRUE;
+    params->transform = (wg_transform_t)(UINT_PTR)transform;
+    RS_LOG( "MPEG audio decoder created: %s %u Hz %uch -> %s %u Hz %uch (transform %p)\n", transform->name,
+            (UINT)in->nSamplesPerSec, (UINT)in->nChannels, rs_format_name( &transform->out ), transform->out.rate,
+            transform->out.channels, transform );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_destroy( wg_transform_t handle )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    transform->magic = 0;
+    pthread_mutex_unlock( &transform->lock );
+    pthread_mutex_destroy( &transform->lock );
+    mpa_free( transform );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_push_data( wg_transform_t handle, struct wg_sample *sample, const void *data, HRESULT *result )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+    NTSTATUS status;
+
+    if (!transform || !sample) return STATUS_INVALID_HANDLE;
+    if (sample->size && !data) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &transform->lock );
+    if (transform->pcm_len > transform->pcm_pos)
+    {
+        *result = MF_E_NOTACCEPTING;
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_SUCCESS;
+    }
+    transform->pcm_pos = transform->pcm_len = 0;
+    /* The output from here on starts near this sample's time: the parser
+     * holds at most part of one frame (26 ms at 44.1 kHz) from before it.
+     * The timeline is kept unless the sample's time is off it by more. */
+    if (sample->flags & WG_SAMPLE_FLAG_HAS_PTS)
+    {
+        INT64 expected = transform->anchor + (INT64)(transform->anchor_frames * 10000000 / transform->out.rate);
+
+        if (!transform->have_pts || (sample->flags & WG_SAMPLE_FLAG_DISCONTINUITY)
+            || llabs( (long long)(sample->pts - expected) ) > 500000)
+        {
+            transform->anchor = sample->pts;
+            transform->anchor_frames = 0;
+            transform->have_pts = TRUE;
+        }
+    }
+    if (sample->flags & WG_SAMPLE_FLAG_DISCONTINUITY) transform->discontinuity = TRUE;
+    /* The parser reads past the end of what it is given: a padded copy. */
+    if (sample->size && !buffer_reserve( &transform->in_buf, &transform->in_cap,
+                                         (size_t)sample->size + AV_INPUT_BUFFER_PADDING_SIZE ))
+    {
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_NO_MEMORY;
+    }
+    if (sample->size)
+    {
+        memcpy( transform->in_buf, data, sample->size );
+        memset( transform->in_buf + sample->size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
+    }
+    status = sample->size ? mpa_parse( transform, transform->in_buf, sample->size ) : STATUS_SUCCESS;
+    pthread_mutex_unlock( &transform->lock );
+    *result = status ? E_FAIL : S_OK;
+    return status;
+}
+
+static NTSTATUS mpa_read_data( wg_transform_t handle, struct wg_sample *sample, void *data, HRESULT *result )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+    size_t avail, copy;
+
+    if (!transform || !sample) return STATUS_INVALID_HANDLE;
+    if (sample->max_size && !data) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &transform->lock );
+    avail = transform->pcm_len - transform->pcm_pos;
+    copy = avail < sample->max_size ? avail : sample->max_size;
+    copy -= copy % transform->out.frame_size;
+    if (!copy)
+    {
+        sample->size = 0;
+        pthread_mutex_unlock( &transform->lock );
+        *result = MF_E_TRANSFORM_NEED_MORE_INPUT;
+        return STATUS_SUCCESS;
+    }
+    memcpy( data, transform->pcm_buf + transform->pcm_pos, copy );
+    sample->size = copy;
+    sample->flags &= ~(WG_SAMPLE_FLAG_INCOMPLETE | WG_SAMPLE_FLAG_HAS_PTS |
+                       WG_SAMPLE_FLAG_HAS_DURATION | WG_SAMPLE_FLAG_DISCONTINUITY);
+    sample->flags |= WG_SAMPLE_FLAG_SYNC_POINT | WG_SAMPLE_FLAG_HAS_DURATION;
+    {
+        UINT64 frames = copy / transform->out.frame_size, rate = transform->out.rate;
+        INT64 start = transform->anchor + (INT64)((transform->anchor_frames * 10000000 + rate / 2) / rate);
+        INT64 end = transform->anchor + (INT64)(((transform->anchor_frames + frames) * 10000000 + rate / 2) / rate);
+
+        sample->duration = end - start;
+        if (transform->have_pts)
+        {
+            sample->flags |= WG_SAMPLE_FLAG_HAS_PTS;
+            sample->pts = start;
+        }
+        transform->anchor_frames += frames;
+    }
+    if (transform->discontinuity)
+    {
+        sample->flags |= WG_SAMPLE_FLAG_DISCONTINUITY;
+        transform->discontinuity = FALSE;
+    }
+    transform->pcm_pos += copy;
+    if (transform->pcm_pos < transform->pcm_len) sample->flags |= WG_SAMPLE_FLAG_INCOMPLETE;
+    else transform->pcm_pos = transform->pcm_len = 0;
+    pthread_mutex_unlock( &transform->lock );
+    *result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_get_output_type( wg_transform_t handle, struct wg_media_type *type )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+    UINT32 size;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    size = transform->out_format_size;
+    type->major = madeira_MFMediaType_Audio;
+    if (!type->u.format || type->format_size < size)
+    {
+        type->format_size = size;
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    memcpy( type->u.format, transform->out_format, size );
+    type->format_size = size;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_set_output_type( wg_transform_t handle, const struct wg_media_type *type )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+    struct rs_format fout;
+    BYTE *copy;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    if (!rs_parse( type, &fout )) return STATUS_NOT_SUPPORTED;
+    if (!(copy = malloc( type->format_size )))
+    {
+        av_channel_layout_uninit( &fout.layout );
+        return STATUS_NO_MEMORY;
+    }
+    memcpy( copy, type->u.format, type->format_size );
+    pthread_mutex_lock( &transform->lock );
+    av_channel_layout_uninit( &transform->out.layout );
+    transform->out = fout;
+    swr_free( &transform->swr );   /* set up again, for the new output, at the next frame */
+    transform->pcm_pos = transform->pcm_len = 0;
+    transform->discontinuity = TRUE;
+    free( transform->out_format );
+    transform->out_format = copy;
+    transform->out_format_size = type->format_size;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_get_status( wg_transform_t handle, UINT32 *accepts_input )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    *accepts_input = transform->pcm_len == transform->pcm_pos;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS mpa_drain( wg_transform_t handle )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+    NTSTATUS status;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    if (!(status = mpa_parse( transform, NULL, 0 ))) status = mpa_decode( transform, NULL, 0 );
+    mpa_restart( transform );
+    pthread_mutex_unlock( &transform->lock );
+    return status;
+}
+
+static NTSTATUS mpa_flush( wg_transform_t handle )
+{
+    struct mpa_transform *transform = get_mpa_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    transform->pcm_pos = transform->pcm_len = 0;
+    transform->have_pts = FALSE;
+    transform->anchor = 0;
+    transform->anchor_frames = 0;
+    transform->discontinuity = TRUE;
+    mpa_restart( transform );
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+/***********************************************************************
  *           transform kinds
  *
  * wg_transform_create gives the create to the first kind below that claims
@@ -3569,6 +4117,12 @@ static const struct wg_transform_ops rs_transform_ops =
     rs_set_output_type, rs_push_data, rs_read_data, rs_get_status, rs_drain, rs_flush,
 };
 
+static const struct wg_transform_ops mpa_transform_ops =
+{
+    "mpeg-audio", MADEIRA_WG_MPA_MAGIC, mpa_claims, mpa_create, mpa_destroy, mpa_get_output_type,
+    mpa_set_output_type, mpa_push_data, mpa_read_data, mpa_get_status, mpa_drain, mpa_flush,
+};
+
 static const struct wg_transform_ops wma_transform_ops =
 {
     "wma", MADEIRA_WG_TRANSFORM_MAGIC, wma_claims, wma_create, wma_destroy, wma_get_output_type,
@@ -3581,10 +4135,12 @@ static const struct wg_transform_ops wmv_transform_ops =
     wmv_set_output_type, wmv_push_data, wmv_read_data, wmv_get_status, wmv_drain, wmv_flush,
 };
 
-/* In claim order: raw audio is the resampler's, other audio the WMA decoder's. */
+/* In claim order: raw audio is the resampler's, MPEG audio the MPEG audio
+ * decoder's, other audio the WMA decoder's. */
 static const struct wg_transform_ops *const transform_kinds[] =
 {
     &rs_transform_ops,
+    &mpa_transform_ops,
     &wma_transform_ops,
     &wmv_transform_ops,
 };
@@ -3832,8 +4388,10 @@ static BOOL wg_video_ahead_switch_on(void)
 }
 
 /* The WM reader's compressed samples of an ASF's WMV / WMA streams, for an
- * application's own decoder (KiriKiri's movie plugin and the decoder DMOs).
- * 0 refuses them as before: the reader then keeps its decoded streams. */
+ * application's own decoder (KiriKiri's movie plugin and the decoder DMOs),
+ * and an MPEG program stream's MPEG-1 video and audio for quartz's MPEG-1
+ * splitter.  0 refuses them as before: the reader keeps its decoded streams,
+ * and quartz takes the decoding splitter. */
 static BOOL wg_compressed_switch_on(void)
 {
     const char *v = getenv( "MADEIRA_WG_COMPRESSED" );
@@ -4121,6 +4679,16 @@ static NTSTATUS wgp_get_codec_format( wg_parser_stream_t handle, struct wg_forma
         format->u.audio.rate = info.native.rate;
         format->u.audio.bitrate = info.bitrate;
         return S_OK;
+    case MAV_CODEC_MPEG_VIDEO:
+        /* MPEG-2 video has no wg_format: its current (decoded) format stands in */
+        if (info.version != 1) return wgp_get_current_format( handle, format );
+        memset( format, 0, sizeof(*format) );
+        format->major_type = WG_MAJOR_TYPE_VIDEO_MPEG1;
+        format->u.video.width = info.vnative.width;
+        format->u.video.height = info.vnative.height;
+        format->u.video.fps_n = info.vnative.fps_n;
+        format->u.video.fps_d = info.vnative.fps_d;
+        return S_OK;
     case MAV_CODEC_AAC:
         memset( format, 0, sizeof(*format) );
         format->major_type = WG_MAJOR_TYPE_AUDIO_MPEG4;
@@ -4200,10 +4768,12 @@ static NTSTATUS wgp_enable( wg_parser_stream_t handle, const struct wg_format *f
     if (!format) return STATUS_INVALID_PARAMETER;
     if (mav_stream_info( parser->core, index, &info )) return VFW_E_WRONG_STATE;
 
-    if (format->major_type == WG_MAJOR_TYPE_VIDEO_WMV || format->major_type == WG_MAJOR_TYPE_AUDIO_WMA)
+    if (format->major_type == WG_MAJOR_TYPE_VIDEO_WMV || format->major_type == WG_MAJOR_TYPE_AUDIO_WMA
+        || format->major_type == WG_MAJOR_TYPE_VIDEO_MPEG1 || format->major_type == WG_MAJOR_TYPE_AUDIO_MPEG1)
     {
         /* the demuxer's packets, as get_current_format describes them */
-        if ((format->major_type == WG_MAJOR_TYPE_VIDEO_WMV) != (info.type == MAV_STREAM_VIDEO))
+        if ((format->major_type == WG_MAJOR_TYPE_VIDEO_WMV || format->major_type == WG_MAJOR_TYPE_VIDEO_MPEG1)
+            != (info.type == MAV_STREAM_VIDEO))
             status = MAV_E_PARAM;
         else
             status = mav_enable_compressed( parser->core, index );

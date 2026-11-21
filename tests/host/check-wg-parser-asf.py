@@ -39,7 +39,7 @@ Needs python3, a C compiler and the FFmpeg tarball (build/ffmpeg/src).
 from pathlib import Path
 import os, re, subprocess, sys, tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_ffmpeg import host_ffmpeg   # the shared host build, made under a lock
+from host_ffmpeg import host_ffmpeg, MEDIA_FLAGS   # the shared host build, made under a lock
 
 root = Path(__file__).resolve().parents[2]
 core = root / "build/ntdll-unix/wg_parser_av_ios.c"
@@ -88,18 +88,7 @@ print("PASS: FFmpeg has the asf demuxer and the Windows Media decoders (still no
 
 # ------------------------------------------------------------------ 2. host FFmpeg
 tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(root / "build/ffmpeg/src/ffmpeg-7.1.5.tar.xz")
-FLAGS = [
-    "--disable-everything", "--disable-autodetect", "--disable-gpl", "--disable-nonfree", "--disable-version3",
-    "--enable-decoder=wmav1,wmav2,wmapro,wmalossless", "--enable-decoder=mp1,mp2,mp3",
-    "--enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le",
-    "--enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3",
-    "--enable-demuxer=mp3,wav,mov,asf", "--enable-parser=mpegaudio",
-    # TEST ONLY: input synthesis
-    "--enable-encoder=wmv1,wmv2,msmpeg4v3,wmav2", "--enable-muxer=asf",
-    "--disable-programs", "--disable-doc", "--disable-network", "--disable-avdevice", "--disable-swscale",
-    "--disable-avfilter", "--disable-postproc", "--enable-avformat", "--enable-avcodec", "--enable-swresample",
-    "--disable-asm", "--disable-shared", "--enable-static", "--enable-pic", "--disable-debug",
-]
+FLAGS = MEDIA_FLAGS   # tests/host/host_ffmpeg.py: one cached build for the media checks
 prefix = host_ffmpeg(FLAGS, tarball, tag="asf-", override=os.environ.get("MADEIRA_HOST_FFMPEG_ASF"))
 inc, lib = prefix / "include", prefix / "lib"
 

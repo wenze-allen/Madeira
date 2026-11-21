@@ -457,6 +457,9 @@ OVERLAY = {
                 "choices": [("", "Utility (default)"), ("background", "Background"), ("initiated", "User initiated")]},
     "env.MADEIRA_WG_VIDEO": {"title": "Media: MP4 video (32-bit programs)",
                 "note": "0 limits the media parser to MP3/WAV; by default MP4 with H.264/HEVC video decodes through VideoToolbox."},
+    "env.MADEIRA_WG_MPEG_TRANSFORM": {"title": "Media: MPEG audio decoder (32-bit programs)",
+                "note": "0 refuses the MPEG audio decoder behind DirectShow's MPEG audio and MP3 decoders again; by default "
+                        "an MPEG movie built on quartz's MPEG-1 splitter (KiriKiri, BURIKO) gets its sound decoded by libavcodec."},
     "env.MADEIRA_WG_VIDEO_AHEAD": {"title": "Media: decode video ahead (32-bit programs)",
                 "note": "0 decodes a movie's video on the thread that asks for it, as before; by default each video stream "
                         "decodes ahead on a thread of its own, so the audio is not held up behind a picture."},
