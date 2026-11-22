@@ -265,6 +265,8 @@ static void mav_allow_compressed_asf( int allowed );
 static void mav_allow_video_ahead( int allowed );
 /* 0: omit the per-stream playback summary lines (first buffer and disconnect) */
 static void mav_allow_summary( int allowed );
+/* 0: raw MPEG-1 video (.m1v) is refused and RIFF/CDXA (.dat) sectors are not unwrapped, as before */
+static void mav_allow_mpeg_raw( int allowed );
 static struct mav_parser *mav_create( int output_compressed );
 static void mav_destroy( struct mav_parser *p );
 static int mav_connect( struct mav_parser *p, uint64_t file_size );
@@ -359,6 +361,7 @@ static enum mav_pixel_format mav_native_pix = MAV_PIX_NV12;
 static int mav_compressed_asf = 1;
 static int mav_video_ahead = 1;
 static int mav_summary = 1;
+static int mav_mpeg_raw = 1;
 
 static void mav_configure( int video_allowed, const struct mav_video_backend *video,
                            const struct mav_audio_backend *audio, enum mav_pixel_format native )
@@ -382,6 +385,11 @@ static void mav_allow_video_ahead( int allowed )
 static void mav_allow_summary( int allowed )
 {
     mav_summary = !!allowed;
+}
+
+static void mav_allow_mpeg_raw( int allowed )
+{
+    mav_mpeg_raw = !!allowed;
 }
 
 /* ---- the log: bounded, and deduplicated ---- */
@@ -708,6 +716,9 @@ struct mav_stream
     int64_t last_dts;           /* stream time base, INT64_MIN = none yet */
     int64_t last_vpts;
     int64_t frame_duration;     /* 100 ns, from the frame rate */
+    int64_t m1v_gop_base;       /* raw MPEG-1 ES: display index of the current GOP's tr=0 picture */
+    int64_t m1v_gop_frames;     /* raw MPEG-1 ES: pictures seen so far in the current GOP */
+    int64_t m1v_coded_frames;   /* raw MPEG-1 ES: coded picture index */
     int bt709;
 
     /* ---- packets ---- */
@@ -793,6 +804,12 @@ struct mav_parser
     int is_mov;
     int is_asf;
     int is_mpeg;                /* an MPEG program stream */
+    int is_mpegvideo;           /* a raw MPEG-1 video elementary stream (.m1v / .mpv) */
+    int is_cdxa;                /* RIFF/CDXA VideoCD .dat unwrapped to 2324-byte packs */
+    uint64_t cdxa_data_offset;
+    uint64_t cdxa_sectors;
+    uint64_t logical_size;      /* unwrapped byte length when is_cdxa */
+    uint8_t *cdxa_raw;
     int ready;                  /* connected and streams exposed */
     int demux_eof;
     unsigned int read_errors_logged;
@@ -814,16 +831,32 @@ struct mav_parser
 };
 
 /***********************************************************************
- *           the read protocol
+ *           the read protocol (and RIFF/CDXA VideoCD sector unwrapping)
  */
-static int mav_avio_read( void *opaque, uint8_t *dest, int size )
+#define MAV_CDXA_SECTOR_SIZE 2352
+#define MAV_CDXA_HEADER_SIZE 24
+#define MAV_CDXA_FORM2_DATA  2324
+#define MAV_CDXA_FORM1_DATA  2048
+#define MAV_CDXA_BATCH       28
+
+static const uint8_t mav_cdxa_sync[12] =
 {
-    struct mav_parser *p = opaque;
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+};
+
+static uint32_t mav_le32( const uint8_t *b )
+{
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static int mav_raw_read_once( struct mav_parser *p, uint64_t offset, uint8_t *dest, uint32_t size )
+{
     int result;
 
-    if (size <= 0) return AVERROR(EINVAL);
-    if (p->file_size && p->pos >= p->file_size) return AVERROR_EOF;
+    if (!size) return 0;
+    if (p->file_size && offset >= p->file_size) return AVERROR_EOF;
     if (size > MAV_MAX_REQUEST) size = MAV_MAX_REQUEST;
+    if (p->file_size && offset + size > p->file_size) size = (uint32_t)(p->file_size - offset);
 
     pthread_mutex_lock( &p->io_lock );
     if (!p->connected)
@@ -832,7 +865,7 @@ static int mav_avio_read( void *opaque, uint8_t *dest, int size )
         return AVERROR_EXIT;
     }
     p->req.dest = dest;
-    p->req.offset = p->pos;
+    p->req.offset = offset;
     p->req.size = size;
     p->req.done = 0;
     p->req.result = 0;
@@ -851,24 +884,176 @@ static int mav_avio_read( void *opaque, uint8_t *dest, int size )
     p->req.dest = NULL;
     pthread_mutex_unlock( &p->io_lock );
 
-    if (result > 0)
-    {
-        p->pos += result;
-        return result;
-    }
+    if (result > 0) return result;
     return result ? AVERROR(EIO) : AVERROR_EOF;
+}
+
+static int mav_raw_read_full( struct mav_parser *p, uint64_t offset, uint8_t *dest, uint32_t size )
+{
+    uint32_t got = 0;
+
+    while (got < size)
+    {
+        int r = mav_raw_read_once( p, offset + got, dest + got, size - got );
+        if (r == AVERROR_EOF) break;
+        if (r < 0) return got ? (int)got : r;
+        got += (uint32_t)r;
+    }
+    return got ? (int)got : AVERROR_EOF;
+}
+
+/* VideoCD .dat files (MEDIASUBTYPE_MPEG1VideoCD) wrap raw 2352-byte CD-ROM XA
+ * Mode 2 sectors in a RIFF/CDXA container.  FFmpeg's psxstr demuxer only knows
+ * PlayStation STR video/audio sectors, and mpegps reads raw bytes -- including
+ * the 24-byte sync/MSF/XA-subheader and 4-byte EDC every 2352 bytes -- which
+ * corrupts any PES packet crossing a sector boundary.  Each sector maps to
+ * 2324 logical bytes (Form 2's user payload, where White Book VideoCD stores
+ * one 2324-byte MPEG-1 pack; empty pre-gap or Form 1 ISO sectors become zero
+ * stuffing that mpegps skips), so byte seeking stays exact. */
+static int mav_detect_cdxa( struct mav_parser *p )
+{
+    uint8_t hdr[64], sec[MAV_CDXA_HEADER_SIZE];
+    uint64_t off = 12, data_off = 0, avail, sectors;
+    uint32_t data_size = 0;
+    int r, found = 0;
+
+    if (p->file_size && p->file_size < 44) return 0;
+    r = mav_raw_read_full( p, 0, hdr, sizeof(hdr) );
+    if (r == AVERROR_EOF || (r > 0 && r < 44)) return 0;
+    if (r < 0) return r;
+    if (memcmp( hdr, "RIFF", 4 ) || memcmp( hdr + 8, "CDXA", 4 )) return 0;
+
+    while (off + 8 <= 4096 && (!p->file_size || off + 8 <= p->file_size))
+    {
+        uint8_t ch[8];
+        uint32_t csize;
+
+        if (off + 8 <= (uint64_t)r) memcpy( ch, hdr + off, 8 );
+        else if ((r = mav_raw_read_full( p, off, ch, 8 )) < 8)
+            return r < 0 && r != AVERROR_EOF ? r : 0;
+        csize = mav_le32( ch + 4 );
+        if (!memcmp( ch, "data", 4 ))
+        {
+            data_off = off + 8;
+            data_size = csize;
+            found = 1;
+            break;
+        }
+        off += 8 + (uint64_t)csize + (csize & 1);
+    }
+    if (!found) return 0;
+    if (!mav_video_allowed || !mav_mpeg_raw) return AVERROR_PATCHWELCOME;
+    if (p->file_size && p->file_size < data_off + MAV_CDXA_SECTOR_SIZE) return 0;
+
+    r = mav_raw_read_full( p, data_off, sec, sizeof(sec) );
+    if (r < (int)sizeof(sec)) return r < 0 && r != AVERROR_EOF ? r : 0;
+    if (memcmp( sec, mav_cdxa_sync, 12 ) || sec[15] != 2) return 0;
+
+    if (p->file_size)
+    {
+        avail = p->file_size - data_off;
+        if (data_size >= MAV_CDXA_SECTOR_SIZE && (uint64_t)data_size < avail) avail = data_size;
+        sectors = avail / MAV_CDXA_SECTOR_SIZE;
+    }
+    else
+        sectors = data_size >= MAV_CDXA_SECTOR_SIZE ? (uint64_t)data_size / MAV_CDXA_SECTOR_SIZE : 0;
+    if (p->file_size && !sectors) return 0;
+
+    if (!(p->cdxa_raw = malloc( (size_t)MAV_CDXA_BATCH * MAV_CDXA_SECTOR_SIZE ))) return AVERROR(ENOMEM);
+    p->is_cdxa = 1;
+    p->cdxa_data_offset = data_off;
+    p->cdxa_sectors = sectors;
+    p->logical_size = sectors * MAV_CDXA_FORM2_DATA;
+    mav_log( "cdxa: unwrapping RIFF/CDXA Mode 2 sectors at +%llu (%llu sectors, %llu unwrapped bytes)",
+             (unsigned long long)data_off, (unsigned long long)sectors, (unsigned long long)p->logical_size );
+    return 1;
+}
+
+static int mav_cdxa_read( struct mav_parser *p, uint8_t *dest, int size )
+{
+    int total = 0;
+
+    if (p->logical_size && p->pos >= p->logical_size) return AVERROR_EOF;
+    if (p->logical_size && (uint64_t)size > p->logical_size - p->pos)
+        size = (int)(p->logical_size - p->pos);
+
+    while (total < size)
+    {
+        uint64_t sec_idx = p->pos / MAV_CDXA_FORM2_DATA;
+        uint32_t sec_off = (uint32_t)(p->pos % MAV_CDXA_FORM2_DATA);
+        uint32_t want = ((uint32_t)(size - total) + sec_off + MAV_CDXA_FORM2_DATA - 1) / MAV_CDXA_FORM2_DATA;
+        uint32_t got_secs, k;
+        int r;
+
+        if (want > MAV_CDXA_BATCH) want = MAV_CDXA_BATCH;
+        if (p->cdxa_sectors && sec_idx >= p->cdxa_sectors) break;
+        if (p->cdxa_sectors && want > p->cdxa_sectors - sec_idx)
+            want = (uint32_t)(p->cdxa_sectors - sec_idx);
+
+        r = mav_raw_read_full( p, p->cdxa_data_offset + sec_idx * MAV_CDXA_SECTOR_SIZE,
+                               p->cdxa_raw, want * MAV_CDXA_SECTOR_SIZE );
+        if (r < 0) return total ? total : r;
+        got_secs = (uint32_t)r / MAV_CDXA_SECTOR_SIZE;
+        if (!got_secs) break;
+
+        for (k = 0; k < got_secs && total < size; k++)
+        {
+            const uint8_t *raw = p->cdxa_raw + (size_t)k * MAV_CDXA_SECTOR_SIZE;
+            uint32_t chunk = MAV_CDXA_FORM2_DATA - sec_off;
+            int xa_mode2 = !memcmp( raw, mav_cdxa_sync, 12 ) && raw[15] == 2;
+            uint8_t submode = raw[18];
+            int has_start = !raw[24] && !raw[25] && raw[26] == 1;
+
+            if ((int)chunk > size - total) chunk = (uint32_t)(size - total);
+            if (xa_mode2 && (submode & 0x20) && ((submode & 0x0e) || has_start))
+            {
+                /* Mode 2 Form 2: 24-byte header + 2324-byte VideoCD MPEG-1 pack + 4-byte EDC */
+                memcpy( dest + total, raw + MAV_CDXA_HEADER_SIZE + sec_off, chunk );
+            }
+            else if (xa_mode2 && !(submode & 0x20) && (submode & 0x06) && has_start)
+            {
+                /* Mode 2 Form 1 carrying video/audio: 2048-byte user data, zeroing the ECC tail */
+                uint32_t body = sec_off < MAV_CDXA_FORM1_DATA ? MAV_CDXA_FORM1_DATA - sec_off : 0;
+                if (body > chunk) body = chunk;
+                if (body) memcpy( dest + total, raw + MAV_CDXA_HEADER_SIZE + sec_off, body );
+                if (chunk > body) memset( dest + total + body, 0, chunk - body );
+            }
+            else
+            {
+                /* Empty pre-gap/lead-out or Form 1 ISO data sector: zero stuffing */
+                memset( dest + total, 0, chunk );
+            }
+            p->pos += chunk;
+            total += (int)chunk;
+            sec_off = 0;
+        }
+    }
+    return total ? total : AVERROR_EOF;
+}
+
+static int mav_avio_read( void *opaque, uint8_t *dest, int size )
+{
+    struct mav_parser *p = opaque;
+    int result;
+
+    if (size <= 0) return AVERROR(EINVAL);
+    if (p->is_cdxa) return mav_cdxa_read( p, dest, size );
+    result = mav_raw_read_once( p, p->pos, dest, (uint32_t)size );
+    if (result > 0) p->pos += result;
+    return result;
 }
 
 static int64_t mav_avio_seek( void *opaque, int64_t offset, int whence )
 {
     struct mav_parser *p = opaque;
+    uint64_t size = p->is_cdxa ? p->logical_size : p->file_size;
     int64_t target;
 
     whence &= ~AVSEEK_FORCE;
     switch (whence)
     {
     case AVSEEK_SIZE:
-        return p->file_size ? (int64_t)p->file_size : AVERROR(ENOSYS);
+        return size ? (int64_t)size : AVERROR(ENOSYS);
     case SEEK_SET:
         target = offset;
         break;
@@ -876,8 +1061,8 @@ static int64_t mav_avio_seek( void *opaque, int64_t offset, int whence )
         target = (int64_t)p->pos + offset;
         break;
     case SEEK_END:
-        if (!p->file_size) return AVERROR(ENOSYS);
-        target = (int64_t)p->file_size + offset;
+        if (!size) return AVERROR(ENOSYS);
+        target = (int64_t)size + offset;
         break;
     default:
         return AVERROR(EINVAL);
@@ -1089,7 +1274,10 @@ static void mav_teardown( struct mav_parser *p )
         av_freep( &p->avio->buffer );
         avio_context_free( &p->avio );
     }
-    p->ready = p->is_mov = p->is_asf = p->is_mpeg = p->demux_eof = 0;
+    free( p->cdxa_raw );
+    p->cdxa_raw = NULL;
+    p->ready = p->is_mov = p->is_asf = p->is_mpeg = p->is_mpegvideo = p->is_cdxa = p->demux_eof = 0;
+    p->cdxa_data_offset = p->cdxa_sectors = p->logical_size = 0;
     p->read_errors_logged = 0;
     p->stop = -1;
 }
@@ -1363,27 +1551,135 @@ static int64_t mav_to_100ns( const struct mav_stream *s, int64_t ts )
     return av_rescale_q( ts - s->origin, s->time_base, (AVRational){ 1, 10000000 } );
 }
 
-/* The containers that carry video here: MP4 (platform decoders), ASF and
- * MPEG program streams (libavcodec). */
+/* The containers that carry video here: MP4 (platform decoders), ASF, MPEG
+ * program streams (including unwrapped RIFF/CDXA VideoCD .dat) and raw MPEG-1
+ * video elementary streams (libavcodec). */
 static int mav_video_container( const struct mav_parser *p )
 {
-    return p->is_mov || p->is_asf || p->is_mpeg;
+    return p->is_mov || p->is_asf || p->is_mpeg || p->is_mpegvideo;
 }
 
 /* A compressed-output parser hands out an ASF's Windows Media streams, and an
- * MPEG program stream's MPEG-1 video and MPEG audio, as they are: the formats
- * wg_format can describe (WMA, WMV1/2/3, WMVA, WVC1; MPEG-1 video, MPEG
- * audio), for the WM reader's compressed samples and quartz's MPEG-1 splitter
- * (which a graph built by hand connects to the MPEG video and audio decoders).
- * MS-MPEG4 and MPEG-2 video have no wg_format. */
+ * MPEG program or raw MPEG-1 video stream's MPEG-1 video and MPEG audio, as
+ * they are: the formats wg_format can describe (WMA, WMV1/2/3, WMVA, WVC1;
+ * MPEG-1 video, MPEG audio), for the WM reader's compressed samples and
+ * quartz's MPEG-1 splitter (which a graph built by hand connects to the MPEG
+ * video and audio decoders).  MS-MPEG4 and MPEG-2 video have no wg_format. */
 static int mav_passes_compressed( const struct mav_parser *p, const struct mav_stream *s )
 {
     if (!p->output_compressed) return 0;
     if (p->is_asf)
         return s->info.kind == MAV_CODEC_WMA || (s->info.kind == MAV_CODEC_WMV && s->info.wmv != MAV_WMV_NONE);
-    if (p->is_mpeg)
+    if (p->is_mpeg || p->is_mpegvideo)
         return s->info.kind == MAV_CODEC_MPEG_AUDIO || (s->info.kind == MAV_CODEC_MPEG_VIDEO && s->info.version == 1);
     return 0;
+}
+
+/* ---- raw MPEG-1 video elementary streams (FFmpeg's mpegvideo demuxer) ----
+ *
+ * Raw .m1v / .mpv elementary streams carry no PES timestamps, and rawdec sets
+ * avg_frame_rate to 25/1 before parsing.  We read the sequence header's
+ * frame_rate_code (ISO/IEC 11172-2 Table 2-D4) for the real rate, and give
+ * each picture its display-order timestamp (frame_number * frame_duration, via
+ * time_base = 1 / frame_rate) from its GOP base and 10-bit temporal_reference. */
+static int mav_mpeg1_seq_fps( const uint8_t *buf, size_t size, AVRational *fps )
+{
+    static const AVRational tab[16] =
+    {
+        { 0, 1 },
+        { 24000, 1001 }, { 24, 1 }, { 25, 1 },       { 30000, 1001 },
+        { 30, 1 },       { 50, 1 }, { 60000, 1001 }, { 60, 1 },
+        { 15, 1 },       { 5, 1 },  { 10, 1 },       { 12, 1 },       { 15, 1 },
+    };
+    size_t i;
+
+    if (!buf || size < 8) return 0;
+    for (i = 0; i + 8 <= size; i++)
+    {
+        unsigned int code;
+
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1 || buf[i + 3] != 0xb3) continue;
+        code = buf[i + 7] & 0x0f;
+        if (tab[code].num > 0)
+        {
+            *fps = tab[code];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int64_t mav_count_m1v_pictures( struct mav_parser *p )
+{
+    uint8_t *buf = malloc( MAV_AVIO_BUFFER + 3 );
+    uint64_t off = 0;
+    int64_t count = 0;
+    size_t carry = 0;
+
+    if (!buf) return 0;
+    while (!p->file_size || off < p->file_size)
+    {
+        int r = mav_raw_read_once( p, off, buf + carry, MAV_AVIO_BUFFER );
+        size_t n, i;
+
+        if (r <= 0) break;
+        off += (uint32_t)r;
+        n = carry + (size_t)r;
+        for (i = 0; i + 4 <= n; i++)
+            if (!buf[i] && !buf[i + 1] && buf[i + 2] == 1 && !buf[i + 3])
+            {
+                count++;
+                i += 3;
+            }
+        carry = n >= 3 ? 3 : n;
+        memmove( buf, buf + n - carry, carry );
+    }
+    free( buf );
+    return count;
+}
+
+static void mav_stamp_m1v_packet( struct mav_stream *s, AVPacket *pkt )
+{
+    const uint8_t *d = pkt->data;
+    size_t n = (size_t)pkt->size, i;
+    int64_t disp = 0;
+    int found_pic = 0;
+
+    for (i = 0; i + 4 <= n; i++)
+    {
+        uint8_t code;
+
+        if (d[i] || d[i + 1] || d[i + 2] != 1) continue;
+        code = d[i + 3];
+        if (code == 0xb8)   /* GOP_START_CODE: earliest picture in display order has temporal_reference 0 */
+        {
+            s->m1v_gop_base += s->m1v_gop_frames;
+            s->m1v_gop_frames = 0;
+            i += 3;
+        }
+        else if (code == 0x00 && i + 6 <= n)   /* PICTURE_START_CODE */
+        {
+            unsigned int tr = ((unsigned int)d[i + 4] << 2) | (d[i + 5] >> 6);
+            unsigned int pct = (d[i + 5] >> 3) & 7;
+            int64_t k = (s->m1v_gop_frames & ~(int64_t)1023) | tr;
+
+            if (k + 512 < s->m1v_gop_frames) k += 1024;
+            else if (k > s->m1v_gop_frames + 512) k -= 1024;
+            if (k < 0) k = tr;
+            disp = s->m1v_gop_base + k;
+            s->m1v_gop_frames++;
+            if (pct == 1) pkt->flags |= AV_PKT_FLAG_KEY;
+            else pkt->flags &= ~AV_PKT_FLAG_KEY;
+            found_pic = 1;
+            break;
+        }
+        else if (code >= 0x01 && code <= 0xaf)
+            break;
+    }
+    if (!found_pic) disp = s->m1v_gop_base + s->m1v_gop_frames++;
+    pkt->pts = disp;
+    pkt->dts = s->m1v_coded_frames++;
+    pkt->duration = 1;
 }
 
 /***********************************************************************
@@ -1421,7 +1717,7 @@ static struct mav_stream *mav_stream_new( struct mav_parser *p, AVStream *st, en
      * clock starts anywhere, and its streams start a little apart on it: they
      * all count from the earliest start, so they stay in sync.  An MP3/WAV
      * stream starts at its own start. */
-    if (p->is_mov || p->is_asf)
+    if (p->is_mov || p->is_asf || p->is_mpegvideo)
         s->origin = 0;
     else if (p->is_mpeg && p->fmt->start_time != AV_NOPTS_VALUE)
         s->origin = av_rescale_q( p->fmt->start_time, AV_TIME_BASE_Q, st->time_base );
@@ -1586,10 +1882,16 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         s->vbackend = &mav_lavc_video;
     }
     snprintf( s->info.codec, sizeof(s->info.codec), "%s", avcodec_get_name( par->codec_id ) );
-    if (p->is_asf != (s->info.kind == MAV_CODEC_WMV) || p->is_mpeg != (s->info.kind == MAV_CODEC_MPEG_VIDEO))
+    if (p->is_asf != (s->info.kind == MAV_CODEC_WMV)
+        || (p->is_mpeg || p->is_mpegvideo) != (s->info.kind == MAV_CODEC_MPEG_VIDEO))
     {
         snprintf( why, why_size, "not in this container here (H.264 / HEVC in MP4, Windows Media video in ASF, "
-                  "MPEG-1/2 video in an MPEG program stream)" );
+                  "MPEG-1/2 video in MPEG)" );
+        return MAV_E_UNSUPPORTED;
+    }
+    if (p->is_mpegvideo && s->info.version != 1)
+    {
+        snprintf( why, why_size, "only MPEG-1 video is supported as a raw elementary stream" );
         return MAV_E_UNSUPPORTED;
     }
     if (!s->vbackend || !s->vbackend->supports( codec ))
@@ -1607,11 +1909,35 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         return MAV_E_UNSUPPORTED;
     snprintf( s->info.backend, sizeof(s->info.backend), "%s", s->vbackend->name );
 
-    if (fps.num <= 0 || fps.den <= 0) fps = st->r_frame_rate;
+    if (p->is_mpegvideo)
+    {
+        fps = (AVRational){ 0, 1 };
+        if (!mav_mpeg1_seq_fps( par->extradata, (size_t)par->extradata_size, &fps ))
+        {
+            uint8_t probe_hdr[4096];
+            int n = mav_raw_read_full( p, 0, probe_hdr, sizeof(probe_hdr) );
+            if (n > 0) mav_mpeg1_seq_fps( probe_hdr, (size_t)n, &fps );
+        }
+        if (fps.num <= 0 || fps.den <= 0) fps = par->framerate;
+        if (fps.num <= 0 || fps.den <= 0) fps = st->r_frame_rate;
+    }
+    else if (fps.num <= 0 || fps.den <= 0)
+        fps = st->r_frame_rate;
     if (fps.num <= 0 || fps.den <= 0 || av_q2d( fps ) > 1000)
     {
         mav_log( "stream %u: no frame rate in the container; assuming 30/1", s->number );
         fps = (AVRational){ 30, 1 };
+    }
+    if (p->is_mpegvideo)
+    {
+        s->time_base = (AVRational){ fps.den, fps.num };
+        s->origin = 0;
+        if (p->file_size > 0 && p->file_size <= (16u << 20))
+        {
+            int64_t pics = mav_count_m1v_pictures( p );
+            if (pics > 0)
+                s->info.duration = av_rescale_q( pics, s->time_base, (AVRational){ 1, 10000000 } );
+        }
     }
     s->info.vnative.fmt = mav_native_pix;
     s->info.vnative.width = par->width;
@@ -1648,6 +1974,15 @@ static int mav_connect_locked( struct mav_parser *p )
     unsigned int i;
     int err, status, is_mp3;
 
+    if ((err = mav_detect_cdxa( p )) < 0)
+    {
+        if (err == AVERROR(ENOMEM)) return MAV_E_NOMEM;
+        if (err == AVERROR_PATCHWELCOME)
+            return mav_refuse( p, MAV_E_UNSUPPORTED, !mav_video_allowed ? "container disabled by MADEIRA_WG_VIDEO=0"
+                                                                        : "RIFF/CDXA disabled by MADEIRA_WG_MPEG_RAW=0" );
+        return mav_refuse( p, MAV_E_IO, "read error during probe" );
+    }
+
     if (!(avio_buf = av_malloc( MAV_AVIO_BUFFER ))) return MAV_E_NOMEM;
     if (!(p->avio = avio_alloc_context( avio_buf, MAV_AVIO_BUFFER, 0, p, mav_avio_read, NULL, mav_avio_seek )))
     {
@@ -1670,18 +2005,21 @@ static int mav_connect_locked( struct mav_parser *p )
     is_mp3 = !strcmp( name, "mp3" );
     p->is_mov = !strcmp( name, MAV_MOV_NAME );
     p->is_asf = !strcmp( name, "asf" );
-    /* An MPEG program stream.  MPEG video on its own (.m1v, the mpegvideo
-     * demuxer, which mpegps probes a program stream's video with) has no
-     * presentation times to play or seek by, and quartz's MPEG-1 splitter
-     * does not take it either: it is not in the allowlist. */
     p->is_mpeg = !strcmp( name, "mpeg" );
+    /* Raw MPEG-1 video (.m1v / .mpv, FFmpeg's mpegvideo demuxer, which mpegps
+     * also probes a program stream's video with): given display-order times
+     * from its sequence header and temporal_reference when MADEIRA_WG_MPEG_RAW
+     * is on. */
+    p->is_mpegvideo = !strcmp( name, "mpegvideo" );
+    if (p->is_mpegvideo && !mav_mpeg_raw)
+        return mav_refuse( p, MAV_E_UNSUPPORTED, "container disabled by MADEIRA_WG_MPEG_RAW=0" );
     if (!is_mp3 && strcmp( name, "wav" ) && !(mav_video_container( p ) && mav_video_allowed))
         return mav_refuse( p, MAV_E_UNSUPPORTED, mav_video_container( p ) ? "container disabled by MADEIRA_WG_VIDEO=0"
                                                                           : "container not in the allowlist" );
     /* An ASF header object scores like a recognised MP4 (its GUID matches);
-     * an MPEG program stream has its own floor. */
+     * an MPEG program or elementary stream has its own floor. */
     {
-        int floor = p->is_mpeg ? MAV_MIN_MPEG_PROBE_SCORE
+        int floor = (p->is_mpeg || p->is_mpegvideo) ? MAV_MIN_MPEG_PROBE_SCORE
                   : mav_video_container( p ) ? MAV_MIN_MOV_PROBE_SCORE : MAV_MIN_PROBE_SCORE;
         if (p->fmt->probe_score < floor)
         {
@@ -1693,8 +2031,8 @@ static int mav_connect_locked( struct mav_parser *p )
      * compressed streams: a compressed-output parser is refused before the
      * stream analysis reads anything more.  An ASF is the WM reader's, which
      * asks for compressed samples of its Windows Media streams, and an MPEG
-     * program stream quartz's MPEG-1 splitter's. */
-    if (p->output_compressed && (is_mp3 || p->is_mov || ((p->is_asf || p->is_mpeg) && !mav_compressed_asf)))
+     * program or raw MPEG-1 video stream quartz's MPEG-1 splitter's. */
+    if (p->output_compressed && (is_mp3 || p->is_mov || ((p->is_asf || p->is_mpeg || p->is_mpegvideo) && !mav_compressed_asf)))
         return mav_refuse( p, MAV_E_UNSUPPORTED,
                            "compressed output requested and no decoder filter exists; "
                            "the decoding splitter is tried next" );
@@ -2155,6 +2493,8 @@ static int mav_next_packet( struct mav_parser *p, struct mav_stream *s, AVPacket
         }
         for (i = 0; i < p->stream_count; i++)
             if (p->streams[i]->av_index == p->read_pkt->stream_index) owner = p->streams[i];
+        if (p->is_mpegvideo && owner && owner->type == MAV_STREAM_VIDEO)
+            mav_stamp_m1v_packet( owner, p->read_pkt );
         if (owner == s)
         {
             s->unread = 0;
@@ -3260,6 +3600,56 @@ static void mav_release_buffer( struct mav_parser *p, unsigned int stream )
 /***********************************************************************
  *           seek
  */
+/* Raw MPEG-1 video (ff_mpegvideo_demuxer) has no index or read_timestamp, so
+ * FFmpeg's generic seek reads to EOF and fails.  Rewind the byte stream (which
+ * flushes the demuxer's packet buffer and mpegvideo_parser), then -- when
+ * seeking past 0 -- scan packets keeping only the last keyframe GOP at or
+ * before `target` (plus the next keyframe, which open-GOP B-frames right after
+ * it reference). */
+static int mav_seek_m1v_rewind( struct mav_parser *p )
+{
+    av_seek_frame( p->fmt, -1, 0, AVSEEK_FLAG_BYTE );
+    avio_seek( p->avio, 0, SEEK_SET );
+    p->avio->error = 0;
+    p->avio->eof_reached = 0;
+    return 0;
+}
+
+static void mav_seek_m1v_advance( struct mav_parser *p, struct mav_stream *s, int64_t target )
+{
+    for (;;)
+    {
+        AVPacket *copy;
+        int64_t pts_100ns;
+        int is_key;
+
+        if (av_read_frame( p->fmt, p->read_pkt ) < 0)
+        {
+            p->demux_eof = 1;
+            break;
+        }
+        if (p->read_pkt->stream_index != s->av_index)
+        {
+            av_packet_unref( p->read_pkt );
+            continue;
+        }
+        mav_stamp_m1v_packet( s, p->read_pkt );
+        is_key = !!(p->read_pkt->flags & AV_PKT_FLAG_KEY);
+        pts_100ns = mav_to_100ns( s, p->read_pkt->pts );
+        if (is_key && pts_100ns <= target)
+            mav_queue_clear( s );
+        if (!(copy = av_packet_alloc()))
+        {
+            av_packet_unref( p->read_pkt );
+            break;
+        }
+        av_packet_move_ref( copy, p->read_pkt );
+        mav_queue_push( s, copy );
+        if (is_key && pts_100ns > target)
+            break;
+    }
+}
+
 static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, uint64_t start,
                      int set_stop, uint64_t stop )
 {
@@ -3312,8 +3702,13 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
          * the PE side's way to start over, so it must not stay failed. */
         p->avio->error = 0;
         p->avio->eof_reached = 0;
-        err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
-        if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
+        if (p->is_mpegvideo)
+            err = mav_seek_m1v_rewind( p );
+        else
+        {
+            err = avformat_seek_file( p->fmt, ref->av_index, INT64_MIN, ts, ts, 0 );
+            if (err < 0) err = av_seek_frame( p->fmt, ref->av_index, ts, AVSEEK_FLAG_BACKWARD );
+        }
         if (err < 0)
         {
             mav_log( "seek to %llums failed (%d)", (unsigned long long)(start / 10000), err );
@@ -3349,7 +3744,10 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
                 c->skipped = 0;
                 c->next_pts = target;
                 c->last_dts = c->last_vpts = INT64_MIN;
+                c->m1v_gop_base = c->m1v_gop_frames = c->m1v_coded_frames = 0;
             }
+            if (p->is_mpegvideo && target > 0)
+                mav_seek_m1v_advance( p, ref, target );
             p->generation++;
             if (p->bp_waiters) pthread_cond_broadcast( &p->drain_cond );
         }

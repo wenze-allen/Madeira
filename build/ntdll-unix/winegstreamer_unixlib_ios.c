@@ -4481,6 +4481,15 @@ static BOOL wg_summary_switch_on(void)
     return !(v && v[0] == '0' && !v[1]);
 }
 
+/* Raw MPEG-1 video elementary streams (.m1v/.mpv) and RIFF/CDXA VideoCD .dat
+ * sector unwrapping for quartz's MPEG-1 splitter (KiriKiri's krmovie).
+ * 0 refuses .m1v and leaves .dat unwrapped, as before. */
+static BOOL wg_mpeg_raw_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_MPEG_RAW" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
 static enum mav_pixel_format wg_video_native_format(void)
 {
     static const struct { const char *name; enum mav_pixel_format fmt; } names[] =
@@ -4513,6 +4522,9 @@ static void wgp_configure(void)
     if (!wg_video_ahead_switch_on())
         mav_log( "video decode-ahead disabled by MADEIRA_WG_VIDEO_AHEAD=0: video decodes on the requesting thread" );
     mav_allow_summary( wg_summary_switch_on() );
+    mav_allow_mpeg_raw( wg_mpeg_raw_switch_on() );
+    if (!wg_mpeg_raw_switch_on())
+        mav_log( "raw MPEG-1 video and RIFF/CDXA unwrapping disabled by MADEIRA_WG_MPEG_RAW=0" );
 
 #ifdef __APPLE__
     mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native );

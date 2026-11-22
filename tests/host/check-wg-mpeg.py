@@ -25,8 +25,15 @@ program stream, and its wg_transform no MPEG decoder.
      the file's bytes and keyframe flags; MADEIRA_WG_COMPRESSED=0 refuses the file;
    - an MPEG-2 program stream (the dvd muxer): decoded bit-exact; its video not passed compressed
      (no wg_format), its audio is;
-   - an MPEG-1 elementary stream (.m1v) is refused: it has no presentation times to play or seek by,
-     and quartz's MPEG-1 splitter does not take one either.
+   - a raw MPEG-1 elementary stream (.m1v, at 25 fps and 30000/1001 fps with open-GOP B-frames):
+     sequence-header frame rate (not rawdec's 25 fps default), display-order timestamps
+     (frame_number * frame_duration from temporal_reference) in both decoded and compressed modes,
+     bit-exact NV12, rewind to 0 and exact seeks (including open-GOP B-frames); raw MPEG-2 (.m2v)
+     refused;
+   - a VideoCD RIFF/CDXA .dat file (2352-byte Mode 2 Form 2 sectors with 24-byte headers, 4-byte
+     EDC trailers, empty pre-gap and Form 1 ISO sectors): unwrapped in the AVIO layer and played
+     and split identically to the MPEG-1 program stream;
+   - MADEIRA_WG_MPEG_RAW=0 restores refusal of .m1v and skips RIFF/CDXA unwrapping.
 4. The glue under ASan/UBSan, through the unix call table (needs a configured Wine tree's headers,
    MADEIRA_WINE_BUILD, like check-wmv-transform.py):
    - BURIKO's and KiriKiri's splitter: a compressed-output parser reports WG_MAJOR_TYPE_VIDEO_MPEG1
@@ -78,10 +85,18 @@ kinds = glue[glue.index("static const struct wg_transform_ops *const transform_k
 kinds = kinds[:kinds.index("};")]
 assert kinds.index("&mpa_transform_ops") < kinds.index("&wma_transform_ops"), "MPEG audio claimed before WMA"
 assert 'getenv( "MADEIRA_WG_MPEG_TRANSFORM" )' in glue
+assert 'getenv( "MADEIRA_WG_MPEG_RAW" )' in glue and "mav_allow_mpeg_raw(" in glue
 parser = (wine / "dlls/winegstreamer/quartz_parser.c")
 transform = (wine / "dlls/winegstreamer/quartz_transform.c")
 if parser.exists() and transform.exists():
-    qp = body(parser.read_text(), "static BOOL mpeg_splitter_filter_init_gst(")
+    qtext = parser.read_text()
+    qa = body(qtext, "static HRESULT mpeg_splitter_sink_query_accept(")
+    assert ("MEDIASUBTYPE_MPEG1Video" in qa and "MEDIASUBTYPE_MPEG1VideoCD" in qa
+            and "MEDIASUBTYPE_MPEG1System" in qa and "MEDIASUBTYPE_MPEG1Audio" in qa
+            and "FIXME" not in qa), "MPEG-1 splitter accepts all four MPEG-1 stream subtypes"
+    sc = body(qtext, "static HRESULT mpeg_splitter_sink_connect(")
+    assert "MEDIASUBTYPE_MPEG1System" in sc and "IAsyncReader_SyncRead" in sc, "seek-to-end quirk on connect"
+    qp = body(qtext, "static BOOL mpeg_splitter_filter_init_gst(")
     assert "WG_MAJOR_TYPE_VIDEO_MPEG1" in qp and "WG_MAJOR_TYPE_AUDIO_MPEG1" in qp, "the splitter takes only these"
     qt = transform.read_text()
     vprobe = body(qt, "HRESULT mpeg_video_codec_create(")
@@ -90,8 +105,8 @@ if parser.exists() and transform.exists():
     assert "WAVE_FORMAT_MPEG" in aprobe and ".fwHeadLayer = 2" in aprobe
     l3probe = body(qt, "HRESULT mpeg_layer3_decoder_create(")
     assert "WAVE_FORMAT_MPEGLAYER3" in l3probe
-    print("PASS: Wine's MPEG-1 splitter takes MPEG-1 video and MPEG audio only; the MPEG decoders' probes are "
-          "the ones tested below")
+    print("PASS: Wine's MPEG-1 splitter accepts MPEG1System, MPEG1VideoCD, MPEG1Video and MPEG1Audio, seeks a "
+          "system stream's reader to EOF on connect, and exposes MPEG-1 video / audio pins; the MPEG decoders' probes match")
 print("PASS: FFmpeg has the MPEG program stream demuxer, the MPEG-1/2 decoders and parser (still "
       "no H.264/HEVC/AAC); the glue maps MPEG-1 video and MPEG audio compressed; MPEG audio is a transform kind")
 
@@ -156,7 +171,7 @@ static void put( AVFormatContext *oc, AVCodecContext *e, AVStream *st, AVFrame *
 
 /* `muxer`: "mpeg" (MPEG-1 system), "dvd" (MPEG-2 program stream), "mpeg1video" / "mpeg2video" (the
  * video alone), "mp2" (the audio alone).  A moving pattern with B-frames, a 440 Hz MP2 tone. */
-static uint8_t *make_mpeg( const char *muxer, enum AVCodecID vcodec, int audio, size_t *size )
+static uint8_t *make_mpeg_rate( const char *muxer, enum AVCodecID vcodec, int audio, int fps_n, int fps_d, size_t *size )
 {
     struct membuf m = {0};
     AVFormatContext *oc = NULL; AVCodecContext *ve = NULL, *ae = NULL; AVStream *vs = NULL, *as = NULL;
@@ -168,7 +183,7 @@ static uint8_t *make_mpeg( const char *muxer, enum AVCodecID vcodec, int audio, 
     {
         vs = avformat_new_stream( oc, NULL );
         ve = avcodec_alloc_context3( avcodec_find_encoder( vcodec ) );
-        ve->width = W; ve->height = H; ve->time_base = (AVRational){ 1, FPS }; ve->framerate = (AVRational){ FPS, 1 };
+        ve->width = W; ve->height = H; ve->time_base = (AVRational){ fps_d, fps_n }; ve->framerate = (AVRational){ fps_n, fps_d };
         ve->pix_fmt = AV_PIX_FMT_YUV420P; ve->gop_size = GOP; ve->max_b_frames = 2; ve->bit_rate = 1500000;
         if (avcodec_open2( ve, ve->codec, NULL ) < 0) return NULL;
         avcodec_parameters_from_context( vs->codecpar, ve );
@@ -209,7 +224,7 @@ static uint8_t *make_mpeg( const char *muxer, enum AVCodecID vcodec, int audio, 
             vf->pts = i;
             put( oc, ve, vs, vf );
         }
-        while (ae && apts * FPS < (int64_t)(i + 1) * RATE)
+        while (ae && apts * fps_n < (int64_t)(i + 1) * RATE * fps_d)
         {
             int n;
             av_frame_make_writable( af );
@@ -231,6 +246,63 @@ static uint8_t *make_mpeg( const char *muxer, enum AVCodecID vcodec, int audio, 
     avcodec_free_context( &ve ); avcodec_free_context( &ae ); av_frame_free( &vf ); av_frame_free( &af );
     *size = m.size;
     return m.data;
+}
+
+static uint8_t *make_mpeg( const char *muxer, enum AVCodecID vcodec, int audio, size_t *size )
+{
+    return make_mpeg_rate( muxer, vcodec, audio, FPS, 1, size );
+}
+
+/* White Book / CD-ROM XA RIFF/CDXA VideoCD .dat wrapper: 44-byte RIFF/CDXA/fmt/data header,
+ * 2 pre-gap/ISO bumper sectors (an empty Form 2 pre-gap sector and a Form 1 ISO data sector with
+ * fake MPEG start codes in its 276-byte ECC tail to verify Form 1 non-AV sectors are zero-stuffed),
+ * then 2352-byte Mode 2 Form 2 sectors (24-byte sync/MSF/XA-subheader + 2324-byte payload + 4-byte
+ * non-zero EDC trailer).  Because `ps` uses 2048-byte packs, every pack after the first straddles a
+ * 2324-byte sector boundary and would be corrupted if the 28 header/EDC bytes were not stripped. */
+static uint8_t *make_vcd_dat( const uint8_t *ps, size_t ps_size, size_t *out_size )
+{
+    static const uint8_t sync[12] = { 0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00 };
+    size_t pre = 2, body = (ps_size + 2323) / 2324, total_sec = pre + body;
+    uint32_t data_bytes = (uint32_t)(total_sec * 2352), riff_size = 36 + data_bytes;
+    uint8_t *dat = calloc( 1, 44 + data_bytes );
+    size_t s;
+
+    if (!dat) return NULL;
+    memcpy( dat, "RIFF", 4 );
+    dat[4] = riff_size; dat[5] = riff_size >> 8; dat[6] = riff_size >> 16; dat[7] = riff_size >> 24;
+    memcpy( dat + 8, "CDXAfmt ", 8 );
+    dat[16] = 16;   /* 16-byte CDXA fmt chunk */
+    memcpy( dat + 36, "data", 4 );
+    dat[40] = data_bytes; dat[41] = data_bytes >> 8; dat[42] = data_bytes >> 16; dat[43] = data_bytes >> 24;
+
+    /* sector 0: empty Mode 2 Form 2 lead-in (submode 0x20, no content bits) */
+    memcpy( dat + 44, sync, 12 );
+    dat[44 + 13] = 2; dat[44 + 15] = 2;
+    dat[44 + 18] = dat[44 + 22] = 0x20;
+
+    /* sector 1: Mode 2 Form 1 ISO data sector (submode 0x08) with fake start codes in body & ECC */
+    {
+        uint8_t *s1 = dat + 44 + 2352;
+        memcpy( s1, sync, 12 );
+        s1[13] = 2; s1[14] = 1; s1[15] = 2;
+        s1[18] = s1[22] = 0x08;
+        memcpy( s1 + 24, "\x00\x00\x01\xba\x21\x00\x01\x00\x01\x80\x00\x01\x00\x00\x01\xe0", 16 );
+        memcpy( s1 + 2072, "\x00\x00\x01\xba\x00\x00\x01\xe0\xde\xad\xbe\xef", 12 );
+    }
+
+    for (s = 0; s < body; s++)
+    {
+        uint8_t *sec = dat + 44 + (pre + s) * 2352;
+        size_t off = s * 2324, chunk = ps_size - off > 2324 ? 2324 : ps_size - off;
+        memcpy( sec, sync, 12 );
+        sec[12] = 0; sec[13] = 2; sec[14] = (uint8_t)((pre + s) % 75); sec[15] = 2;
+        sec[16] = sec[20] = 1; sec[17] = sec[21] = 1;
+        sec[18] = sec[22] = 0x66;   /* Form 2, Video + Audio, Real-Time */
+        memcpy( sec + 24, ps + off, chunk );
+        memcpy( sec + 2348, "\xde\xad\xbe\xef", 4 );   /* non-zero EDC trailer */
+    }
+    *out_size = 44 + data_bytes;
+    return dat;
 }
 
 /* ---- the reference: the same file demuxed and decoded by libavformat + libavcodec directly ---- */
@@ -376,14 +448,14 @@ static void src_start( struct source *s, struct mav_parser *p, const uint8_t *da
 static void src_stop( struct source *s ) { mav_disconnect( s->p ); __atomic_store_n( &s->running, 0, __ATOMIC_RELEASE ); pthread_join( s->thread, NULL ); }
 
 /* Decoded: every picture bit-exact in order, the tone, one clock, an exact seek, a rewind to 0. */
-static int test_decoded( const uint8_t *data, size_t size, const char *name, const char *container, const char *codec,
-                         int version, int audio )
+static int test_decoded_ref( const uint8_t *data, size_t size, const uint8_t *ref_data, size_t ref_size,
+                             const char *name, const char *container, const char *codec, int version, int audio )
 {
     struct mav_parser *p = mav_create( 0 ); struct source s; struct mav_stream_info vi, ai; struct mav_buffer b;
     uint8_t *pic = malloc( REF_SIZE ); double *pcm = NULL; size_t frames = 0, cap = 0; int n = 0;
     int64_t first_v = -1, first_a = -1, target; double freq = 0, rms = 0;
 
-    CHECK( !make_reference( data, size ) && ref_count == FRAMES, "%s: reference: %d pictures", name, ref_count );
+    CHECK( !make_reference( ref_data, ref_size ) && ref_count == FRAMES, "%s: reference: %d pictures", name, ref_count );
     src_start( &s, p, data, size );
     CHECK( mav_connect( p, size ) == MAV_OK, "%s: connect", name );
     CHECK( (int)mav_stream_count( p ) == 1 + audio && mav_stream_info( p, 0, &vi ) == MAV_OK, "%s: streams", name );
@@ -449,25 +521,42 @@ static int test_decoded( const uint8_t *data, size_t size, const char *name, con
            && (int64_t)b.pts == target, "%s: seek to %lld gave %llu", name, (long long)target, (unsigned long long)b.pts );
     CHECK( mav_copy_buffer( p, 0, pic, 0, b.size ) == MAV_OK && nv12_matches( pic, W, 50 ), "%s: the seek's picture", name );
     mav_release_buffer( p, 0 );
+    if (!audio)
+    {
+        /* also test seeking directly onto an open-GOP B-frame (frame 47, coded after I48) */
+        target = first_v + 47 * TICK;
+        CHECK( mav_seek( p, 0, 1, (uint64_t)target, 0, 0 ) == MAV_OK && mav_get_buffer( p, 0, &b ) == MAV_OK
+               && (int64_t)b.pts == target, "%s: open-GOP B-frame seek to %lld gave %llu", name, (long long)target,
+               (unsigned long long)b.pts );
+        CHECK( mav_copy_buffer( p, 0, pic, 0, b.size ) == MAV_OK && nv12_matches( pic, W, 47 ), "%s: picture 47", name );
+        mav_release_buffer( p, 0 );
+    }
     if (audio)
         CHECK( mav_get_buffer( p, 1, &b ) == MAV_OK && llabs( (long long)b.pts - (long long)target ) <= 1,
                "%s: audio after the seek at %llu", name, (unsigned long long)b.pts );
     src_stop( &s ); mav_destroy( p ); free( pic ); free( pcm );
     printf( "PASS: %s: %d pictures bit-exact in NV12, in order at 40 ms steps%s; rewind to 0; exact seek to 2 s\n", name, n,
-            audio ? ", the MP2 tone, audio and video on one clock" : "" );
+            audio ? ", the MP2 tone, audio and video on one clock" : " (and open-GOP B-frame 47)" );
     return 0;
 }
 
+static int test_decoded( const uint8_t *data, size_t size, const char *name, const char *container, const char *codec,
+                         int version, int audio )
+{
+    return test_decoded_ref( data, size, data, size, name, container, codec, version, audio );
+}
+
 /* Compressed, as quartz's MPEG-1 splitter reads it: every packet of both streams. */
-static int test_compressed( const uint8_t *data, size_t size )
+static int test_compressed_ref( const uint8_t *data, size_t size, const uint8_t *ref_data, size_t ref_size,
+                                const char *label )
 {
     struct mav_parser *p = mav_create( 1 ); struct source s; struct mav_stream_info vi, ai; struct mav_buffer b;
     uint8_t *buf = malloc( 1 << 20 ); int next[2] = { 0, 0 }, count[2] = { 0, 0 }, want[2] = { 0, 0 }, i;
 
-    CHECK( !make_reference( data, size ), "reference" );
+    CHECK( !make_reference( ref_data, ref_size ), "%s: reference", label );
     for (i = 0; i < ref_pkt_count; i++) want[ref_pkts[i].stream]++;
     src_start( &s, p, data, size );
-    CHECK( mav_connect( p, size ) == MAV_OK && mav_stream_count( p ) == 2, "a compressed-output parser connects" );
+    CHECK( mav_connect( p, size ) == MAV_OK && mav_stream_count( p ) == 2, "%s: compressed-output parser connects", label );
     CHECK( mav_stream_info( p, 0, &vi ) == MAV_OK && mav_stream_info( p, 1, &ai ) == MAV_OK
            && vi.kind == MAV_CODEC_MPEG_VIDEO && vi.version == 1 && ai.kind == MAV_CODEC_MPEG_AUDIO, "infos" );
     for (i = 0; i < 2; i++)
@@ -480,7 +569,7 @@ static int test_compressed( const uint8_t *data, size_t size )
         CHECK( next[st] < ref_pkt_count, "stream %d: more packets than the file has", st );
         r = &ref_pkts[next[st]++];
         CHECK( b.size == (uint32_t)r->size && mav_copy_buffer( p, st, buf, 0, b.size ) == MAV_OK
-               && !memcmp( buf, r->data, b.size ), "stream %d packet %d: the file's %d bytes (got %u)", st, count[st],
+               && !memcmp( buf, r->data, b.size ), "%s stream %d packet %d: the file's %d bytes (got %u)", label, st, count[st],
                r->size, b.size );
         CHECK( b.delta == !r->key, "stream %d packet %d: keyframe flag", st, count[st] );
         if (r->pts != INT64_MIN)
@@ -497,12 +586,12 @@ static int test_compressed( const uint8_t *data, size_t size )
     /* MADEIRA_WG_COMPRESSED=0: the splitter gives way to the decoding splitter */
     mav_allow_compressed_asf( 0 );
     p = mav_create( 1 ); src_start( &s, p, data, size );
-    CHECK( mav_connect( p, size ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_COMPRESSED=0 refuses the MPEG program stream" );
+    CHECK( mav_connect( p, size ) == MAV_E_UNSUPPORTED, "%s: MADEIRA_WG_COMPRESSED=0 refuses it", label );
     src_stop( &s ); mav_destroy( p );
     mav_allow_compressed_asf( 1 );
     free( buf );
-    printf( "PASS: MPEG-1 program stream compressed (quartz's MPEG-1 splitter): all %d video and %d audio packets with "
-            "the file's bytes, keyframe flags and timestamps; MADEIRA_WG_COMPRESSED=0 refuses it\n", count[0], count[1] );
+    printf( "PASS: %s compressed (quartz's MPEG-1 splitter): all %d video and %d audio packets with "
+            "the file's bytes, keyframe flags and timestamps; MADEIRA_WG_COMPRESSED=0 refuses it\n", label, count[0], count[1] );
     return 0;
 }
 
@@ -533,20 +622,147 @@ static int test_mpeg2_compressed( const uint8_t *data, size_t size )
     return 0;
 }
 
-static int test_es_refused( const uint8_t *data, size_t size )
+/* Raw MPEG-1 ES (.m1v) at 30000/1001 fps (proving rawdec's 25 fps default is ignored):
+ * both decoded and compressed (splitter) modes carry exact display-order timestamps
+ * (frame_number * frame_duration from temporal_reference). */
+static int test_es_ntsc_and_compressed( const uint8_t *es, size_t size )
 {
-    struct mav_parser *p = mav_create( 0 ); struct source s;
+    struct mav_parser *p; struct source s; struct mav_stream_info vi; struct mav_buffer b;
+    uint8_t *buf = malloc( 1 << 20 ), *pic = malloc( REF_SIZE );
+    AVCodecContext *dec; AVPacket *pkt = av_packet_alloc(); AVFrame *f = av_frame_alloc();
+    int i = 0, out_n = 0, reordered = 0; uint64_t prev_pkt_pts = 0;
+    uint64_t want_dur = av_rescale_q( FRAMES, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
 
-    src_start( &s, p, data, size );
-    CHECK( mav_connect( p, size ) == MAV_E_UNSUPPORTED, "an MPEG-1 elementary stream is refused" );
+    CHECK( !make_reference( es, size ) && ref_count == FRAMES && ref_pkt_count == FRAMES,
+           "NTSC ES reference (%d pics, %d pkts)", ref_count, ref_pkt_count );
+
+    /* 1. Decoded mode at 30000/1001 */
+    p = mav_create( 0 ); src_start( &s, p, es, size );
+    CHECK( mav_connect( p, size ) == MAV_OK && mav_stream_count( p ) == 1 && mav_stream_info( p, 0, &vi ) == MAV_OK,
+           "connect NTSC .m1v decoded" );
+    CHECK( !strcmp( vi.container, "mpegvideo" ) && !strcmp( vi.codec, "mpeg1video" ) && vi.version == 1
+           && vi.vnative.fps_n == 30000 && vi.vnative.fps_d == 1001 && vi.duration == want_dur,
+           "NTSC .m1v info: %s %u/%u dur=%llu (want %llu)", vi.container, vi.vnative.fps_n, vi.vnative.fps_d,
+           (unsigned long long)vi.duration, (unsigned long long)want_dur );
+    CHECK( mav_seek( p, 0, 1, 0, 0, 0 ) == MAV_OK, "seek 0" );
+    for (i = 0; mav_get_buffer( p, 0, &b ) == MAV_OK; i++)
+    {
+        uint64_t want_pts = av_rescale_q( i, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+        CHECK( b.pts == want_pts && b.size == REF_SIZE && mav_copy_buffer( p, 0, pic, 0, b.size ) == MAV_OK
+               && nv12_matches( pic, W, i ), "decoded NTSC pic %d pts %llu (want %llu)", i,
+               (unsigned long long)b.pts, (unsigned long long)want_pts );
+        mav_release_buffer( p, 0 );
+    }
+    CHECK( i == FRAMES, "decoded %d NTSC pictures", i );
     src_stop( &s ); mav_destroy( p );
-    printf( "PASS: an MPEG-1 elementary stream (.m1v) is refused, not played with made-up times\n" );
+
+    /* 2. Compressed (splitter) mode at 30000/1001 */
+    p = mav_create( 1 ); src_start( &s, p, es, size );
+    CHECK( mav_connect( p, size ) == MAV_OK && mav_stream_count( p ) == 1
+           && mav_can_pass_compressed( p, 0 ) && mav_enable_compressed( p, 0 ) == MAV_OK,
+           "connect NTSC .m1v compressed" );
+    dec = avcodec_alloc_context3( avcodec_find_decoder( AV_CODEC_ID_MPEG1VIDEO ) );
+    dec->thread_count = 1;
+    CHECK( avcodec_open2( dec, dec->codec, NULL ) >= 0, "open mpeg1video check decoder" );
+    for (i = 0; mav_get_buffer( p, 0, &b ) == MAV_OK; i++)
+    {
+        const struct refpkt *r = &ref_pkts[i];
+        CHECK( i < ref_pkt_count && b.size == (uint32_t)r->size && mav_copy_buffer( p, 0, buf, 0, b.size ) == MAV_OK
+               && !memcmp( buf, r->data, b.size ) && b.delta == !r->key, "compressed .m1v packet %d", i );
+        if (i > 0 && b.pts < prev_pkt_pts) reordered = 1;
+        prev_pkt_pts = b.pts;
+        pkt->data = buf; pkt->size = (int)b.size; pkt->pts = (int64_t)b.pts;
+        CHECK( avcodec_send_packet( dec, pkt ) >= 0, "send packet %d", i );
+        while (avcodec_receive_frame( dec, f ) >= 0)
+        {
+            uint64_t want_pts = av_rescale_q( out_n, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+            CHECK( (uint64_t)f->pts == want_pts, "decoder output %d pts %lld != display pts %llu",
+                   out_n, (long long)f->pts, (unsigned long long)want_pts );
+            out_n++;
+            av_frame_unref( f );
+        }
+        mav_release_buffer( p, 0 );
+    }
+    avcodec_send_packet( dec, NULL );
+    while (avcodec_receive_frame( dec, f ) >= 0)
+    {
+        uint64_t want_pts = av_rescale_q( out_n, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+        CHECK( (uint64_t)f->pts == want_pts, "drained output %d pts %lld != %llu",
+               out_n, (long long)f->pts, (unsigned long long)want_pts );
+        out_n++;
+        av_frame_unref( f );
+    }
+    CHECK( i == FRAMES && out_n == FRAMES && reordered,
+           "compressed .m1v: %d packets, %d display-ordered times (reordered=%d)", i, out_n, reordered );
+
+    /* Seek in compressed mode: lands on the keyframe at or before frame 50 (I48) */
+    {
+        uint64_t seek_to = av_rescale_q( 50, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+        uint64_t key_48 = av_rescale_q( 48, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+        CHECK( mav_seek( p, 0, 1, seek_to, 0, 0 ) == MAV_OK && mav_get_buffer( p, 0, &b ) == MAV_OK,
+               "compressed .m1v seek" );
+        CHECK( !b.delta && b.discontinuity && b.pts <= seek_to && b.pts >= key_48,
+               "compressed .m1v seek landed on keyframe at %llu (target %llu)",
+               (unsigned long long)b.pts, (unsigned long long)seek_to );
+        mav_release_buffer( p, 0 );
+    }
+    src_stop( &s ); mav_destroy( p );
+    avcodec_free_context( &dec ); av_packet_free( &pkt ); av_frame_free( &f );
+    free( buf ); free( pic );
+    printf( "PASS: raw MPEG-1 elementary stream (.m1v) at 30000/1001 fps: sequence-header rate (not rawdec's 25/1), "
+            "exact duration, %d pictures in decoded and compressed splitter modes with display-order temporal_reference "
+            "timestamps, and compressed keyframe seek\n", FRAMES );
+    return 0;
+}
+
+static int test_raw_switches_and_refusals( const uint8_t *es1, size_t nes1, const uint8_t *es2, size_t nes2,
+                                           const uint8_t *dat, size_t ndat, const uint8_t *ps1, size_t nps1 )
+{
+    struct mav_parser *p; struct source s;
+
+    /* Raw MPEG-2 elementary stream (.m2v) is refused in both modes */
+    p = mav_create( 0 ); src_start( &s, p, es2, nes2 );
+    CHECK( mav_connect( p, nes2 ) == MAV_E_UNSUPPORTED, "raw MPEG-2 (.m2v) refused decoded" );
+    src_stop( &s ); mav_destroy( p );
+    p = mav_create( 1 ); src_start( &s, p, es2, nes2 );
+    CHECK( mav_connect( p, nes2 ) == MAV_E_UNSUPPORTED, "raw MPEG-2 (.m2v) refused compressed" );
+    src_stop( &s ); mav_destroy( p );
+
+    /* MADEIRA_WG_COMPRESSED=0 refuses compressed .m1v */
+    mav_allow_compressed_asf( 0 );
+    p = mav_create( 1 ); src_start( &s, p, es1, nes1 );
+    CHECK( mav_connect( p, nes1 ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_COMPRESSED=0 refuses compressed .m1v" );
+    src_stop( &s ); mav_destroy( p );
+    mav_allow_compressed_asf( 1 );
+
+    /* MADEIRA_WG_MPEG_RAW=0 restores old behaviour: refuses .m1v and RIFF/CDXA .dat, keeps .mpg */
+    mav_allow_mpeg_raw( 0 );
+    p = mav_create( 0 ); src_start( &s, p, es1, nes1 );
+    CHECK( mav_connect( p, nes1 ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_MPEG_RAW=0 refuses .m1v decoded" );
+    src_stop( &s ); mav_destroy( p );
+    p = mav_create( 1 ); src_start( &s, p, es1, nes1 );
+    CHECK( mav_connect( p, nes1 ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_MPEG_RAW=0 refuses .m1v compressed" );
+    src_stop( &s ); mav_destroy( p );
+    p = mav_create( 0 ); src_start( &s, p, dat, ndat );
+    CHECK( mav_connect( p, ndat ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_MPEG_RAW=0 refuses RIFF/CDXA .dat decoded" );
+    src_stop( &s ); mav_destroy( p );
+    p = mav_create( 1 ); src_start( &s, p, dat, ndat );
+    CHECK( mav_connect( p, ndat ) == MAV_E_UNSUPPORTED, "MADEIRA_WG_MPEG_RAW=0 refuses RIFF/CDXA .dat compressed" );
+    src_stop( &s ); mav_destroy( p );
+    p = mav_create( 1 ); src_start( &s, p, ps1, nps1 );
+    CHECK( mav_connect( p, nps1 ) == MAV_OK, "MADEIRA_WG_MPEG_RAW=0 still allows plain .mpg" );
+    src_stop( &s ); mav_destroy( p );
+    mav_allow_mpeg_raw( 1 );
+
+    printf( "PASS: refusals and kill switches: raw MPEG-2 (.m2v) refused; MADEIRA_WG_COMPRESSED=0 refuses compressed "
+            ".m1v; MADEIRA_WG_MPEG_RAW=0 refuses .m1v and RIFF/CDXA .dat while keeping plain .mpg\n" );
     return 0;
 }
 
 int main( int argc, char **argv )
 {
-    size_t n1, n2, n3; uint8_t *ps1, *ps2, *es1;
+    size_t n1, n2, n3, n_ntsc, n_es2, ndat;
+    uint8_t *ps1, *ps2, *es1, *es_ntsc, *es2, *dat;
     int threads = argc > 1 && !strcmp( argv[1], "threads" );
 
     alarm( 300 );
@@ -556,17 +772,24 @@ int main( int argc, char **argv )
     ps1 = make_mpeg( "mpeg", AV_CODEC_ID_MPEG1VIDEO, 1, &n1 );
     ps2 = make_mpeg( "dvd", AV_CODEC_ID_MPEG2VIDEO, 1, &n2 );
     es1 = make_mpeg( "mpeg1video", AV_CODEC_ID_MPEG1VIDEO, 0, &n3 );
-    CHECK( ps1 && ps2 && es1, "make the files" );
+    es_ntsc = make_mpeg_rate( "mpeg1video", AV_CODEC_ID_MPEG1VIDEO, 0, 30000, 1001, &n_ntsc );
+    es2 = make_mpeg( "mpeg2video", AV_CODEC_ID_MPEG2VIDEO, 0, &n_es2 );
+    dat = ps1 ? make_vcd_dat( ps1, n1, &ndat ) : NULL;
+    CHECK( ps1 && ps2 && es1 && es_ntsc && es2 && dat, "make the files" );
     if (test_decoded( ps1, n1, "MPEG-1 program stream", "mpeg", "mpeg1video", 1, 1 )) return 1;
-    if (test_compressed( ps1, n1 )) return 1;
+    if (test_decoded_ref( dat, ndat, ps1, n1, "VideoCD RIFF/CDXA .dat", "mpeg", "mpeg1video", 1, 1 )) return 1;
+    if (test_decoded( es1, n3, "MPEG-1 elementary stream (.m1v)", "mpegvideo", "mpeg1video", 1, 0 )) return 1;
+    if (test_compressed_ref( ps1, n1, ps1, n1, "MPEG-1 program stream" )) return 1;
+    if (test_compressed_ref( dat, ndat, ps1, n1, "VideoCD RIFF/CDXA .dat" )) return 1;
     if (!threads)
     {
+        if (test_es_ntsc_and_compressed( es_ntsc, n_ntsc )) return 1;
         if (test_decoded( ps2, n2, "MPEG-2 program stream", "mpeg", "mpeg2video", 2, 1 )) return 1;
         if (test_mpeg2_compressed( ps2, n2 )) return 1;
-        if (test_es_refused( es1, n3 )) return 1;
+        if (test_raw_switches_and_refusals( es1, n3, es2, n_es2, dat, ndat, ps1, n1 )) return 1;
     }
     free_reference();
-    free( ps1 ); free( ps2 ); free( es1 );
+    free( ps1 ); free( ps2 ); free( es1 ); free( es_ntsc ); free( es2 ); free( dat );
     return failures != 0;
 }
 """
@@ -875,6 +1098,98 @@ static int test_audio( void )
     return 0;
 }
 
+/* KiriKiri's krmovie end-to-end splitter -> CLSID_CMpegVideoCodec / CLSID_CMpegAudioCodec pipeline
+ * for raw .m1v (MEDIASUBTYPE_MPEG1Video, 30000/1001 fps) and VideoCD .dat (MEDIASUBTYPE_MPEG1VideoCD). */
+static int test_splitter_m1v_and_vcd( const uint8_t *es_ntsc, size_t n_ntsc, const uint8_t *dat, size_t ndat,
+                                      const uint8_t *ps1, size_t n1 )
+{
+    /* 1. Raw .m1v at 30000/1001 through compressed wg_parser -> wg_transform MPEG-1 video decoder */
+    {
+        struct wg_parser_create_params c = { 0, 1 }; struct wg_parser_connect_params cn = {0};
+        struct wg_parser_get_stream_count_params sc = {0}; struct wg_parser_get_stream_params gs = {0};
+        struct wg_format vf; struct gsource src; MFVIDEOFORMAT fi, fo; NTSTATUS st; wg_transform_t vt;
+        uint8_t *pkt = malloc( 1 << 20 ), *pic = malloc( REF_SIZE ); struct wg_sample s;
+        int n = 0; HRESULT hr;
+
+        CHECK( !make_reference( es_ntsc, n_ntsc ) && ref_count == FRAMES, "NTSC ES ref" );
+        CHECK( !call( unix_wg_parser_create, &c ) && c.parser, "create .m1v splitter parser" );
+        mav_configure( 1, NULL, NULL, MAV_PIX_BGRx );
+        memset( &src, 0, sizeof(src) ); src.data = es_ntsc; src.size = n_ntsc; src.parser = c.parser; src.running = 1;
+        pthread_create( &src.thread, NULL, gread_thread, &src );
+        cn.parser = c.parser; cn.file_size = n_ntsc;
+        CHECK( !call( unix_wg_parser_connect, &cn ), "connect .m1v" );
+        sc.parser = c.parser;
+        CHECK( !call( unix_wg_parser_get_stream_count, &sc ) && sc.count == 1, "one video stream" );
+        gs.parser = c.parser; gs.index = 0;
+        CHECK( !call( unix_wg_parser_get_stream, &gs ), "stream 0" );
+        {
+            struct wg_parser_stream_get_current_format_params f0 = { gs.stream, &vf };
+            struct wg_parser_stream_enable_params e0 = { gs.stream, &vf };
+            struct wg_parser_stream_seek_params sk = { gs.stream, 1.0, 0, 0, AM_SEEKING_AbsolutePositioning, AM_SEEKING_NoPositioning };
+            CHECK( !call( unix_wg_parser_stream_get_current_format, &f0 ), "format" );
+            CHECK( vf.major_type == WG_MAJOR_TYPE_VIDEO_MPEG1 && vf.u.video.width == W && vf.u.video.height == H
+                   && vf.u.video.fps_n == 30000 && vf.u.video.fps_d == 1001, "NTSC .m1v wg_format %u/%u",
+                   vf.u.video.fps_n, vf.u.video.fps_d );
+            CHECK( !call( unix_wg_parser_stream_enable, &e0 ) && !call( unix_wg_parser_stream_seek, &sk ), "enable+seek" );
+        }
+        video_type( &fi, &sub_mpeg1_payload, 0, W, H, FALSE );
+        fi.videoInfo.FramesPerSecond.Numerator = 30000; fi.videoInfo.FramesPerSecond.Denominator = 1001;
+        vt = create( (struct wg_media_type){ madeira_MFMediaType_Video, sizeof(fi), { .video = &fi } },
+                     video_type( &fo, NULL, FCC('N','V','1','2'), W, H, FALSE ), &st );
+        CHECK( !st && vt, "MPEG-1 video transform" );
+        for (;;)
+        {
+            struct wg_parser_buffer b; struct wg_parser_stream_get_buffer_params g = { c.parser, gs.stream, &b };
+            struct wg_parser_stream_copy_buffer_params cp = { gs.stream, pkt, 0, 0 };
+            if (call( unix_wg_parser_stream_get_buffer, &g ) != S_OK) break;
+            cp.size = b.size;
+            CHECK( !call( unix_wg_parser_stream_copy_buffer, &cp ) && b.has_pts, "copy .m1v packet" );
+            call( unix_wg_parser_stream_release_buffer, &gs.stream );
+            while ((hr = push( vt, pkt, b.size, (INT64)b.pts )) == MF_E_NOTACCEPTING)
+            {
+                while (read_one( vt, pic, REF_SIZE, &s ) == S_OK)
+                {
+                    uint64_t want = av_rescale_q( n, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+                    CHECK( (s.flags & WG_SAMPLE_FLAG_HAS_PTS) && (uint64_t)s.pts == want && nv12_matches( pic, W, n ),
+                           ".m1v->transform pic %d pts %lld != %llu", n, (long long)s.pts, (unsigned long long)want );
+                    n++;
+                }
+            }
+            CHECK( hr == S_OK, "push .m1v packet %#x", (unsigned)hr );
+            while (read_one( vt, pic, REF_SIZE, &s ) == S_OK)
+            {
+                uint64_t want = av_rescale_q( n, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+                CHECK( (s.flags & WG_SAMPLE_FLAG_HAS_PTS) && (uint64_t)s.pts == want && nv12_matches( pic, W, n ),
+                       ".m1v->transform pic %d pts %lld != %llu", n, (long long)s.pts, (unsigned long long)want );
+                n++;
+            }
+        }
+        CHECK( !call( unix_wg_transform_drain, &vt ), "drain .m1v transform" );
+        while (read_one( vt, pic, REF_SIZE, &s ) == S_OK)
+        {
+            uint64_t want = av_rescale_q( n, (AVRational){ 1001, 30000 }, (AVRational){ 1, 10000000 } );
+            CHECK( (s.flags & WG_SAMPLE_FLAG_HAS_PTS) && (uint64_t)s.pts == want && nv12_matches( pic, W, n ),
+                   "drained .m1v pic %d pts %lld != %llu", n, (long long)s.pts, (unsigned long long)want );
+            n++;
+        }
+        CHECK( n == FRAMES, ".m1v splitter->decoder pictures: %d", n );
+        destroy( vt );
+        call( unix_wg_parser_disconnect, &c.parser );
+        __atomic_store_n( &src.running, 0, __ATOMIC_RELEASE ); pthread_join( src.thread, NULL );
+        call( unix_wg_parser_destroy, &c.parser );
+        free( pkt ); free( pic );
+    }
+
+    /* 2. VideoCD .dat (RIFF/CDXA) through compressed wg_parser -> MPEG-1 video + audio decoders */
+    {
+        CHECK( !make_reference( ps1, n1 ) && ref_count == FRAMES, "VCD reference" );
+        if (test_splitter_formats( dat, ndat )) return 1;
+    }
+    printf( "PASS: KiriKiri splitter pipeline: raw .m1v (30000/1001) and VideoCD RIFF/CDXA .dat split and decoded "
+            "bit-exact with exact display timestamps\n" );
+    return 0;
+}
+
 static int test_switched_off( void )
 {
     struct { WAVEFORMATEX wfx; BYTE extra[22]; } in; WAVEFORMATEX out; NTSTATUS st; wg_transform_t t;
@@ -885,18 +1200,54 @@ static int test_switched_off( void )
     return 0;
 }
 
+static int test_raw_switched_off( void )
+{
+    size_t nes, nps, ndat;
+    uint8_t *es = make_mpeg( "mpeg1video", AV_CODEC_ID_MPEG1VIDEO, 0, &nes );
+    uint8_t *ps = make_mpeg( "mpeg", AV_CODEC_ID_MPEG1VIDEO, 1, &nps );
+    uint8_t *dat = ps ? make_vcd_dat( ps, nps, &ndat ) : NULL;
+    struct wg_parser_create_params c = { 0, 1 }; struct wg_parser_connect_params cn = {0};
+    struct gsource src;
+
+    CHECK( es && ps && dat, "make streams" );
+    CHECK( !call( unix_wg_parser_create, &c ) && c.parser, "create parser" );
+    mav_configure( 1, NULL, NULL, MAV_PIX_BGRx );
+
+    memset( &src, 0, sizeof(src) ); src.data = es; src.size = nes; src.parser = c.parser; src.running = 1;
+    pthread_create( &src.thread, NULL, gread_thread, &src );
+    cn.parser = c.parser; cn.file_size = nes;
+    CHECK( call( unix_wg_parser_connect, &cn ) == VFW_E_UNSUPPORTED_STREAM, "MADEIRA_WG_MPEG_RAW=0 refuses .m1v" );
+    __atomic_store_n( &src.running, 0, __ATOMIC_RELEASE ); pthread_join( src.thread, NULL );
+
+    memset( &src, 0, sizeof(src) ); src.data = dat; src.size = ndat; src.parser = c.parser; src.running = 1;
+    pthread_create( &src.thread, NULL, gread_thread, &src );
+    cn.parser = c.parser; cn.file_size = ndat;
+    CHECK( call( unix_wg_parser_connect, &cn ) == VFW_E_UNSUPPORTED_STREAM, "MADEIRA_WG_MPEG_RAW=0 refuses .dat" );
+    __atomic_store_n( &src.running, 0, __ATOMIC_RELEASE ); pthread_join( src.thread, NULL );
+
+    call( unix_wg_parser_destroy, &c.parser );
+    free( es ); free( ps ); free( dat );
+    printf( "PASS: MADEIRA_WG_MPEG_RAW=0 through the glue refuses .m1v and VideoCD .dat\n" );
+    return 0;
+}
+
 int main( int argc, char **argv )
 {
-    size_t n1; uint8_t *ps1;
+    size_t n1, n_ntsc, ndat; uint8_t *ps1, *es_ntsc, *dat;
 
     alarm( 300 );
     setvbuf( stdout, NULL, _IONBF, 0 );
     av_log_set_level( AV_LOG_ERROR );
     if (argc > 1 && !strcmp( argv[1], "off" )) return test_switched_off() || failures;
+    if (argc > 1 && !strcmp( argv[1], "raw_off" )) return test_raw_switched_off() || failures;
     ps1 = make_mpeg( "mpeg", AV_CODEC_ID_MPEG1VIDEO, 1, &n1 );
-    CHECK( ps1, "the MPEG-1 program stream" );
-    if (test_splitter_formats( ps1, n1 ) || test_video() || test_audio()) return 1;
-    free( ps1 ); free_reference();
+    es_ntsc = make_mpeg_rate( "mpeg1video", AV_CODEC_ID_MPEG1VIDEO, 0, 30000, 1001, &n_ntsc );
+    dat = ps1 ? make_vcd_dat( ps1, n1, &ndat ) : NULL;
+    CHECK( ps1 && es_ntsc && dat, "the MPEG-1 streams" );
+    if (test_splitter_formats( ps1, n1 ) || test_splitter_m1v_and_vcd( es_ntsc, n_ntsc, dat, ndat, ps1, n1 )
+        || test_video() || test_audio())
+        return 1;
+    free( ps1 ); free( es_ntsc ); free( dat ); free_reference();
     return failures != 0;
 }
 """
@@ -920,12 +1271,17 @@ with tempfile.TemporaryDirectory() as t:
     lines = [l for l in out.stderr.splitlines() if l.startswith(TAG)]
     assert any("connect container=mpeg stream=0 video codec=mpeg1video backend=libavcodec 320x240 fps=25/1 out=nv12" in l
                for l in lines), lines
+    assert any("connect container=mpegvideo stream=0 video codec=mpeg1video backend=libavcodec 320x240 fps=30000/1001" in l
+               for l in lines), lines
+    assert any("cdxa: unwrapping RIFF/CDXA Mode 2 sectors" in l for l in lines), lines
     assert any("connect container=mpeg codec=mp2 layer=2 rate=44100 channels=2" in l for l in lines), lines
     assert any("video codec=mpeg2video backend=libavcodec" in l for l in lines), lines
     assert any("out=compressed" in l and "mpeg1video" in l for l in lines), lines
     assert any(l.endswith("stream 0: decoding ahead on a thread of its own (3 pictures)") for l in lines), lines
     assert any("connect refused (mpeg, compressed_out=1): compressed output requested" in l for l in lines), lines
-    assert any("connect refused (mpegvideo, compressed_out=0): container not in the allowlist" in l for l in lines), lines
+    assert any("connect refused (mpegvideo, compressed_out=0): container disabled by MADEIRA_WG_MPEG_RAW=0" in l
+               for l in lines), lines
+    assert any("RIFF/CDXA disabled by MADEIRA_WG_MPEG_RAW=0" in l for l in lines), lines
     assert any("stream 0 summary: container=mpeg codec=mpeg1video backend=libavcodec out=nv12 320x240 mode=ahead " in l
                for l in lines), lines
     assert any("stream 1 summary: container=mpeg codec=mp2 backend=libavcodec out=s16 44100Hz 2ch mode=on-demand " in l
@@ -942,7 +1298,7 @@ with tempfile.TemporaryDirectory() as t:
         tenv = dict(env, TSAN_OPTIONS="halt_on_error=1")
         out = subprocess.run([str(tsan), "threads"], env=tenv, capture_output=True, text=True, timeout=900)
         assert out.returncode == 0 and "WARNING: ThreadSanitizer" not in out.stderr, out.stdout + out.stderr[-6000:]
-        print("PASS: ThreadSanitizer clean: the MPEG-1 program stream decoded ahead, sought, rewound and read compressed")
+        print("PASS: ThreadSanitizer clean: MPEG-1 program stream, VideoCD .dat and raw .m1v decoded ahead, sought, rewound and read compressed")
 
     # ---------------------------------------------------------------- 4. the glue
     for need in [wine_build / "include/config.h", wine_build / "include/mfobjects.h", wine / "dlls/winegstreamer/unixlib.h"]:
@@ -975,6 +1331,8 @@ with tempfile.TemporaryDirectory() as t:
                              "stream 0 summary: container=mpeg codec=mpeg1video backend=libavcodec out=compressed mode=compressed"]),
         ("MADEIRA_WG_MPEG_TRANSFORM=0", {"MADEIRA_WG_MPEG_TRANSFORM": "0"}, ["off"],
          ["MPEG audio: disabled by MADEIRA_WG_MPEG_TRANSFORM=0"]),
+        ("MADEIRA_WG_MPEG_RAW=0", {"MADEIRA_WG_MPEG_RAW": "0"}, ["raw_off"],
+         ["raw MPEG-1 video and RIFF/CDXA unwrapping disabled by MADEIRA_WG_MPEG_RAW=0"]),
     ]:
         out = subprocess.run([str(gexe)] + argv, env=dict(aenv, **extra), capture_output=True, text=True, timeout=600)
         print(out.stdout, end="")

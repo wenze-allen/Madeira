@@ -42,7 +42,7 @@ has been tested game by game.
 | File | What it is |
 |---|---|
 | `build/ntdll-unix/winegstreamer_unixlib_ios.c` | Both unix call tables (entry for entry with `dlls/winegstreamer/unixlib.h`), the wow64 thunks, and three kinds of `wg_transform` on libavcodec: the WMA decoder `wma_decoder.c` uses (WMA v1/v2/Pro/Lossless, XMA1/2), the video decoder `video_decoder.c`'s WMVideo Decoder DMO/MFT and `quartz_transform.c`'s MPEG video decoder use (WMV1, WMV2, WMV3, WMVA, WVC1; MPEG-1/2 video; see below), and the MPEG audio decoder `quartz_transform.c`'s MPEG audio and layer-3 decoders use (layers I-III). `transform_create` gives a create to the first kind that claims its input type; every other entry finds the kind by the magic its object starts with. Raw audio in is a third kind, the resampler `resampler.c` uses, on libswresample (see below). Other transforms (AAC, H.264, the colour converter) are refused at create, and `wg_muxer` returns `STATUS_NOT_IMPLEMENTED`. |
-| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext, libavformat demux (mp3, wav, mov, asf, mpegps), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) and MPEG-1/2 video decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
+| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext (with RIFF/CDXA 2352-byte sector unwrapping for VideoCD `.dat` files), libavformat demux (mp3, wav, mov, asf, mpegps, mpegvideo), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) and MPEG-1/2 video decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
 | `build/ntdll-unix/wg_parser_apple_ios.c` | H.264/HEVC on VideoToolbox (NV12 out) and AAC on an AudioToolbox AudioConverter (float PCM out). Its own translation unit with no Wine or FFmpeg header. |
 | `build/ntdll-unix/wg_parser_backend_ios.h` | The contract between the core and a decoder backend; plain C types only, so the host test can supply stub backends. |
 | `build/ffmpeg/build.sh` | FFmpeg 7.1.5, pinned by SHA-256, LGPL-only configuration. |
@@ -59,10 +59,13 @@ See `THIRD-PARTY-NOTICES.md` for the exact component list and its licence.
 **Containers and codecs.** MP3/WAV: MPEG audio and PCM. MP4/MOV: H.264 or
 HEVC video (VideoToolbox) with AAC, MPEG audio or PCM. ASF (WMV/WMA): Windows
 Media video (libavcodec) with WMA v1/v2/Pro/Lossless or MPEG audio. MPEG
-program streams (`.mpg`, MPEG-1 and MPEG-2): MPEG-1/2 video (libavcodec) with
-MPEG audio. AVI, MPEG video on its own (`.m1v`), transport streams, Bink and
-the like are not handled here (Bink and most engines' own formats are decoded
-by the game itself). The codec format of an
+program streams (`.mpg`, MPEG-1 and MPEG-2) and RIFF/CDXA VideoCD sector files
+(`.dat`, unwrapped to 2324-byte packs): MPEG-1/2 video (libavcodec) with MPEG
+audio. Raw MPEG-1 video elementary streams (`.m1v`/`.mpv`): MPEG-1 video
+(libavcodec), timed in display order from the sequence header's frame rate and
+each picture's `temporal_reference`. AVI, raw MPEG-2 video (`.m2v`), transport
+streams, Bink and the like are not handled here (Bink and most engines' own
+formats are decoded by the game itself). The codec format of an
 ASF stream (`wg_parser_stream_get_codec_format`) is the one Wine's GStreamer
 backend reports: WMV1/WMV2/WMV3/WMVA/WVC1 video, WMA audio with its version,
 block alignment and codec data, so a game that reads the file's profile
@@ -108,20 +111,43 @@ count, so the next call wrote through a NULL array. Now:
 Each compressed stream logs `first compressed packet delivered` once.
 `MADEIRA_WG_COMPRESSED=0` refuses compressed output for an ASF again.
 
-**MPEG program streams (`.mpg`).** Older visual novels play their movies as
-MPEG-1 program streams through DirectShow, two ways:
+**MPEG program streams (`.mpg`), raw MPEG-1 video (`.m1v`/`.mpv`) and VideoCD (`.dat`).**
+Older visual novels play their movies as MPEG-1 program streams, raw MPEG-1
+video elementary streams or RIFF/CDXA VideoCD `.dat` files through DirectShow,
+two ways:
 - `RenderFile`: quartz's MPEG-1 splitter takes nothing from a decoding parser,
-  so the graph falls through to winegstreamer's decoding splitter, which this
-  parser serves with decoded pictures and PCM.
-- A graph built by hand: KiriKiri's krmovie connects quartz's MPEG-1 splitter
-  to `CLSID_CMpegVideoCodec` and `CLSID_CMpegAudioCodec`, and from them to its
-  RGB32 buffer renderer (bottom-up) or VMR-9. BURIKO reads the picture size from
-  the splitter's MPEG video format while connecting (krkrwine's notes). A
-  compressed-output parser here hands out an MPEG program stream's MPEG-1 video
-  and MPEG audio as the demuxer's packets, and reports them as
-  `WG_MAJOR_TYPE_VIDEO_MPEG1` (size, frame rate) and `WG_MAJOR_TYPE_AUDIO_MPEG1`
-  (layer, rate, channels). MPEG-2 video has no `wg_format`: it stays decoded,
-  quartz's MPEG-1 splitter then gives way, and the decoding splitter plays it.
+  so for MPEG-2 program streams the graph falls through to winegstreamer's
+  decoding splitter, which this parser serves with decoded pictures and PCM.
+- A graph built by hand: KiriKiri's krmovie maps `.mpg`/`.mpeg` to
+  `MEDIASUBTYPE_MPEG1System`, `.m1v`/`.mpv` to `MEDIASUBTYPE_MPEG1Video` and
+  `.dat` to `MEDIASUBTYPE_MPEG1VideoCD`, connects its async reader to quartz's
+  `CLSID_MPEG1Splitter` directly (which accepts all four MPEG-1 stream subtypes,
+  and seeks the reader of a system stream to the end of the file on connect), and connects the
+  splitter's output pins to `CLSID_CMpegVideoCodec` and `CLSID_CMpegAudioCodec`,
+  and from them to its RGB32 buffer renderer (bottom-up) or VMR-9. BURIKO reads
+  the picture size from the splitter's MPEG video format while connecting
+  (krkrwine's notes). A compressed-output parser here hands out an MPEG program
+  or raw MPEG-1 video stream's MPEG-1 video and MPEG audio as the demuxer's
+  packets, and reports them as `WG_MAJOR_TYPE_VIDEO_MPEG1` (size, frame rate)
+  and `WG_MAJOR_TYPE_AUDIO_MPEG1` (layer, rate, channels). MPEG-2 video has no
+  `wg_format`: in a program stream it stays decoded, quartz's MPEG-1 splitter
+  then gives way, and the decoding splitter plays it; a raw MPEG-2 `.m2v` is
+  refused.
+
+Raw MPEG-1 video elementary streams (FFmpeg's `mpegvideo` demuxer) carry no PES
+timestamps, and `rawdec` defaults `avg_frame_rate` to 25 fps before parsing:
+the parser reads the sequence header's `frame_rate_code` for the real rate and
+stamps each picture with `frame_number * frame_duration` in display order from
+its GOP base and 10-bit `temporal_reference` (handling both open and closed
+GOPs and 1024-frame wraps), in both decoded and compressed modes, and rewinds
+and scans to the target's keyframe GOP on seek. VideoCD `.dat` files wrap
+2352-byte CD-ROM XA Mode 2 sectors in a `RIFF`/`CDXA` container, which FFmpeg's
+demuxers do not unwrap (`psxstr` handles PlayStation STR only): the AVIO read
+path unwraps each Mode 2 Form 2 sector's 2324-byte user payload (after the
+24-byte sync/MSF/subheader, dropping the 4-byte EDC trailer, and zero-stuffing
+empty or Form 1 ISO sectors so byte seeking stays exact) before `mpegps` sees
+the stream. `MADEIRA_WG_MPEG_RAW=0` refuses raw `.m1v` and skips `RIFF`/`CDXA`
+unwrapping again.
 
 A program stream's clock starts anywhere, and its streams start a little
 apart: they count from the earliest start, so audio and video stay in sync.
@@ -255,7 +281,8 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: every video `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT and quartz's MPEG video decoder cannot be created, as before. Read once per process. WMA is unaffected. |
 | `MADEIRA_WG_MPEG_TRANSFORM` | on | `0`: the MPEG audio `wg_transform` is refused at create, so quartz's MPEG audio and layer-3 decoders cannot be created, as before. |
 | `MADEIRA_WG_RESAMPLER` | on | `0`: the resampler transform is refused at create, as before. |
-| `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF and an MPEG program stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
+| `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF, an MPEG program stream and a raw MPEG-1 video stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
+| `MADEIRA_WG_MPEG_RAW` | on | `0`: raw MPEG-1 video elementary streams (`.m1v`/`.mpv`) are refused at connect and `RIFF`/`CDXA` VideoCD `.dat` sectors are not unwrapped, as before. |
 | `MADEIRA_WG_VIDEO_AHEAD` | on | `0`: video is decoded on the thread that asks for it, as before; a Media Foundation movie's audio then waits behind each picture (see above). |
 | `MADEIRA_WG_VIDEO_FORMAT` | `rgb32` | Native format a video stream reports: `nv12`, `i420`, `yv12`, `yuy2`, `rgb32`, `argb32` or `abgr32` (see above for why the default is `rgb32`). |
 | `MADEIRA_WG_SUMMARY` | on | `0`: omit the one-line playback summaries per parser stream (`stream N first:`, `stream N summary:`) and per `wg_transform` (`destroy:`), restoring the previous log output. |
@@ -420,13 +447,23 @@ none:
     `put_CurrentPosition(0)`);
   - compressed output for quartz's MPEG-1 splitter, packet by packet against an
     independent demux; MPEG-2 video not passed; `MADEIRA_WG_COMPRESSED=0`;
-  - a `.m1v` refused;
+  - raw MPEG-1 video elementary streams (`.m1v` at 25 and 30000/1001 fps with
+    open-GOP B-frames) in decoded and compressed splitter modes: sequence-header
+    frame rate, display-order `temporal_reference` timestamps, bit-exact NV12,
+    rewind and seeks (including onto an open-GOP B-frame); raw MPEG-2 (`.m2v`)
+    refused;
+  - VideoCD `RIFF`/`CDXA` `.dat` sector files (2352-byte Mode 2 Form 2 sectors
+    with 24-byte headers, 4-byte EDC trailers, empty pre-gap and Form 1 ISO
+    sectors) unwrapped in the AVIO layer, in decoded and compressed splitter
+    modes;
+  - `MADEIRA_WG_MPEG_RAW=0` restoring `.m1v` and `.dat` refusal;
   - through the glue: the splitter's `WG_MAJOR_TYPE_VIDEO_MPEG1` size and frame
-    rate (BURIKO's) and MPEG audio formats; the MPEG video decoder's probe, the
+    rate (BURIKO's and KiriKiri's `.mpg`, `.m1v` and `.dat`) and MPEG audio
+    formats; the MPEG video decoder's probe, the
     MPEG-1 and MPEG-2 elementary streams pushed in 997-byte pieces, bit-exact,
     and RGB32 bottom-up within 1 of BT.601; the MPEG audio decoder's probes and
-    MP2 in 333-byte pieces to S16 and float; refusals and
-    `MADEIRA_WG_MPEG_TRANSFORM=0`;
+    MP2 in 333-byte pieces to S16 and float; refusals,
+    `MADEIRA_WG_MPEG_TRANSFORM=0` and `MADEIRA_WG_MPEG_RAW=0`;
   - the threaded cases again under ThreadSanitizer.
 - `tests/host/check-wg-resampler.py` (needs a configured Wine tree, like
   the WMA test): drives the resampler through the `wg_transform` entries under

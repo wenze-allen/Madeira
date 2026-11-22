@@ -472,6 +472,9 @@ OVERLAY = {
     "env.MADEIRA_WG_SUMMARY": {"title": "Media: playback summary lines in the log",
                 "note": "0 omits the one-line playback summaries per parser stream (first buffer and disconnect) and per "
                         "media transform at destroy; on by default."},
+    "env.MADEIRA_WG_MPEG_RAW": {"title": "Media: raw MPEG-1 video and VideoCD .dat (32-bit programs)",
+                "note": "0 refuses raw MPEG-1 video elementary streams (.m1v/.mpv) and skips RIFF/CDXA VideoCD .dat sector "
+                        "unwrapping again; by default both play and demux through quartz's MPEG-1 splitter (KiriKiri's krmovie)."},
     "env.MADEIRA_WOW_RWX_PLAIN": {"category": "Memory & JIT pool", "note": "Unset: a 32-bit window's anonymous RWX memory is plain read/write to the host once Wine Mono's libmono-2.0-x86.dll is mapped there (ml1279/ml1282). 1: in every 32-bit window. 0: never (stores go through the JIT pool's alias, and FEX's Mono bridge stays off)."},
     "env.MADEIRA_WINEMONO_BRIDGE": {"note": "FEX's Mono backpatcher bridge (ml712). On by itself for Wine Mono, 32- and 64-bit (ml1282/ml1286); for the 32-bit runtime in a guest window it also turns SMC detection off once the backpatcher is found (ml1280). 0 keeps it off."},
     "env.MADEIRA_MONO_DEFAULTS": {"category": "Wine libraries", "note": "Wine Mono, 32- and 64-bit: mscoree sets MONO_THREADS_SUSPEND=coop and adds keep-delegates to MONO_DEBUG before Mono loads, and puts the previous values back once Mono has read them (ml1282); values already set win. 0 sets nothing."},
