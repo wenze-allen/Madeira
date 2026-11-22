@@ -1,50 +1,84 @@
 /* video-selftest-x86.c -- on-device 32-bit video self-test.        (MADEIRA)
  *
  * Run this one i386 program on the iPad after each build to exercise every
- * video playback path visual novels use through WoW64:
+ * video playback path visual novels and Unity games use through WoW64:
  *
- *   [1/6] kirikiri2-wmv-dmo   Sabbat of the Witch's path: LoadLibrary
- *                             wmvcore.dll + GetProcAddress WMCreateSyncReader,
- *                             open ASF, SetReadStreamSamples(TRUE) on both
- *                             streams, feed compressed WMV/WMA packets to
- *                             CLSID_CWMVDecMediaObject and
- *                             CLSID_CWMADecMediaObject via IMediaObject, and
- *                             verify RGB32 frames + PCM samples + checksums.
- *   [2/6] kirikiri-mpeg1      Hand-built DirectShow graph (all ConnectDirect,
- *                             never RenderFile): AsyncReader -> MPEG1Splitter
- *                             -> CMpegVideoCodec -> bottom-up-only RGB32 sink,
- *                             and MPEG1Splitter -> CMpegAudioCodec -> null PCM
- *                             sink; check frame count, negotiated 320x240 from
- *                             the connection's media type, IAMStreamSelect
- *                             Count/Info on the splitter, then rewind with
- *                             IMediaPosition::put_CurrentPosition(0) and play
- *                             to EC_COMPLETE a second time.
- *   [3/6] dshow-renderfile    DirectShow RenderFile on the MPEG-1 clip with
- *                             the default renderer in a hidden window, running
- *                             to EC_COMPLETE.
- *   [4/6] mf-session-evr-sar  Senren Banka's path: ASF clip through
- *                             MFCreateMediaSession with EVR on a window and
- *                             SAR, checking IMFVideoDisplayControl's
- *                             GetCurrentImage returns a non-black image
- *                             mid-way, IMFPresentationClock::GetTime advances,
- *                             and playback reaches MESessionEnded.
- *   [5/6] mf-source-reader    MFCreateSourceReaderFromURL on the ASF clip,
- *                             decoding video to MFVideoFormat_RGB32 and
- *                             counting non-black frames.
- *   [6/6] mci-mpeg            mciSendString open/play/close on the MPEG-1
- *                             clip, waiting for playback completion.
+ *   [1/10]  kirikiri2-wmv-dmo       Sabbat of the Witch's path: LoadLibrary
+ *                                   wmvcore.dll + GetProcAddress
+ *                                   WMCreateSyncReader, open ASF,
+ *                                   SetReadStreamSamples(TRUE) on both streams,
+ *                                   feed compressed WMV/WMA packets to
+ *                                   CLSID_CWMVDecMediaObject and
+ *                                   CLSID_CWMADecMediaObject via IMediaObject,
+ *                                   and verify RGB32 frames + PCM samples.
+ *   [2/10]  kirikiri-mpeg1          Hand-built DirectShow graph (ConnectDirect
+ *                                   only, never RenderFile): AsyncReader ->
+ *                                   MPEG1Splitter -> CMpegVideoCodec ->
+ *                                   bottom-up-only RGB32 sink, and
+ *                                   MPEG1Splitter -> CMpegAudioCodec -> PCM
+ *                                   sink; check 320x240 from connection media
+ *                                   type, IAMStreamSelect Count/Info, rewind
+ *                                   with put_CurrentPosition(0) and play again.
+ *   [3/10]  dshow-renderfile-mpeg   DirectShow RenderFile on the MPEG-1 clip
+ *                                   in a visible window: VMR-7's
+ *                                   IBasicVideo::GetCurrentImage returns
+ *                                   E_NOTIMPL, so clear the window to black,
+ *                                   read its client area via GDI BitBlt into a
+ *                                   DIBSection during playback, fail if the
+ *                                   picture is black or never appears, and wait
+ *                                   for EC_COMPLETE.
+ *   [4/10]  mf-session-evr-sar      Senren Banka's path: ASF clip through
+ *                                   MFCreateMediaSession with EVR on a window
+ *                                   and SAR, checking IMFVideoDisplayControl's
+ *                                   GetCurrentImage returns a non-black image
+ *                                   mid-way, IMFPresentationClock::GetTime
+ *                                   advances, and playback reaches
+ *                                   MESessionEnded.
+ *   [5/10]  mf-source-reader        MFCreateSourceReaderFromURL on the ASF
+ *                                   clip, decoding video to MFVideoFormat_RGB32
+ *                                   at native 320x240 and counting non-black
+ *                                   frames.
+ *   [6/10]  mci-mpeg                mciSendString open/play/close on the MPEG-1
+ *                                   clip, waiting for playback completion.
+ *   [7/10]  dshow-renderfile-avi    DirectShow RenderFile on the AVI clip
+ *                                   (MPEG-4 Xvid + IMA ADPCM, routed through
+ *                                   winegstreamer's decoding splitter because
+ *                                   the compressed AVI splitter refuses it),
+ *                                   with the same visible-window GDI picture
+ *                                   check and EC_COMPLETE.
+ *   [8/10]  kirikiri-m1v            KiriKiri's raw .m1v graph: AsyncReader
+ *                                   connected to CLSID_MPEG1Splitter with
+ *                                   MEDIATYPE_Stream / MEDIASUBTYPE_MPEG1Video,
+ *                                   1 video stream -> CMpegVideoCodec ->
+ *                                   bottom-up RGB32 sink, checking 320x240,
+ *                                   frame count, rewind, and second play.
+ *   [9/10]  kirikiri-vcd-dat        KiriKiri's VideoCD .dat graph: AsyncReader
+ *                                   connected to CLSID_MPEG1Splitter with
+ *                                   MEDIATYPE_Stream /
+ *                                   MEDIASUBTYPE_MPEG1VideoCD on RIFF/CDXA
+ *                                   2352-byte Mode 2 Form 2 sectors, checking
+ *                                   320x240, frame + PCM counts, rewind, and
+ *                                   second play.
+ *   [10/10] mf-source-reader-resize Unity's resized RGB32 path:
+ *                                   MFCreateSourceReaderFromURL with
+ *                                   MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING
+ *                                   delivering MFVideoFormat_RGB32 scaled from
+ *                                   320x240 to 160x120 through
+ *                                   CLSID_VideoProcessorMFT ("video converter"),
+ *                                   checking output dimensions and non-black
+ *                                   resized frames.
  *
  * Report output goes both to console/stderr (captured by Madeira's device log)
  * and to a log file (%USERPROFILE%\Documents\video-selftest.log by default, or
  * MADEIRA_SELFTEST_LOG if set).
  *
- * Exit status: the number of paths that failed (0 = all 6 passed, 1..6 = count
- * of failed paths; 99 if basic Win32/COM initialisation or clip staging failed
- * before the paths could run).
+ * Exit status: the number of paths that failed (0 = all 10 passed, 1..10 =
+ * count of failed paths; 99 if basic Win32/COM initialisation or clip staging
+ * failed before the paths could run).
  *
  * Built with -nostdlib -ffreestanding like wma-x86.c so the PE imports only
- * the system API DLLs it explicitly links against; decoders, splitters and
- * wmvcore.dll are reached through COM / LoadLibrary just as games reach them.
+ * the 7 allowed system/MF/WinMM DLLs; decoders, splitters, wmvcore.dll and
+ * gdi32.dll are reached through COM / LoadLibrary.
  */
 
 #include <stddef.h>
@@ -76,7 +110,8 @@
 #define FNV1A_INIT 0x811c9dc5u
 #define FNV1A_PRIME 0x01000193u
 
-#define WATCHDOG_TIMEOUT_MS 90000u
+#define SELFTEST_TOTAL_PATHS 10u
+#define WATCHDOG_TIMEOUT_MS 150000u
 
 static const GUID k_guid_null = { 0 };
 
@@ -245,12 +280,18 @@ struct selftest_paths
     WCHAR log_path[MAX_PATH];
     WCHAR wmv_path[MAX_PATH];
     WCHAR mpg_path[MAX_PATH];
+    WCHAR avi_path[MAX_PATH];
+    WCHAR m1v_path[MAX_PATH];
+    WCHAR dat_path[MAX_PATH];
     WCHAR wmv_url[MAX_PATH + 16];
     WCHAR tmp_buf[MAX_PATH];
     WCHAR cmd_buf[MAX_PATH + 64];
     WCHAR ret_buf[128];
     const char *wmv_origin;
     const char *mpg_origin;
+    const char *avi_origin;
+    const char *m1v_origin;
+    const char *dat_origin;
 };
 
 static struct selftest_paths g_paths;
@@ -433,6 +474,11 @@ static BOOL stage_clip( const WCHAR *leaf, const unsigned char *bytes, DWORD siz
  * Pixel & audio verification helpers.
  * ------------------------------------------------------------------------- */
 
+static DWORD abs_diff_byte( BYTE a, BYTE b )
+{
+    return (a >= b) ? (DWORD)(a - b) : (DWORD)(b - a);
+}
+
 static DWORD hash_rgb32_and_check_nonblack( const BYTE *buf, DWORD width, DWORD height,
                                             LONG stride, DWORD *out_crc )
 {
@@ -462,6 +508,30 @@ static DWORD hash_rgb32_and_check_nonblack( const BYTE *buf, DWORD width, DWORD 
     }
     *out_crc = crc;
     return nonblack;
+}
+
+static DWORD count_rgb32_chromatic( const BYTE *buf, DWORD width, DWORD height, LONG stride )
+{
+    DWORD chromatic = 0;
+    DWORD x, y;
+
+    for (y = 0; y < height; y++)
+    {
+        const BYTE *row = (stride >= 0)
+            ? (buf + y * (DWORD)stride)
+            : (buf + (height - 1u - y) * (DWORD)(-stride));
+        for (x = 0; x < width; x++)
+        {
+            BYTE b = row[x * 4u + 0u];
+            BYTE g = row[x * 4u + 1u];
+            BYTE r = row[x * 4u + 2u];
+            if (abs_diff_byte( r, g ) > 24u ||
+                abs_diff_byte( g, b ) > 24u ||
+                abs_diff_byte( r, b ) > 24u)
+                chromatic++;
+        }
+    }
+    return chromatic;
 }
 
 static DWORD hash_pcm_s16( const short *samples, DWORD sample_count, WORD channels,
@@ -511,7 +581,8 @@ static void pump_messages( void )
 }
 
 /* -------------------------------------------------------------------------
- * Window class used by MF EVR (path 4) and MCI notify (path 6).
+ * Window class used by DirectShow VMR-7 (paths 3 & 7), MF EVR (path 4) and
+ * MCI notify (path 6).
  * ------------------------------------------------------------------------- */
 
 static volatile LONG g_mci_notified = 0;
@@ -525,6 +596,11 @@ static LRESULT CALLBACK selftest_wndproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM
         g_mci_notify_code = wp;
         InterlockedExchange( &g_mci_notified, 1 );
         return 0;
+    }
+    if (msg == WM_ERASEBKGND)
+    {
+        /* Do not paint a white background brush behind video child windows. */
+        return 1;
     }
     return DefWindowProcW( hwnd, msg, wp, lp );
 }
@@ -976,7 +1052,7 @@ out:
 
     if (ok)
     {
-        write_str( "[1/6] PASS kirikiri2-wmv-dmo: pkts=" );
+        write_str( "[1/10] PASS kirikiri2-wmv-dmo: pkts=" );
         write_uint( v_pkts );
         write_str( "+" );
         write_uint( a_pkts );
@@ -1000,7 +1076,7 @@ out:
     }
     else
     {
-        write_str( "[1/6] FAIL kirikiri2-wmv-dmo: step=" );
+        write_str( "[1/10] FAIL kirikiri2-wmv-dmo: step=" );
         write_str( step );
         write_str( " hr=" );
         write_hex32( (DWORD)hr );
@@ -1021,7 +1097,8 @@ out:
 }
 
 /* =========================================================================
- * PATH 2: Custom DirectShow sink filters & hand-built KiriKiri MPEG-1 graph
+ * PATHS 2, 8 & 9: Custom DirectShow sink filters & KiriKiri MPEG-1 graphs
+ * (.mpg program stream, raw .m1v elementary stream, VideoCD .dat sectors)
  * ========================================================================= */
 
 struct sink_filter
@@ -1858,7 +1935,13 @@ static HRESULT wait_dshow_completion( IMediaEvent *me, DWORD timeout_ms, LONG *o
     return E_ABORT;
 }
 
-static BOOL run_path2_kirikiri_mpeg1( void )
+/* Hand-built KiriKiri MPEG-1 DirectShow graph (ConnectDirect only):
+ *   - stream_subtype == NULL: default negotiation on .mpg (2 streams)
+ *   - stream_subtype == &MEDIASUBTYPE_MPEG1Video: raw .m1v (1 video stream)
+ *   - stream_subtype == &MEDIASUBTYPE_MPEG1VideoCD: RIFF/CDXA .dat (2 streams) */
+static BOOL run_kirikiri_mpeg_graph( const char *tag_prefix, const char *path_name,
+                                     const WCHAR *clip_path, const GUID *stream_subtype,
+                                     BOOL expect_audio )
 {
     IFilterGraph *fg = NULL;
     IMediaFilter *mf = NULL;
@@ -1872,6 +1955,8 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     IPin *src_out = NULL, *sp_in = NULL, *sp_out0 = NULL, *sp_out1 = NULL;
     IPin *vdec_in = NULL, *vdec_out = NULL, *adec_in = NULL, *adec_out = NULL;
     AM_MEDIA_TYPE cmt;
+    AM_MEDIA_TYPE stream_mt;
+    DWORD expect_streams = expect_audio ? 2u : 1u;
     DWORD ss_count = 0, i;
     BOOL ss_saw_video = FALSE, ss_saw_audio = FALSE;
     LONG conn_w = 0, conn_h = 0, ev_code = 0;
@@ -1881,10 +1966,11 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     BOOL ok = FALSE;
 
     memset( &cmt, 0, sizeof(cmt) );
+    memset( &stream_mt, 0, sizeof(stream_mt) );
 
     vsink = create_sink_filter( TRUE );
-    asink = create_sink_filter( FALSE );
-    if (!vsink || !asink) { step = "create_sink_filter"; hr = E_OUTOFMEMORY; goto out; }
+    if (expect_audio) asink = create_sink_filter( FALSE );
+    if (!vsink || (expect_audio && !asink)) { step = "create_sink_filter"; hr = E_OUTOFMEMORY; goto out; }
 
     /* Self-check the sink's strict bottom-up RGB32 rule: top-down (-240) must be refused. */
     {
@@ -1923,22 +2009,40 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     hr = CoCreateInstance( &CLSID_CMpegVideoCodec, NULL, CLSCTX_INPROC_SERVER, &IID_IBaseFilter, (void **)&vdec );
     if (FAILED( hr ) || !vdec) { step = "CoCreateInstance(CMpegVideoCodec)"; goto out; }
 
-    hr = CoCreateInstance( &CLSID_CMpegAudioCodec, NULL, CLSCTX_INPROC_SERVER, &IID_IBaseFilter, (void **)&adec );
-    if (FAILED( hr ) || !adec) { step = "CoCreateInstance(CMpegAudioCodec)"; goto out; }
+    if (expect_audio)
+    {
+        hr = CoCreateInstance( &CLSID_CMpegAudioCodec, NULL, CLSCTX_INPROC_SERVER, &IID_IBaseFilter, (void **)&adec );
+        if (FAILED( hr ) || !adec) { step = "CoCreateInstance(CMpegAudioCodec)"; goto out; }
+    }
+
+    if (stream_subtype)
+    {
+        stream_mt.majortype = MEDIATYPE_Stream;
+        stream_mt.subtype = *stream_subtype;
+        stream_mt.bFixedSizeSamples = TRUE;
+        stream_mt.bTemporalCompression = TRUE;
+        stream_mt.lSampleSize = 1;
+        stream_mt.formattype = k_guid_null;
+    }
 
     hr = IBaseFilter_QueryInterface( src, &IID_IFileSourceFilter, (void **)&fsf );
     if (FAILED( hr ) || !fsf) { step = "QueryInterface(IFileSourceFilter)"; goto out; }
-    hr = IFileSourceFilter_Load( fsf, g_paths.mpg_path, NULL );
+    hr = IFileSourceFilter_Load( fsf, clip_path, stream_subtype ? &stream_mt : NULL );
     if (FAILED( hr )) { step = "IFileSourceFilter::Load"; goto out; }
 
     if (FAILED( hr = IFilterGraph_AddFilter( fg, src, L"AsyncSrc" ) ) ||
         FAILED( hr = IFilterGraph_AddFilter( fg, splitter, L"MPEG1Splitter" ) ) ||
         FAILED( hr = IFilterGraph_AddFilter( fg, vdec, L"MPEGVideoDec" ) ) ||
-        FAILED( hr = IFilterGraph_AddFilter( fg, adec, L"MPEGAudioDec" ) ) ||
-        FAILED( hr = IFilterGraph_AddFilter( fg, &vsink->IBaseFilter_iface, L"RGB32Sink" ) ) ||
-        FAILED( hr = IFilterGraph_AddFilter( fg, &asink->IBaseFilter_iface, L"AudioSink" ) ))
+        FAILED( hr = IFilterGraph_AddFilter( fg, &vsink->IBaseFilter_iface, L"RGB32Sink" ) ))
     {
         step = "IFilterGraph::AddFilter";
+        goto out;
+    }
+    if (expect_audio &&
+        (FAILED( hr = IFilterGraph_AddFilter( fg, adec, L"MPEGAudioDec" ) ) ||
+         FAILED( hr = IFilterGraph_AddFilter( fg, &asink->IBaseFilter_iface, L"AudioSink" ) )))
+    {
+        step = "IFilterGraph::AddFilter(audio)";
         goto out;
     }
 
@@ -1946,41 +2050,58 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     sp_in = find_pin_by_dir( splitter, PINDIR_INPUT, 0 );
     if (!src_out || !sp_in) { step = "find AsyncReader/Splitter pins"; hr = E_FAIL; goto out; }
 
-    hr = IFilterGraph_ConnectDirect( fg, src_out, sp_in, NULL );
+    hr = IFilterGraph_ConnectDirect( fg, src_out, sp_in, stream_subtype ? &stream_mt : NULL );
     if (FAILED( hr )) { step = "ConnectDirect(AsyncReader->MPEG1Splitter)"; goto out; }
 
     sp_out0 = find_pin_by_dir( splitter, PINDIR_OUTPUT, 0 );
-    sp_out1 = find_pin_by_dir( splitter, PINDIR_OUTPUT, 1 );
     vdec_in = find_pin_by_dir( vdec, PINDIR_INPUT, 0 );
     vdec_out = find_pin_by_dir( vdec, PINDIR_OUTPUT, 0 );
-    adec_in = find_pin_by_dir( adec, PINDIR_INPUT, 0 );
-    adec_out = find_pin_by_dir( adec, PINDIR_OUTPUT, 0 );
-    if (!sp_out0 || !sp_out1 || !vdec_in || !vdec_out || !adec_in || !adec_out)
+    if (!sp_out0 || !vdec_in || !vdec_out)
     {
-        step = "find splitter/decoder pins";
+        step = "find splitter/video-decoder pins";
         hr = E_FAIL;
         goto out;
     }
 
-    /* Connect splitter outputs to the MPEG video and audio codecs via ConnectDirect. */
-    if (SUCCEEDED( IFilterGraph_ConnectDirect( fg, sp_out0, vdec_in, NULL ) ))
+    if (expect_audio)
     {
-        hr = IFilterGraph_ConnectDirect( fg, sp_out1, adec_in, NULL );
-        if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegAudioCodec)"; goto out; }
+        sp_out1 = find_pin_by_dir( splitter, PINDIR_OUTPUT, 1 );
+        adec_in = find_pin_by_dir( adec, PINDIR_INPUT, 0 );
+        adec_out = find_pin_by_dir( adec, PINDIR_OUTPUT, 0 );
+        if (!sp_out1 || !adec_in || !adec_out)
+        {
+            step = "find splitter/audio-decoder pins";
+            hr = E_FAIL;
+            goto out;
+        }
+
+        if (SUCCEEDED( IFilterGraph_ConnectDirect( fg, sp_out0, vdec_in, NULL ) ))
+        {
+            hr = IFilterGraph_ConnectDirect( fg, sp_out1, adec_in, NULL );
+            if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegAudioCodec)"; goto out; }
+        }
+        else
+        {
+            hr = IFilterGraph_ConnectDirect( fg, sp_out1, vdec_in, NULL );
+            if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegVideoCodec)"; goto out; }
+            hr = IFilterGraph_ConnectDirect( fg, sp_out0, adec_in, NULL );
+            if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegAudioCodec)"; goto out; }
+        }
     }
     else
     {
-        hr = IFilterGraph_ConnectDirect( fg, sp_out1, vdec_in, NULL );
+        hr = IFilterGraph_ConnectDirect( fg, sp_out0, vdec_in, NULL );
         if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegVideoCodec)"; goto out; }
-        hr = IFilterGraph_ConnectDirect( fg, sp_out0, adec_in, NULL );
-        if (FAILED( hr )) { step = "ConnectDirect(splitter->CMpegAudioCodec)"; goto out; }
     }
 
     hr = IFilterGraph_ConnectDirect( fg, vdec_out, &vsink->IPin_iface, NULL );
     if (FAILED( hr )) { step = "ConnectDirect(CMpegVideoCodec->RGB32BottomUpSink)"; goto out; }
 
-    hr = IFilterGraph_ConnectDirect( fg, adec_out, &asink->IPin_iface, NULL );
-    if (FAILED( hr )) { step = "ConnectDirect(CMpegAudioCodec->AudioSink)"; goto out; }
+    if (expect_audio)
+    {
+        hr = IFilterGraph_ConnectDirect( fg, adec_out, &asink->IPin_iface, NULL );
+        if (FAILED( hr )) { step = "ConnectDirect(CMpegAudioCodec->AudioSink)"; goto out; }
+    }
 
     /* Verify size and bottom-up orientation from the connection's media type. */
     hr = IPin_ConnectionMediaType( &vsink->IPin_iface, &cmt );
@@ -2008,7 +2129,12 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     if (FAILED( hr ) || !ss) { step = "QueryInterface(IAMStreamSelect)"; goto out; }
 
     hr = IAMStreamSelect_Count( ss, &ss_count );
-    if (FAILED( hr ) || ss_count != 2) { step = "IAMStreamSelect::Count!=2"; if (SUCCEEDED( hr )) hr = E_FAIL; goto out; }
+    if (FAILED( hr ) || ss_count != expect_streams)
+    {
+        step = "IAMStreamSelect::Count mismatch";
+        if (SUCCEEDED( hr )) hr = E_FAIL;
+        goto out;
+    }
 
     for (i = 0; i < ss_count; i++)
     {
@@ -2036,7 +2162,7 @@ static BOOL run_path2_kirikiri_mpeg1( void )
         }
         delete_media_type( info_mt );
     }
-    if (!ss_saw_video || !ss_saw_audio)
+    if (!ss_saw_video || (expect_audio && !ss_saw_audio))
     {
         step = "IAMStreamSelect::Info video/audio metadata";
         hr = E_FAIL;
@@ -2063,8 +2189,9 @@ static BOOL run_path2_kirikiri_mpeg1( void )
 
     frames1 = vsink->frames;
     crc1 = vsink->crc;
-    pcm1 = asink->pcm_frames;
-    if (frames1 < SELFTEST_CLIP_FRAMES - 5u || vsink->nonblack_frames != frames1 || pcm1 < SELFTEST_AUDIO_RATE)
+    pcm1 = asink ? asink->pcm_frames : 0u;
+    if (frames1 < SELFTEST_CLIP_FRAMES - 5u || vsink->nonblack_frames != frames1 ||
+        (expect_audio && pcm1 < SELFTEST_AUDIO_RATE))
     {
         step = "pass1 frame/PCM counts";
         hr = E_FAIL;
@@ -2075,7 +2202,7 @@ static BOOL run_path2_kirikiri_mpeg1( void )
     hr = IMediaControl_Pause( mc );
     if (FAILED( hr )) { step = "IMediaControl::Pause"; goto out; }
     reset_sink_stats( vsink );
-    reset_sink_stats( asink );
+    if (asink) reset_sink_stats( asink );
 
     hr = IMediaPosition_put_CurrentPosition( mp, 0.0 );
     if (FAILED( hr )) { step = "IMediaPosition::put_CurrentPosition(0)"; goto out; }
@@ -2088,8 +2215,9 @@ static BOOL run_path2_kirikiri_mpeg1( void )
 
     frames2 = vsink->frames;
     crc2 = vsink->crc;
-    pcm2 = asink->pcm_frames;
-    if (frames2 < SELFTEST_CLIP_FRAMES - 5u || vsink->nonblack_frames != frames2 || pcm2 < SELFTEST_AUDIO_RATE)
+    pcm2 = asink ? asink->pcm_frames : 0u;
+    if (frames2 < SELFTEST_CLIP_FRAMES - 5u || vsink->nonblack_frames != frames2 ||
+        (expect_audio && pcm2 < SELFTEST_AUDIO_RATE))
     {
         step = "pass2 frame/PCM counts after rewind";
         hr = E_FAIL;
@@ -2124,7 +2252,10 @@ out:
 
     if (ok)
     {
-        write_str( "[2/6] PASS kirikiri-mpeg1: size=" );
+        write_str( tag_prefix );
+        write_str( " PASS " );
+        write_str( path_name );
+        write_str( ": size=" );
         write_int( conn_w );
         write_str( "x" );
         write_int( conn_h );
@@ -2134,10 +2265,13 @@ out:
         write_uint( frames1 );
         write_str( " pass2_frames=" );
         write_uint( frames2 );
-        write_str( " pcm_frames=" );
-        write_uint( pcm1 );
-        write_str( "/" );
-        write_uint( pcm2 );
+        if (expect_audio)
+        {
+            write_str( " pcm_frames=" );
+            write_uint( pcm1 );
+            write_str( "/" );
+            write_uint( pcm2 );
+        }
         write_str( " rgb_crc=" );
         write_hex32( crc1 );
         write_str( "/" );
@@ -2146,7 +2280,10 @@ out:
     }
     else
     {
-        write_str( "[2/6] FAIL kirikiri-mpeg1: step=" );
+        write_str( tag_prefix );
+        write_str( " FAIL " );
+        write_str( path_name );
+        write_str( ": step=" );
         write_str( step );
         write_str( " hr=" );
         write_hex32( (DWORD)hr );
@@ -2160,40 +2297,258 @@ out:
     return ok;
 }
 
+static BOOL run_path2_kirikiri_mpeg1( void )
+{
+    return run_kirikiri_mpeg_graph( "[2/10]", "kirikiri-mpeg1", g_paths.mpg_path, NULL, TRUE );
+}
+
 /* =========================================================================
- * PATH 3: DirectShow RenderFile on MPEG-1 in a hidden window -> EC_COMPLETE
+ * PATHS 3 & 7: DirectShow RenderFile in a visible window + GDI client read
+ *
+ * Wine's default DirectShow video renderer (`CLSID_VideoRendererDefault`,
+ * `wine/dlls/quartz/videorenderer.c:504`) creates the VMR-7 (`vmr7.c`).
+ * VMR-7's `IBasicVideo::GetCurrentImage` (`vmr_get_current_image`,
+ * `vmr7.c:571`) is a stub returning `E_NOTIMPL`, and its DirectDraw clipper
+ * (`vmr7_presenter.c:393`, `ddraw/surface.c:1686`) skips blitting altogether
+ * when the window has no visible region (`WS_VISIBLE` unset). So we attach
+ * `IVideoWindow` to a visible popup window, pre-clear the window client area
+ * to black with GDI `PatBlt(..., BLACKNESS)` (because Wine's `dce.c`
+ * initialises new window surfaces to `0xff` solid white), read the client
+ * area back via `BitBlt` into a 32bpp `DIBSection` while the graph runs, and
+ * require a colourful non-black video frame AND `EC_COMPLETE` to pass.
+ *
+ * `gdi32.dll` is loaded via `LoadLibraryA` + `GetProcAddress` so the PE's
+ * static import table stays restricted to the 7 core/MF/WinMM DLLs.
  * ========================================================================= */
 
-static BOOL run_path3_dshow_renderfile( void )
+typedef HDC     (WINAPI *pfn_CreateCompatibleDC)( HDC );
+typedef HBITMAP (WINAPI *pfn_CreateDIBSection)( HDC, const BITMAPINFO *, UINT, void **, HANDLE, DWORD );
+typedef HGDIOBJ (WINAPI *pfn_SelectObject)( HDC, HGDIOBJ );
+typedef BOOL    (WINAPI *pfn_BitBlt)( HDC, int, int, int, int, HDC, int, int, DWORD );
+typedef BOOL    (WINAPI *pfn_PatBlt)( HDC, int, int, int, int, DWORD );
+typedef BOOL    (WINAPI *pfn_DeleteDC)( HDC );
+typedef BOOL    (WINAPI *pfn_DeleteObject)( HGDIOBJ );
+typedef BOOL    (WINAPI *pfn_GdiFlush)( void );
+
+struct gdi32_api
 {
-    HWND hwnd = NULL;
+    HMODULE mod;
+    pfn_CreateCompatibleDC pCreateCompatibleDC;
+    pfn_CreateDIBSection pCreateDIBSection;
+    pfn_SelectObject pSelectObject;
+    pfn_BitBlt pBitBlt;
+    pfn_PatBlt pPatBlt;
+    pfn_DeleteDC pDeleteDC;
+    pfn_DeleteObject pDeleteObject;
+    pfn_GdiFlush pGdiFlush;
+};
+
+static BOOL load_gdi32_api( struct gdi32_api *g )
+{
+    memset( g, 0, sizeof(*g) );
+    g->mod = LoadLibraryA( "gdi32.dll" );
+    if (!g->mod) return FALSE;
+
+    g->pCreateCompatibleDC = (pfn_CreateCompatibleDC)(void *)GetProcAddress( g->mod, "CreateCompatibleDC" );
+    g->pCreateDIBSection   = (pfn_CreateDIBSection)(void *)GetProcAddress( g->mod, "CreateDIBSection" );
+    g->pSelectObject       = (pfn_SelectObject)(void *)GetProcAddress( g->mod, "SelectObject" );
+    g->pBitBlt             = (pfn_BitBlt)(void *)GetProcAddress( g->mod, "BitBlt" );
+    g->pPatBlt             = (pfn_PatBlt)(void *)GetProcAddress( g->mod, "PatBlt" );
+    g->pDeleteDC           = (pfn_DeleteDC)(void *)GetProcAddress( g->mod, "DeleteDC" );
+    g->pDeleteObject       = (pfn_DeleteObject)(void *)GetProcAddress( g->mod, "DeleteObject" );
+    g->pGdiFlush           = (pfn_GdiFlush)(void *)GetProcAddress( g->mod, "GdiFlush" );
+
+    if (!g->pCreateCompatibleDC || !g->pCreateDIBSection || !g->pSelectObject ||
+        !g->pBitBlt || !g->pPatBlt || !g->pDeleteDC || !g->pDeleteObject)
+    {
+        FreeLibrary( g->mod );
+        memset( g, 0, sizeof(*g) );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void unload_gdi32_api( struct gdi32_api *g )
+{
+    if (g->mod)
+    {
+        FreeLibrary( g->mod );
+        g->mod = NULL;
+    }
+}
+
+static void clear_window_black( const struct gdi32_api *g, HWND w )
+{
+    HDC dc;
+    if (!w) return;
+    dc = GetDC( w );
+    if (dc)
+    {
+        g->pPatBlt( dc, 0, 0, SELFTEST_CLIP_W, SELFTEST_CLIP_H, BLACKNESS );
+        ReleaseDC( w, dc );
+    }
+}
+
+static BOOL capture_window_picture( const struct gdi32_api *g, HWND owner_hwnd, HWND child_hwnd,
+                                    HDC mem_dc, BYTE *dib_bits,
+                                    DWORD *io_best_nonblack, DWORD *out_crc )
+{
+    HWND candidates[2];
+    int c;
+
+    candidates[0] = child_hwnd ? child_hwnd : owner_hwnd;
+    candidates[1] = owner_hwnd;
+
+    for (c = 0; c < 2; c++)
+    {
+        HWND target = candidates[c];
+        HDC src_dc;
+        if (!target || (c == 1 && candidates[1] == candidates[0])) continue;
+
+        memset( dib_bits, 0, SELFTEST_CLIP_W * SELFTEST_CLIP_H * 4u );
+        src_dc = GetDC( target );
+        if (src_dc)
+        {
+            BOOL blt_ok = g->pBitBlt( mem_dc, 0, 0, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                      src_dc, 0, 0, SRCCOPY );
+            ReleaseDC( target, src_dc );
+            if (g->pGdiFlush) g->pGdiFlush();
+            if (blt_ok)
+            {
+                DWORD crc = FNV1A_INIT;
+                DWORD nb = hash_rgb32_and_check_nonblack( dib_bits, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                                          (LONG)(SELFTEST_CLIP_W * 4u), &crc );
+                DWORD chrom = count_rgb32_chromatic( dib_bits, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                                     (LONG)(SELFTEST_CLIP_W * 4u) );
+                if (nb > *io_best_nonblack && chrom > 0u) *io_best_nonblack = nb;
+                if (nb > (SELFTEST_CLIP_W * SELFTEST_CLIP_H) / 4u &&
+                    chrom > (SELFTEST_CLIP_W * SELFTEST_CLIP_H) / 8u)
+                {
+                    *io_best_nonblack = nb;
+                    *out_crc = crc;
+                    return TRUE;
+                }
+            }
+        }
+    }
+
+    /* A last resort: the screen at the window's place. ddraw draws there only while it has no
+     * swapchain window; the VMR-7's clipper gives it the video window, so its frames normally
+     * reach that window's DC, read above. */
+    {
+        HWND ref_wnd = child_hwnd ? child_hwnd : owner_hwnd;
+        POINT pt = { 0, 0 };
+        HDC screen_dc;
+        if (ref_wnd && ClientToScreen( ref_wnd, &pt ))
+        {
+            memset( dib_bits, 0, SELFTEST_CLIP_W * SELFTEST_CLIP_H * 4u );
+            screen_dc = GetDC( NULL );
+            if (screen_dc)
+            {
+                BOOL blt_ok = g->pBitBlt( mem_dc, 0, 0, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                          screen_dc, pt.x, pt.y, SRCCOPY );
+                ReleaseDC( NULL, screen_dc );
+                if (g->pGdiFlush) g->pGdiFlush();
+                if (blt_ok)
+                {
+                    DWORD crc = FNV1A_INIT;
+                    DWORD nb = hash_rgb32_and_check_nonblack( dib_bits, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                                              (LONG)(SELFTEST_CLIP_W * 4u), &crc );
+                    DWORD chrom = count_rgb32_chromatic( dib_bits, SELFTEST_CLIP_W, SELFTEST_CLIP_H,
+                                                         (LONG)(SELFTEST_CLIP_W * 4u) );
+                    if (nb > *io_best_nonblack && chrom > 0u) *io_best_nonblack = nb;
+                    if (nb > (SELFTEST_CLIP_W * SELFTEST_CLIP_H) / 4u &&
+                        chrom > (SELFTEST_CLIP_W * SELFTEST_CLIP_H) / 8u)
+                    {
+                        *io_best_nonblack = nb;
+                        *out_crc = crc;
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOL run_dshow_renderfile_visible( const char *tag_prefix, const char *path_name,
+                                          const WCHAR *clip_path )
+{
+    struct gdi32_api gdi;
+    HWND hwnd = NULL, child_hwnd = NULL;
+    HDC mem_dc = NULL;
+    HBITMAP dib_bmp = NULL;
+    HGDIOBJ old_obj = NULL;
+    BYTE *dib_bits = NULL;
     IGraphBuilder *gb = NULL;
     IVideoWindow *vw = NULL;
+    IBasicVideo *bv = NULL;
     IMediaControl *mc = NULL;
     IMediaEvent *me = NULL;
-    LONG ev_code = 0;
-    DWORD t0 = GetTickCount(), elapsed_ms = 0;
+    LONG ev_code = 0, bv_size = 0;
+    HRESULT bv_hr = E_NOTIMPL;
+    DWORD t0 = GetTickCount(), elapsed_ms = 0, waited = 0;
+    DWORD best_nonblack = 0, pic_crc = FNV1A_INIT;
+    BOOL got_picture = FALSE, got_complete = FALSE;
     const char *step = "init";
     HRESULT hr = S_OK;
     BOOL ok = FALSE;
 
-    /* Hidden window (no WS_VISIBLE). */
-    hwnd = create_test_window( FALSE );
-    if (!hwnd) { step = "CreateWindowExW(hidden)"; hr = HRESULT_FROM_WIN32( GetLastError() ); goto out; }
+    if (!load_gdi32_api( &gdi ))
+    {
+        step = "LoadLibrary(gdi32.dll)";
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        goto out;
+    }
+
+    hwnd = create_test_window( TRUE );
+    if (!hwnd) { step = "CreateWindowExW(visible)"; hr = HRESULT_FROM_WIN32( GetLastError() ); goto out; }
+    ShowWindow( hwnd, SW_SHOWNORMAL );
+    UpdateWindow( hwnd );
+    pump_messages();
+
+    {
+        BITMAPINFO bmi;
+        memset( &bmi, 0, sizeof(bmi) );
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = SELFTEST_CLIP_W;
+        bmi.bmiHeader.biHeight = -SELFTEST_CLIP_H; /* top-down 32bpp RGB */
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        mem_dc = gdi.pCreateCompatibleDC( NULL );
+        if (!mem_dc) { step = "CreateCompatibleDC"; hr = E_FAIL; goto out; }
+        dib_bmp = gdi.pCreateDIBSection( mem_dc, &bmi, DIB_RGB_COLORS, (void **)&dib_bits, NULL, 0 );
+        if (!dib_bmp || !dib_bits) { step = "CreateDIBSection"; hr = E_OUTOFMEMORY; goto out; }
+        old_obj = gdi.pSelectObject( mem_dc, (HGDIOBJ)dib_bmp );
+    }
 
     hr = CoCreateInstance( &CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER, &IID_IGraphBuilder, (void **)&gb );
     if (FAILED( hr ) || !gb) { step = "CoCreateInstance(IGraphBuilder)"; goto out; }
 
-    hr = IGraphBuilder_RenderFile( gb, g_paths.mpg_path, NULL );
+    hr = IGraphBuilder_RenderFile( gb, clip_path, NULL );
     if (FAILED( hr )) { step = "IGraphBuilder::RenderFile"; goto out; }
+
+    /* Record IBasicVideo::GetCurrentImage status (E_NOTIMPL on VMR-7). */
+    if (SUCCEEDED( IGraphBuilder_QueryInterface( gb, &IID_IBasicVideo, (void **)&bv ) ) && bv)
+        bv_hr = IBasicVideo_GetCurrentImage( bv, &bv_size, NULL );
 
     if (SUCCEEDED( IGraphBuilder_QueryInterface( gb, &IID_IVideoWindow, (void **)&vw ) ) && vw)
     {
         IVideoWindow_put_Owner( vw, (OAHWND)(ULONG_PTR)hwnd );
-        IVideoWindow_put_WindowStyle( vw, WS_CHILD | WS_CLIPSIBLINGS );
+        IVideoWindow_put_WindowStyle( vw, WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE );
         IVideoWindow_SetWindowPosition( vw, 0, 0, SELFTEST_CLIP_W, SELFTEST_CLIP_H );
-        IVideoWindow_put_Visible( vw, OAFALSE );
+        IVideoWindow_put_Visible( vw, OATRUE );
     }
+    pump_messages();
+    child_hwnd = FindWindowExW( hwnd, NULL, NULL, NULL );
+
+    /* Clear both owner and child surfaces to black before Run so Wine's default
+     * 0xff white window_surface cannot masquerade as a decoded frame. */
+    clear_window_black( &gdi, hwnd );
+    clear_window_black( &gdi, child_hwnd );
+    if (gdi.pGdiFlush) gdi.pGdiFlush();
 
     if (FAILED( hr = IGraphBuilder_QueryInterface( gb, &IID_IMediaControl, (void **)&mc ) ) ||
         FAILED( hr = IGraphBuilder_QueryInterface( gb, &IID_IMediaEvent, (void **)&me ) ))
@@ -2205,9 +2560,50 @@ static BOOL run_path3_dshow_renderfile( void )
     hr = IMediaControl_Run( mc );
     if (FAILED( hr )) { step = "IMediaControl::Run"; goto out; }
 
-    hr = wait_dshow_completion( me, 20000u, &ev_code );
+    while (waited < 20000u)
+    {
+        HRESULT whr;
+        pump_messages();
+        if (!child_hwnd) child_hwnd = FindWindowExW( hwnd, NULL, NULL, NULL );
+
+        if (!got_picture && waited >= 80u)
+        {
+            if (capture_window_picture( &gdi, hwnd, child_hwnd, mem_dc, dib_bits,
+                                        &best_nonblack, &pic_crc ))
+                got_picture = TRUE;
+        }
+
+        whr = IMediaEvent_WaitForCompletion( me, 25, &ev_code );
+        if (whr != E_ABORT)
+        {
+            hr = whr;
+            got_complete = (SUCCEEDED( whr ) && ev_code == EC_COMPLETE);
+            break;
+        }
+        waited += 25u;
+    }
+
+    if (!got_picture)
+    {
+        pump_messages();
+        if (capture_window_picture( &gdi, hwnd, child_hwnd, mem_dc, dib_bits,
+                                    &best_nonblack, &pic_crc ))
+            got_picture = TRUE;
+    }
+
     elapsed_ms = GetTickCount() - t0;
-    if (FAILED( hr ) || ev_code != EC_COMPLETE) { step = "WaitForCompletion(EC_COMPLETE)"; goto out; }
+    if (!got_complete)
+    {
+        step = "WaitForCompletion(EC_COMPLETE)";
+        if (SUCCEEDED( hr )) hr = E_ABORT;
+        goto out;
+    }
+    if (!got_picture)
+    {
+        step = "video window client area stayed black (GDI BitBlt)";
+        hr = E_FAIL;
+        goto out;
+    }
     ok = TRUE;
 
 out:
@@ -2218,29 +2614,57 @@ out:
         IVideoWindow_put_Owner( vw, 0 );
         IVideoWindow_Release( vw );
     }
+    if (bv) IBasicVideo_Release( bv );
     if (me) IMediaEvent_Release( me );
     if (mc) IMediaControl_Release( mc );
     if (gb) IGraphBuilder_Release( gb );
+    if (old_obj && mem_dc) gdi.pSelectObject( mem_dc, old_obj );
+    if (dib_bmp) gdi.pDeleteObject( (HGDIOBJ)dib_bmp );
+    if (mem_dc) gdi.pDeleteDC( mem_dc );
     if (hwnd) DestroyWindow( hwnd );
+    unload_gdi32_api( &gdi );
 
     if (ok)
     {
-        write_str( "[3/6] PASS dshow-renderfile-mpeg: event=EC_COMPLETE elapsed=" );
+        write_str( tag_prefix );
+        write_str( " PASS " );
+        write_str( path_name );
+        write_str( ": event=EC_COMPLETE size=" );
+        write_uint( SELFTEST_CLIP_W );
+        write_str( "x" );
+        write_uint( SELFTEST_CLIP_H );
+        write_str( " nonblack_px=" );
+        write_uint( best_nonblack );
+        write_str( " rgb_crc=" );
+        write_hex32( pic_crc );
+        write_str( " elapsed=" );
         write_uint( elapsed_ms );
         write_str( "ms\n" );
     }
     else
     {
-        write_str( "[3/6] FAIL dshow-renderfile-mpeg: step=" );
+        write_str( tag_prefix );
+        write_str( " FAIL " );
+        write_str( path_name );
+        write_str( ": step=" );
         write_str( step );
         write_str( " hr=" );
         write_hex32( (DWORD)hr );
         write_str( " ev_code=" );
         write_int( ev_code );
+        write_str( " nonblack_px=" );
+        write_uint( best_nonblack );
+        write_str( " bv_img_hr=" );
+        write_hex32( (DWORD)bv_hr );
         write_str( "\n" );
     }
     flush_log();
     return ok;
+}
+
+static BOOL run_path3_dshow_renderfile( void )
+{
+    return run_dshow_renderfile_visible( "[3/10]", "dshow-renderfile-mpeg", g_paths.mpg_path );
 }
 
 /* =========================================================================
@@ -2559,7 +2983,7 @@ out:
 
     if (ok)
     {
-        write_str( "[4/6] PASS mf-session-evr-sar: ended=1 image=" );
+        write_str( "[4/10] PASS mf-session-evr-sar: ended=1 image=" );
         write_int( img_w );
         write_str( "x" );
         write_int( img_h );
@@ -2575,7 +2999,7 @@ out:
     }
     else
     {
-        write_str( "[4/6] FAIL mf-session-evr-sar: step=" );
+        write_str( "[4/10] FAIL mf-session-evr-sar: step=" );
         write_str( step );
         write_str( " hr=" );
         write_hex32( (DWORD)hr );
@@ -2592,7 +3016,7 @@ out:
 }
 
 /* =========================================================================
- * PATH 5: Media Foundation Source Reader -> RGB32
+ * PATH 5: Media Foundation Source Reader -> RGB32 (native 320x240)
  * ========================================================================= */
 
 static BOOL run_path5_mf_source_reader( void )
@@ -2701,7 +3125,7 @@ out:
 
     if (ok)
     {
-        write_str( "[5/6] PASS mf-source-reader: frames=" );
+        write_str( "[5/10] PASS mf-source-reader: frames=" );
         write_uint( frames );
         write_str( " size=" );
         write_uint( sr_w );
@@ -2713,7 +3137,7 @@ out:
     }
     else
     {
-        write_str( "[5/6] FAIL mf-source-reader: step=" );
+        write_str( "[5/10] FAIL mf-source-reader: step=" );
         write_str( step );
         write_str( " hr=" );
         write_hex32( (DWORD)hr );
@@ -2813,7 +3237,7 @@ out:
 
     if (ok)
     {
-        write_str( "[6/6] PASS mci-mpeg: notify=" );
+        write_str( "[6/10] PASS mci-mpeg: notify=" );
         write_uint( (DWORD)g_mci_notify_code );
         write_str( " elapsed=" );
         write_uint( elapsed_ms );
@@ -2821,10 +3245,211 @@ out:
     }
     else
     {
-        write_str( "[6/6] FAIL mci-mpeg: step=" );
+        write_str( "[6/10] FAIL mci-mpeg: step=" );
         write_str( step );
         write_str( " mci_err=" );
         write_uint( (DWORD)err );
+        write_str( "\n" );
+    }
+    flush_log();
+    return ok;
+}
+
+/* =========================================================================
+ * PATH 7: DirectShow RenderFile on AVI (MPEG-4 Xvid + IMA ADPCM)
+ * ========================================================================= */
+
+static BOOL run_path7_dshow_renderfile_avi( void )
+{
+    return run_dshow_renderfile_visible( "[7/10]", "dshow-renderfile-avi", g_paths.avi_path );
+}
+
+/* =========================================================================
+ * PATH 8: KiriKiri raw .m1v graph (MEDIATYPE_Stream / MEDIASUBTYPE_MPEG1Video)
+ * ========================================================================= */
+
+static BOOL run_path8_kirikiri_m1v( void )
+{
+    return run_kirikiri_mpeg_graph( "[8/10]", "kirikiri-m1v", g_paths.m1v_path,
+                                    &MEDIASUBTYPE_MPEG1Video, FALSE );
+}
+
+/* =========================================================================
+ * PATH 9: KiriKiri VideoCD .dat graph (MEDIATYPE_Stream / MEDIASUBTYPE_MPEG1VideoCD)
+ * ========================================================================= */
+
+static BOOL run_path9_kirikiri_vcd_dat( void )
+{
+    return run_kirikiri_mpeg_graph( "[9/10]", "kirikiri-vcd-dat", g_paths.dat_path,
+                                    &MEDIASUBTYPE_MPEG1VideoCD, TRUE );
+}
+
+/* =========================================================================
+ * PATH 10: Media Foundation Source Reader -> RGB32 resized (320x240 -> 160x120)
+ *
+ * In `wine/dlls/mfreadwrite/reader.c`:
+ *   - `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING` alone (`advanced == FALSE`)
+ *     calls `update_media_type(..., advanced=FALSE)` (`reader.c:741-742`),
+ *     which copies the source's `MF_MT_DEFAULT_STRIDE` (1280 for 320px RGB32)
+ *     onto the requested resized media type before configuring the MFT.
+ *   - `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING` (`advanced == TRUE`,
+ *     `reader.c:2324, 3078`) instantiates `CLSID_VideoProcessorMFT` (`msvproc`
+ *     -> `winegstreamer`'s `video_processor.c` -> Madeira's `"video converter"`
+ *     `wg_transform`) and skips copying the source's `MF_MT_DEFAULT_STRIDE`
+ *     so `video_processor.c` normalises stride for the requested frame size.
+ *   - Downscaling (`320x240 -> 160x120`) avoids `video_processor.c:113`'s
+ *     unscaled `MinimumDisplayAperture` copy (`min(320, 160) == 160`), so
+ *     every output sample is genuinely scaled to 160x120 RGB32 (76,800 bytes).
+ * ========================================================================= */
+
+static BOOL run_path10_mf_source_reader_resize( void )
+{
+    BOOL mf_started = FALSE;
+    IMFAttributes *attrs = NULL;
+    IMFSourceReader *sreader = NULL;
+    IMFMediaType *want_mt = NULL, *cur_mt = NULL;
+    UINT64 want_size = (((UINT64)SELFTEST_RESIZE_W) << 32) | (UINT64)SELFTEST_RESIZE_H;
+    UINT64 frame_size = 0;
+    UINT32 stride_u32 = 0;
+    LONG sr_stride = (LONG)(SELFTEST_RESIZE_W * 4u);
+    DWORD sr_w = 0, sr_h = 0, frames = 0, nonblack_frames = 0, chromatic_frames = 0, crc = FNV1A_INIT;
+    const char *step = "init";
+    HRESULT hr = S_OK;
+    BOOL ok = FALSE;
+
+    hr = MFStartup( MF_VERSION, MFSTARTUP_FULL );
+    if (FAILED( hr )) { step = "MFStartup"; goto out; }
+    mf_started = TRUE;
+
+    hr = MFCreateAttributes( &attrs, 1 );
+    if (FAILED( hr ) || !attrs) { step = "MFCreateAttributes"; goto out; }
+    IMFAttributes_SetUINT32( attrs, &MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE );
+
+    hr = MFCreateSourceReaderFromURL( g_paths.wmv_url, attrs, &sreader );
+    if (FAILED( hr ))
+        hr = MFCreateSourceReaderFromURL( g_paths.wmv_path, attrs, &sreader );
+    if (FAILED( hr ) || !sreader) { step = "MFCreateSourceReaderFromURL"; goto out; }
+
+    IMFSourceReader_SetStreamSelection( sreader, MF_SOURCE_READER_ALL_STREAMS, FALSE );
+    hr = IMFSourceReader_SetStreamSelection( sreader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE );
+    if (FAILED( hr )) { step = "SetStreamSelection(video)"; goto out; }
+
+    hr = MFCreateMediaType( &want_mt );
+    if (FAILED( hr ) || !want_mt) { step = "MFCreateMediaType"; goto out; }
+    IMFMediaType_SetGUID( want_mt, &MF_MT_MAJOR_TYPE, &MFMediaType_Video );
+    IMFMediaType_SetGUID( want_mt, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32 );
+    IMFMediaType_SetUINT64( want_mt, &MF_MT_FRAME_SIZE, want_size );
+
+    hr = IMFSourceReader_SetCurrentMediaType( sreader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, want_mt );
+    if (FAILED( hr )) { step = "SetCurrentMediaType(RGB32 160x120)"; goto out; }
+
+    hr = IMFSourceReader_GetCurrentMediaType( sreader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur_mt );
+    if (FAILED( hr ) || !cur_mt) { step = "GetCurrentMediaType"; goto out; }
+    if (SUCCEEDED( IMFMediaType_GetUINT64( cur_mt, &MF_MT_FRAME_SIZE, &frame_size ) ))
+    {
+        sr_w = (DWORD)(frame_size >> 32);
+        sr_h = (DWORD)frame_size;
+    }
+    if (sr_w != SELFTEST_RESIZE_W || sr_h != SELFTEST_RESIZE_H)
+    {
+        step = "GetCurrentMediaType did not report resized 160x120";
+        hr = E_FAIL;
+        goto out;
+    }
+    if (SUCCEEDED( IMFMediaType_GetUINT32( cur_mt, &MF_MT_DEFAULT_STRIDE, &stride_u32 ) ))
+    {
+        LONG s = (LONG)stride_u32;
+        DWORD abs_s = (s < 0) ? (DWORD)(-s) : (DWORD)s;
+        if (abs_s >= sr_w * 4u) sr_stride = s;
+    }
+
+    for (;;)
+    {
+        DWORD stream_idx = 0, sr_flags = 0;
+        LONGLONG ts = 0;
+        IMFSample *sample = NULL;
+
+        hr = IMFSourceReader_ReadSample( sreader, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                         0, &stream_idx, &sr_flags, &ts, &sample );
+        if (FAILED( hr )) { step = "IMFSourceReader::ReadSample"; goto out; }
+        if (sr_flags & MF_SOURCE_READERF_ERROR)
+        {
+            if (sample) IMFSample_Release( sample );
+            step = "MF_SOURCE_READERF_ERROR";
+            hr = E_FAIL;
+            goto out;
+        }
+        if (sample)
+        {
+            IMFMediaBuffer *buf = NULL;
+            BYTE *ptr = NULL;
+            DWORD max_len = 0, cur_len = 0;
+
+            if (SUCCEEDED( IMFSample_ConvertToContiguousBuffer( sample, &buf ) ) && buf)
+            {
+                if (SUCCEEDED( IMFMediaBuffer_Lock( buf, &ptr, &max_len, &cur_len ) ) && ptr)
+                {
+                    DWORD abs_stride = (sr_stride < 0) ? (DWORD)(-sr_stride) : (DWORD)sr_stride;
+                    if (cur_len >= abs_stride * sr_h &&
+                        cur_len < SELFTEST_CLIP_W * SELFTEST_CLIP_H * 4u)
+                    {
+                        DWORD nb = hash_rgb32_and_check_nonblack( ptr, sr_w, sr_h, sr_stride, &crc );
+                        DWORD ch = count_rgb32_chromatic( ptr, sr_w, sr_h, sr_stride );
+                        frames++;
+                        if (nb > (sr_w * sr_h) / 4u) nonblack_frames++;
+                        if (ch > (sr_w * sr_h) / 8u) chromatic_frames++;
+                    }
+                    IMFMediaBuffer_Unlock( buf );
+                }
+                IMFMediaBuffer_Release( buf );
+            }
+            IMFSample_Release( sample );
+        }
+        if (sr_flags & MF_SOURCE_READERF_ENDOFSTREAM)
+            break;
+    }
+
+    if (frames < SELFTEST_CLIP_FRAMES - 5u || nonblack_frames != frames || chromatic_frames != frames)
+    {
+        step = "resized RGB32 160x120 frame count/non-black/chromatic check";
+        hr = E_FAIL;
+        goto out;
+    }
+    ok = TRUE;
+
+out:
+    if (cur_mt) IMFMediaType_Release( cur_mt );
+    if (want_mt) IMFMediaType_Release( want_mt );
+    if (sreader) IMFSourceReader_Release( sreader );
+    if (attrs) IMFAttributes_Release( attrs );
+    if (mf_started) MFShutdown();
+
+    if (ok)
+    {
+        write_str( "[10/10] PASS mf-source-reader-resize: frames=" );
+        write_uint( frames );
+        write_str( " size=" );
+        write_uint( sr_w );
+        write_str( "x" );
+        write_uint( sr_h );
+        write_str( " rgb_crc=" );
+        write_hex32( crc );
+        write_str( "\n" );
+    }
+    else
+    {
+        write_str( "[10/10] FAIL mf-source-reader-resize: step=" );
+        write_str( step );
+        write_str( " hr=" );
+        write_hex32( (DWORD)hr );
+        write_str( " size=" );
+        write_uint( sr_w );
+        write_str( "x" );
+        write_uint( sr_h );
+        write_str( " frames=" );
+        write_uint( frames );
+        write_str( " nonblack=" );
+        write_uint( nonblack_frames );
         write_str( "\n" );
     }
     flush_log();
@@ -2844,8 +3469,18 @@ static DWORD WINAPI watchdog_thread( LPVOID param )
     write_uint( (DWORD)InterlockedCompareExchange( &g_current_stage, 0, 0 ) );
     write_str( "\n" );
     flush_log();
-    ExitProcess( 6 );
+    ExitProcess( SELFTEST_TOTAL_PATHS );
     return 0;
+}
+
+static void log_staged_clip( const char *label, const WCHAR *path, const char *origin )
+{
+    write_str( label );
+    write_str( ": " );
+    write_wstr( path );
+    write_str( " (" );
+    write_str( origin );
+    write_str( ")\n" );
 }
 
 void __cdecl start( void )
@@ -2866,7 +3501,13 @@ void __cdecl start( void )
     if (!stage_clip( L"video-selftest.wmv", selftest_wmv_bytes, (DWORD)sizeof(selftest_wmv_bytes),
                      g_paths.wmv_path, &g_paths.wmv_origin ) ||
         !stage_clip( L"video-selftest.mpg", selftest_mpg_bytes, (DWORD)sizeof(selftest_mpg_bytes),
-                     g_paths.mpg_path, &g_paths.mpg_origin ))
+                     g_paths.mpg_path, &g_paths.mpg_origin ) ||
+        !stage_clip( L"video-selftest.avi", selftest_avi_bytes, (DWORD)sizeof(selftest_avi_bytes),
+                     g_paths.avi_path, &g_paths.avi_origin ) ||
+        !stage_clip( L"video-selftest.m1v", selftest_m1v_bytes, (DWORD)sizeof(selftest_m1v_bytes),
+                     g_paths.m1v_path, &g_paths.m1v_origin ) ||
+        !stage_clip( L"video-selftest.dat", selftest_dat_bytes, (DWORD)sizeof(selftest_dat_bytes),
+                     g_paths.dat_path, &g_paths.dat_origin ))
     {
         write_str( "FATAL: failed to locate or extract test clips\n" );
         flush_log();
@@ -2874,15 +3515,11 @@ void __cdecl start( void )
     }
     make_file_url( g_paths.wmv_url, MAX_PATH + 16, g_paths.wmv_path );
 
-    write_str( "wmv: " );
-    write_wstr( g_paths.wmv_path );
-    write_str( " (" );
-    write_str( g_paths.wmv_origin );
-    write_str( ")\nmpg: " );
-    write_wstr( g_paths.mpg_path );
-    write_str( " (" );
-    write_str( g_paths.mpg_origin );
-    write_str( ")\n" );
+    log_staged_clip( "wmv", g_paths.wmv_path, g_paths.wmv_origin );
+    log_staged_clip( "mpg", g_paths.mpg_path, g_paths.mpg_origin );
+    log_staged_clip( "avi", g_paths.avi_path, g_paths.avi_origin );
+    log_staged_clip( "m1v", g_paths.m1v_path, g_paths.m1v_origin );
+    log_staged_clip( "dat", g_paths.dat_path, g_paths.dat_origin );
     flush_log();
 
     hr = CoInitializeEx( NULL, COINIT_APARTMENTTHREADED );
@@ -2913,11 +3550,23 @@ void __cdecl start( void )
     InterlockedExchange( &g_current_stage, 6 );
     if (!run_path6_mci_mpeg()) failed++;
 
+    InterlockedExchange( &g_current_stage, 7 );
+    if (!run_path7_dshow_renderfile_avi()) failed++;
+
+    InterlockedExchange( &g_current_stage, 8 );
+    if (!run_path8_kirikiri_m1v()) failed++;
+
+    InterlockedExchange( &g_current_stage, 9 );
+    if (!run_path9_kirikiri_vcd_dat()) failed++;
+
+    InterlockedExchange( &g_current_stage, 10 );
+    if (!run_path10_mf_source_reader_resize()) failed++;
+
     CoUninitialize();
 
     write_str( "=== SUMMARY: " );
-    write_uint( 6u - failed );
-    write_str( "/6 passed, " );
+    write_uint( SELFTEST_TOTAL_PATHS - failed );
+    write_str( "/10 passed, " );
     write_uint( failed );
     write_str( " failed (exit=" );
     write_uint( failed );

@@ -595,19 +595,24 @@ none:
 
 ### Running `video-selftest-x86.exe` on the iPad
 
-Build and stage the 32-bit executable and its two 2-second test clips
-(`video-selftest.wmv` and `video-selftest.mpg`, 320x240 25 fps with a 440 Hz
-stereo tone, also embedded in the PE as a standalone fallback):
+`build/build-mac.sh` and CI's `build/build-mac-reuse.sh` run the `selftest`
+step automatically (after `i386`, before `licences` and `app`; set
+`MADEIRA_BUILD_SELFTEST=0` to skip it; if it fails, the build warns and the
+IPA goes without it), so every IPA normally carries
+`video-selftest-x86.exe` and its five 2-second, 320x240 25 fps test clips
+(`video-selftest.wmv`, `video-selftest.mpg`, `video-selftest.avi`,
+`video-selftest.m1v` and `video-selftest.dat`) in `Madeira.app/i386-windows/`.
+To build and stage them by hand:
 
 ```sh
 ./tests/x86/build-video-selftest.sh
 ```
 
-This copies `video-selftest-x86.exe`, `video-selftest.wmv` and
-`video-selftest.mpg` into `app/Madeira/i386-windows/`, which `WineProcessBridge`
-links into `C:\windows\syswow64\` at launch (requires the i386 farm from
-`build/wine-i386/build.sh`). Package and install the app, then set in
-`madeira.cfg`:
+At launch, `madeira_link_syswow64` in `app/Madeira/WineProcessBridge.m`
+symlinks every non-dot file in `Madeira.app/i386-windows/` — including the five
+non-PE clip files — into `C:\windows\syswow64\` alongside
+`video-selftest-x86.exe` (`beside-exe`), and all five clips are also embedded in
+the PE as a standalone fallback. To run it on the iPad, set in `madeira.cfg`:
 
 ```ini
 env.MADEIRA_EXE = video-selftest-x86.exe
@@ -619,17 +624,18 @@ console log) and to `%USERPROFILE%\Documents\video-selftest.log` (override with
 
 **What each output line means:**
 
-- Header (`log:`, `wmv:`, `mpg:`): the active log file path and where each test
-  clip was loaded from (`beside-exe` when staged in `syswow64`, `cwd`, or
-  `embedded-temp` / `embedded-docs` when extracted from the binary).
-- `[1/6] PASS|FAIL kirikiri2-wmv-dmo`: Sabbat of the Witch's path —
+- Header (`log:`, `wmv:`, `mpg:`, `avi:`, `m1v:`, `dat:`): the active log file
+  path and where each test clip was loaded from (`beside-exe` when linked into
+  `syswow64`, `cwd`, or `embedded-temp` / `embedded-docs` when extracted from
+  the binary).
+- `[1/10] PASS|FAIL kirikiri2-wmv-dmo`: Sabbat of the Witch's path —
   `LoadLibrary("wmvcore.dll")` + `GetProcAddress("WMCreateSyncReader")`,
   `SetReadStreamSamples(TRUE)` on both ASF streams, and direct DMO decode
   (`CLSID_CWMVDecMediaObject` to RGB32, `CLSID_CWMADecMediaObject` to 16-bit
   PCM). Prints compressed packet counts (`pkts=video+audio`), decoded RGB32
-  `frames`, `size`, `rgb_crc`, `pcm_frames`, `peak`, Zero-crossing `freq` (~440
+  `frames`, `size`, `rgb_crc`, `pcm_frames`, `peak`, zero-crossing `freq` (~440
   Hz) and `pcm_crc`; on `FAIL`, prints the failing `step=` and `hr=`.
-- `[2/6] PASS|FAIL kirikiri-mpeg1`: KiriKiri's hand-built DirectShow MPEG-1
+- `[2/10] PASS|FAIL kirikiri-mpeg1`: KiriKiri's hand-built DirectShow MPEG-1
   graph (`ConnectDirect` only, no `RenderFile`): `CLSID_AsyncReader` →
   `CLSID_MPEG1Splitter` → `CLSID_CMpegVideoCodec` → custom sink accepting only
   bottom-up RGB32 (`biHeight > 0`), and splitter → `CLSID_CMpegAudioCodec` →
@@ -637,23 +643,50 @@ console log) and to `%USERPROFILE%\Documents\video-selftest.log` (override with
   `IAMStreamSelect` `Count`/`Info` (`streams=2`), plays to `EC_COMPLETE`
   (`pass1_frames`), rewinds with `IMediaPosition::put_CurrentPosition(0)`, and
   plays to `EC_COMPLETE` again (`pass2_frames`, `pcm_frames`, `rgb_crc`).
-- `[3/6] PASS|FAIL dshow-renderfile-mpeg`: `IGraphBuilder::RenderFile` on the
-  MPEG-1 clip with the default renderer attached to a hidden window, running to
-  `EC_COMPLETE` (`elapsed` in ms).
-- `[4/6] PASS|FAIL mf-session-evr-sar`: Senren Banka's path — the ASF clip
+- `[3/10] PASS|FAIL dshow-renderfile-mpeg`: `IGraphBuilder::RenderFile` on the
+  MPEG-1 clip with the default renderer (VMR-7) attached to a visible window.
+  Because VMR-7's `IBasicVideo::GetCurrentImage` returns `E_NOTIMPL` and its
+  DirectDraw clipper skips hidden windows, the test clears the window client
+  area to black before `Run`, reads the client area via GDI `BitBlt` into a
+  `DIBSection` during playback, fails if the picture stays black or never
+  appears, and waits for `EC_COMPLETE` (`size=320x240`, `nonblack_px`,
+  `rgb_crc`, `elapsed` in ms).
+- `[4/10] PASS|FAIL mf-session-evr-sar`: Senren Banka's path — the ASF clip
   through `MFCreateMediaSession` with `MFCreateVideoRendererActivate` (EVR on a
   window) and `MFCreateAudioRendererActivate` (SAR). Checks that
   `IMFVideoDisplayControl::GetCurrentImage` returns a non-black DIB mid-way
   (`image=320x240`, `nonblack_px`, `img_ts`), that
   `IMFPresentationClock::GetTime` advances (`clock=start->end`), and that the
   session reaches `MESessionEnded` (`ended=1`).
-- `[5/6] PASS|FAIL mf-source-reader`: `MFCreateSourceReaderFromURL` on the ASF
-  clip configured for `MFVideoFormat_RGB32`, counting non-black decoded frames
-  (`frames`, `size`, `rgb_crc`).
-- `[6/6] PASS|FAIL mci-mpeg`: `mciSendString` `open` / `play ... notify` /
+- `[5/10] PASS|FAIL mf-source-reader`: `MFCreateSourceReaderFromURL` on the ASF
+  clip configured for `MFVideoFormat_RGB32` at native `320x240`, counting
+  non-black decoded frames (`frames`, `size`, `rgb_crc`).
+- `[6/10] PASS|FAIL mci-mpeg`: `mciSendString` `open` / `play ... notify` /
   `close` on the MPEG-1 clip, waiting for playback completion (`notify=1`,
   `elapsed` in ms).
-- `=== SUMMARY: P/6 passed, F failed (exit=F) ===`: final tally. Process exit
-  code is `0` when all 6 paths pass, `1..6` for the exact number of paths that
-  failed (or `6` if the 90 s watchdog fires, `99` if COM or clip staging fails
-  before the paths start).
+- `[7/10] PASS|FAIL dshow-renderfile-avi`: `IGraphBuilder::RenderFile` on the
+  AVI clip (MPEG-4 Part 2 Xvid video + IMA ADPCM stereo audio, which quartz's
+  compressed AVI splitter refuses so the graph falls through to winegstreamer's
+  decoding splitter), with the same visible-window GDI `BitBlt` picture check
+  and `EC_COMPLETE` as `[3/10]`.
+- `[8/10] PASS|FAIL kirikiri-m1v`: KiriKiri's raw `.m1v` DirectShow graph
+  (`ConnectDirect` only), connecting `CLSID_AsyncReader` to
+  `CLSID_MPEG1Splitter` with `MEDIATYPE_Stream` / `MEDIASUBTYPE_MPEG1Video`
+  (`streams=1`), checking `320x240` bottom-up RGB32, frame count, rewind with
+  `put_CurrentPosition(0)`, and second play to `EC_COMPLETE`.
+- `[9/10] PASS|FAIL kirikiri-vcd-dat`: KiriKiri's VideoCD `.dat` DirectShow
+  graph (`ConnectDirect` only), connecting `CLSID_AsyncReader` to
+  `CLSID_MPEG1Splitter` with `MEDIATYPE_Stream` / `MEDIASUBTYPE_MPEG1VideoCD`
+  on the RIFF/CDXA 2352-byte Mode 2 Form 2 sector clip (`streams=2`), checking
+  `320x240` bottom-up RGB32, frame and PCM counts, rewind, and second play.
+- `[10/10] PASS|FAIL mf-source-reader-resize`: Unity's resized RGB32 path —
+  `MFCreateSourceReaderFromURL` with
+  `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING` requesting
+  `MFVideoFormat_RGB32` at `160x120` (scaled from `320x240` through
+  `CLSID_VideoProcessorMFT` / the `"video converter"` `wg_transform`), checking
+  that `GetCurrentMediaType` and the delivered sample buffers are `160x120` and
+  non-black (`frames`, `size=160x120`, `rgb_crc`).
+- `=== SUMMARY: P/10 passed, F failed (exit=F) ===`: final tally. Process exit
+  code is `0` when all 10 paths pass, `1..10` for the exact number of paths
+  that failed (or `10` if the 150 s watchdog fires, `99` if COM or clip staging
+  fails before the paths start).

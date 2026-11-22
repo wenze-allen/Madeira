@@ -127,6 +127,9 @@ tests/x64/asmconf_obj/
 tests/x86/*.exe
 tests/x86/video-selftest.wmv
 tests/x86/video-selftest.mpg
+tests/x86/video-selftest.avi
+tests/x86/video-selftest.m1v
+tests/x86/video-selftest.dat
 
 # Wine Mono, fetched (hash-checked) by build/wine-mono/fetch.sh and bundled by
 # build/wine-mono/bundle.sh; the scripts are tracked, the payload is not.

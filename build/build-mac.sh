@@ -21,6 +21,7 @@
 #                                  downloaded from Microsoft and extracted with 7-Zip.
 #   JOBS=n                         parallel jobs (default: every core)
 #   MADEIRA_FORCE=1                rebuild every step, ignoring what is up to date
+#   MADEIRA_BUILD_SELFTEST=0       skip building and bundling video-selftest-x86.exe
 #
 # Where things go:
 #   toolchains/host-tools          cmake, ninja, meson (a Python venv), bison 3, 7zz, and
@@ -79,16 +80,19 @@ FREETYPE_TAG=VER-2-13-3
 VCRUNTIME_DLLS="concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll
 msvcp140_codecvt_ids.dll vcamp140.dll vccorlib140.dll vcomp140.dll vcruntime140.dll
 vcruntime140_1.dll vcruntime140_threads.dll mfc140.dll mfc140u.dll"
+SELFTEST_FILES="video-selftest-x86.exe video-selftest.wmv video-selftest.mpg video-selftest.avi
+video-selftest.m1v video-selftest.dat"
 
 STEPS="tools llvm-mingw wine-host gnutls ffmpeg freetype ntdll-unix wineserver win32u-unix
-llvm-ios fex-ios dxmt-ios rppairing dock vcruntime mono i386 licences app ipa"
+llvm-ios fex-ios dxmt-ios rppairing dock vcruntime mono i386 selftest licences app ipa"
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 warn() { printf '    WARNING: %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-MODE=build FROM="" ONLY="" MONO=1
+MODE=build FROM="" ONLY="" MONO=1 SELFTEST=1
+[ "${MADEIRA_BUILD_SELFTEST:-1}" != 0 ] || SELFTEST=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) MODE=check ;;
@@ -147,6 +151,7 @@ step_key() {
         llvm-ios)   hash_paths build/llvm-ios/build.sh | sha_text ;;
         mono)       hash_paths build/wine-mono/pin.sh build/wine-mono/fetch.sh | sha_text ;;
         i386)       { sub_state wine; sub_state dxmt; hash_paths build/wine-i386/build.sh build/dxmt-patches; } | sha_text ;;
+        selftest)   { echo "$LLVM_MINGW_NAME $LLVM_MINGW_SHA256"; hash_paths tests/x86/build-video-selftest.sh tests/x86/video-selftest-x86.c tests/x86/make-video-clips.py tests/host/host_ffmpeg.py build/ffmpeg/src/SHA256SUMS; } | sha_text ;;
         *)          echo "" ;;   # always run (cheap, or incremental by itself)
     esac
 }
@@ -173,6 +178,7 @@ step_outputs() {
         vcruntime)  for d in $VCRUNTIME_DLLS; do printf '%s ' "$R/app/Madeira/x86_64-vcruntime/$d"; done; echo ;;
         mono)       echo "$R/build/wine-mono/$(mono_dir)/lib/mono/4.5/mscorlib.dll" ;;
         i386)       echo "$R/app/Madeira/i386-windows/kernel32.dll $R/app/Madeira/i386-windows/ntdll.dll $R/app/Madeira/i386-windows/mf.dll $R/app/Madeira/i386-windows/d3d9.dll $R/app/Madeira/i386-windows/winemetal.dll" ;;
+        selftest)   for d in $SELFTEST_FILES; do printf '%s ' "$R/app/Madeira/i386-windows/$d"; done; echo ;;
         app)        echo "$DERIVED/Build/Products/Debug-iphoneos/Madeira.app/Info.plist" ;;
         *)          echo "" ;;
     esac
@@ -181,7 +187,7 @@ outputs_present() { local f; for f in $(step_outputs "$1"); do [ -e "$f" ] || re
 # The steps whose script writes its outputs on every run: those must be newer than the
 # step's start, so a library a script only warned about (and left from an older build)
 # is caught here, not at the app link or on a device. The others build incrementally.
-FRESH_STEPS="ntdll-unix wineserver win32u-unix dxmt-ios dock app"
+FRESH_STEPS="ntdll-unix wineserver win32u-unix dxmt-ios dock selftest app"
 outputs_done() {
     local f missing="" fresh=0
     case " $(echo $FRESH_STEPS) " in *" $1 "*) fresh=1 ;; esac
@@ -387,6 +393,7 @@ s_vcruntime() {
 }
 s_mono()       { bash "$R/build/wine-mono/fetch.sh"; }
 s_i386()       { bash "$R/build/wine-i386/build.sh"; }
+s_selftest()   { LLVM_MINGW="$MINGW" bash "$R/tests/x86/build-video-selftest.sh"; }
 s_licences()   { bash "$R/build/stage-licenses.sh"; }
 s_app() {
     rm -rf "$DERIVED/Build/Products/Debug-iphoneos/Madeira.app"
@@ -407,10 +414,10 @@ s_ipa() {
     (cd "$DIST" && zip -qry "$name.ipa" Payload)
     rm -rf "$DIST/Payload"
     unzip -tq "$DIST/$name.ipa" >/dev/null
-    python3 - "$DIST/$name.ipa" "$MONO" <<'PY'
+    python3 - "$DIST/$name.ipa" "$MONO" "$SELFTEST" <<'PY'
 # What the IPA must carry; the 21e6697 IPA lacked the Dock and Wine Mono.
 import sys, zipfile
-ipa, mono = sys.argv[1], sys.argv[2] == "1"
+ipa, mono, selftest = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
 names = set(zipfile.ZipFile(ipa).namelist())
 A = "Payload/Madeira.app/"
 need = ["Info.plist", "Madeira", "prefix-template.tar.gz", "default.metallib",
@@ -419,6 +426,9 @@ need = ["Info.plist", "Madeira", "prefix-template.tar.gz", "default.metallib",
         "licenses/LICENSE-MADEIRA-GPL-3.0.txt", "licenses/LICENSE-MADEIRA-EXCEPTION.txt"]
 need += ["i386-windows/" + d for d in ("ntdll.dll", "kernel32.dll", "mf.dll", "winegstreamer.dll",
                                        "d3d9.dll", "d3d9-emulated.dll", "winemetal.dll", "d3d11.dll", "dxgi.dll")]
+if selftest:
+    need += ["i386-windows/" + d for d in ("video-selftest-x86.exe", "video-selftest.wmv", "video-selftest.mpg",
+                                           "video-selftest.avi", "video-selftest.m1v", "video-selftest.dat")]
 need += ["x86_64-vcruntime/" + d for d in """concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll
     msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll vccorlib140.dll vcomp140.dll vcruntime140.dll
     vcruntime140_1.dll vcruntime140_threads.dll mfc140.dll mfc140u.dll""".split()]
@@ -440,7 +450,8 @@ for marker in (b"first picture delivered", b"using rgb32"):
         missing.append("the app code has no '%s' (stale libntdll_unix.a?)" % marker.decode())
 if missing:
     sys.exit("IPA is incomplete:\n  " + "\n  ".join(missing))
-print("IPA contents: OK (%d entries, %d in i386-windows, Wine Mono %s)" % (len(names), len(i386), "in" if mono else "left out"))
+print("IPA contents: OK (%d entries, %d in i386-windows, Wine Mono %s, selftest %s)"
+      % (len(names), len(i386), "in" if mono else "left out", "in" if selftest else "left out"))
 PY
     {
         echo "Madeira $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist" 2>/dev/null) ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist" 2>/dev/null)), Debug, unsigned"
@@ -482,6 +493,7 @@ if [ "$MODE" = plan ]; then
     for s in $STEPS; do
         k="$(step_key "$s")"
         if [ "$s" = mono ] && [ "$MONO" = 0 ]; then st="skipped (--no-mono)"
+        elif [ "$s" = selftest ] && [ "$SELFTEST" = 0 ]; then st="skipped (MADEIRA_BUILD_SELFTEST=0)"
         elif stamp_ok "$s" "$k" && outputs_present "$s"; then st="up to date"
         else st="runs"; fi
         printf '    %-12s %s\n' "$s" "$st"
@@ -508,6 +520,7 @@ for s in $STEPS; do
         fi
     fi
     if [ "$s" = mono ] && [ "$MONO" = 0 ]; then say "$s: skipped (--no-mono)"; continue; fi
+    if [ "$s" = selftest ] && [ "$SELFTEST" = 0 ]; then say "$s: skipped (MADEIRA_BUILD_SELFTEST=0)"; continue; fi
     k="$(step_key "$s")"
     if stamp_ok "$s" "$k" && outputs_present "$s"; then say "$s: up to date"; continue; fi
     LOG="$LOGS/$(printf '%02d' "$n")-$s.log"
@@ -520,6 +533,17 @@ for s in $STEPS; do
     ( set -e; cd "$R"; "s_$s" ) > "$LOG" 2>&1
     rc=$?
     set -e
+    if [ "$s" = selftest ] && { [ "$rc" != 0 ] || ! outputs_present selftest ||
+                                ! grep -q 'LARGE_ADDRESS_AWARE present' "$LOG"; }; then
+        # The self-test is a convenience: an IPA without it still serves, so its failure
+        # does not cost the build. What it left is removed, and the IPA check does not
+        # ask for it.
+        tail -40 "$LOG" >&2
+        warn "selftest failed (log: ${LOG#"$R"/}); the IPA goes without video-selftest-x86.exe"
+        for d in $SELFTEST_FILES; do rm -f "$R/app/Madeira/i386-windows/$d"; done
+        SELFTEST=0
+        continue
+    fi
     if [ "$rc" != 0 ]; then
         tail -40 "$LOG" >&2
         die "step $s failed (log: ${LOG#"$R"/})"

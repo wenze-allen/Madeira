@@ -1,29 +1,47 @@
 #!/usr/bin/env python3
-"""Host verification for tests/x86/video-selftest-x86.exe and its WMV/MPEG-1 clips; no Wine runs.
+"""Host verification for tests/x86/video-selftest-x86.exe and all five test clips; no Wine runs.
 
 1. Source and documentation checks:
-   - video-selftest-x86.c covers all six VN video paths (KiriKiri 2 IWMSyncReader +
-     WMV/WMA DMOs; KiriKiri hand-built DirectShow MPEG-1 graph with ConnectDirect,
-     bottom-up-only RGB32 sink, IAMStreamSelect, and IMediaPosition::put_CurrentPosition(0)
-     rewind; DirectShow RenderFile in a hidden window; Media Foundation session with
-     EVR + SAR, IMFVideoDisplayControl::GetCurrentImage and IMFPresentationClock;
-     MF source reader to RGB32; MCI open/play/close), logs to both console/stderr and
-     a log file, and exits with the failed-path count;
-   - docs/MEDIA.md documents how to run it on device and what each line and exit code means.
-2. Clip synthesis and decode under ASan/UBSan:
-   - runs tests/x86/make-video-clips.py against the cached host FFmpeg build
-     (MEDIA_FLAGS in tests/host/host_ffmpeg.py);
-   - compiles a C verifier under ASan/UBSan against the host FFmpeg libraries to
-     demux and decode both video-selftest.wmv and video-selftest.mpg, checking
-     container format, codecs, dimensions (320x240), frame counts (50), non-black
-     picture content, top-vs-bottom row asymmetry, and the 440 Hz stereo audio tone.
+   - video-selftest-x86.c covers all 10 video paths:
+     [1/10]  KiriKiri 2 IWMSyncReader + WMV/WMA DMOs
+     [2/10]  KiriKiri hand-built DirectShow MPEG-1 graph (.mpg, ConnectDirect,
+             bottom-up-only RGB32 sink, IAMStreamSelect, put_CurrentPosition(0) rewind)
+     [3/10]  DirectShow RenderFile on .mpg in a visible window with GDI BitBlt
+             client-area picture check + EC_COMPLETE
+     [4/10]  Media Foundation session with EVR + SAR, GetCurrentImage,
+             IMFPresentationClock, MESessionEnded
+     [5/10]  MF source reader to RGB32 at native 320x240
+     [6/10]  MCI open/play/close
+     [7/10]  DirectShow RenderFile on .avi (MPEG-4 Xvid + IMA ADPCM) with visible
+             window GDI BitBlt picture check + EC_COMPLETE
+     [8/10]  KiriKiri hand-built MPEG-1 graph on raw .m1v (MEDIATYPE_Stream /
+             MEDIASUBTYPE_MPEG1Video, 1 stream, rewind + replay)
+     [9/10]  KiriKiri hand-built MPEG-1 graph on VideoCD .dat (MEDIATYPE_Stream /
+             MEDIASUBTYPE_MPEG1VideoCD, 2 streams, rewind + replay)
+     [10/10] MF source reader with MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING
+             resizing + converting to 160x120 RGB32;
+   - logs to both console/stderr and a log file, scales the watchdog to 10 paths,
+     and exits with the failed-path count;
+   - docs/MEDIA.md documents automatic IPA bundling, all 10 lines, and exit codes.
+2. Clip synthesis, host FFmpeg decode, and unix-side wg_parser core playback under ASan/UBSan:
+   - runs tests/x86/make-video-clips.py against the cached host FFmpeg build;
+   - decodes the generated clips with host FFmpeg under ASan/UBSan (.wmv, .mpg,
+     .avi Xvid+IMA-ADPCM, .m1v raw MPEG-1 video, and checks .dat RIFF/CDXA sector
+     wrapping against .mpg);
+   - compiles build/ntdll-unix/wg_parser_av_ios.c into a host C harness under
+     ASan/UBSan and plays all five clips (.wmv, .mpg, .avi, .m1v, .dat) through
+     OUR unix-side parser in decoded mode (checking 320x240 size, 50 non-black
+     pictures, audio tone, and seek-to-0 rewind), plus compressed splitter mode
+     for .mpg, .m1v and .dat (checking 50 decoded 320x240 pictures each, and
+     confirming compressed mode refuses .avi so DirectShow falls back to the
+     decoding splitter).
 3. 32-bit PE build and binary inspection:
-   - runs tests/x86/build-video-selftest.sh (which compiles with -Wall -Werror);
-   - parses PE headers and import tables directly in Python: i386 PE32,
-     LARGE_ADDRESS_AWARE, no delay imports, static imports restricted to core
-     system/MF/WinMM DLLs (wmvcore.dll and COM decoders/splitters NOT statically
-     imported), embedded clip bytes present in the image, and exe + clips staged
-     into app/Madeira/i386-windows/.
+   - runs tests/x86/build-video-selftest.sh (-Wall -Wextra -Werror);
+   - parses PE headers and import tables in Python: i386 PE32, LARGE_ADDRESS_AWARE,
+     no delay imports, exact 7-DLL static import allowlist (wmvcore.dll, gdi32.dll
+     and COM decoders/splitters NOT statically imported), all 5 embedded clip
+     fallbacks present in the PE image, and exe + 5 clips staged into
+     app/Madeira/i386-windows/.
 """
 import os
 from pathlib import Path
@@ -45,11 +63,12 @@ build_sh = (ROOT / "tests/x86/build-video-selftest.sh").read_text()
 make_py = (ROOT / "tests/x86/make-video-clips.py").read_text()
 media_md = (ROOT / "docs/MEDIA.md").read_text()
 
-assert "-Wall" in build_sh and "-Werror" in build_sh, "build script must compile with -Wall -Werror"
+assert "-Wall" in build_sh and "-Wextra" in build_sh and "-Werror" in build_sh, \
+    "build script must compile with -Wall -Wextra -Werror"
 assert "-nostdlib" in build_sh and "--large-address-aware" in build_sh
 
 # Path 1: KiriKiri 2 WMV
-p1 = c_src[c_src.index("static BOOL run_path1_kirikiri2_wmv("):c_src.index("static struct sink_filter")]
+p1 = c_src[c_src.index("static BOOL run_path1_kirikiri2_wmv("):c_src.index("struct sink_filter")]
 assert 'LoadLibraryA( "wmvcore.dll" )' in p1
 assert 'GetProcAddress( wmvcore, "WMCreateSyncReader" )' in p1
 assert "IWMSyncReader_SetReadStreamSamples" in p1
@@ -57,29 +76,50 @@ assert "CLSID_CWMVDecMediaObject" in p1 and "CLSID_CWMADecMediaObject" in p1
 assert "IMediaObject_ProcessInput" in p1 and "IMediaObject_ProcessOutput" in p1
 assert "MEDIASUBTYPE_RGB32" in p1 and "MEDIASUBTYPE_PCM" in p1
 
-# Path 2: KiriKiri MPEG-1 (hand-built ConnectDirect, bottom-up RGB32 only, IAMStreamSelect, rewind)
+# Paths 2, 8, 9: KiriKiri MPEG-1 graphs (.mpg, .m1v, .dat)
 sink_check = c_src[c_src.index("static HRESULT sink_check_media_type("):c_src.index("/* --- IEnumPins --- */")]
 assert "MEDIASUBTYPE_RGB32" in sink_check and "vih->bmiHeader.biHeight <= 0" in sink_check, \
     "custom video sink must accept only bottom-up RGB32 (biHeight > 0)"
-p2 = c_src[c_src.index("static BOOL run_path2_kirikiri_mpeg1("):c_src.index("PATH 3: DirectShow RenderFile")]
+p_mpeg = c_src[c_src.index("static BOOL run_kirikiri_mpeg_graph("):c_src.index("PATHS 3 & 7:")]
 for sym in [
     "CLSID_AsyncReader",
     "IFileSourceFilter_Load",
     "CLSID_MPEG1Splitter",
     "CLSID_CMpegVideoCodec",
     "CLSID_CMpegAudioCodec",
+    "MEDIATYPE_Stream",
     "IFilterGraph_ConnectDirect",
     "IPin_ConnectionMediaType",
     "IAMStreamSelect_Count",
     "IAMStreamSelect_Info",
     "IMediaPosition_put_CurrentPosition( mp, 0.0 )",
 ]:
-    assert sym in p2, ("missing in path 2", sym)
-assert "RenderFile" not in p2 and "IGraphBuilder_Render(" not in p2, "path 2 must use ConnectDirect only"
+    assert sym in p_mpeg, ("missing in KiriKiri MPEG graph helper", sym)
+assert "RenderFile" not in p_mpeg and "IGraphBuilder_Render(" not in p_mpeg, \
+    "KiriKiri MPEG graphs must use ConnectDirect only"
 
-# Path 3: DirectShow RenderFile in hidden window -> EC_COMPLETE
-p3 = c_src[c_src.index("static BOOL run_path3_dshow_renderfile("):c_src.index("static DWORD count_dib_nonblack(")]
-assert "create_test_window( FALSE )" in p3 and "IGraphBuilder_RenderFile" in p3 and "EC_COMPLETE" in p3
+p89 = c_src[c_src.index("static BOOL run_path8_kirikiri_m1v("):c_src.index("PATH 10:")]
+assert "MEDIASUBTYPE_MPEG1Video" in p89 and "g_paths.m1v_path" in p89
+assert "MEDIASUBTYPE_MPEG1VideoCD" in p89 and "g_paths.dat_path" in p89
+
+# Paths 3 & 7: DirectShow RenderFile in a visible window with GDI BitBlt read
+p_rf = c_src[c_src.index("static BOOL load_gdi32_api("):c_src.index("PATH 4: Media Foundation session")]
+for sym in [
+    'LoadLibraryA( "gdi32.dll" )',
+    '"CreateDIBSection"',
+    '"BitBlt"',
+    '"PatBlt"',
+    "BLACKNESS",
+    "SRCCOPY",
+    "create_test_window( TRUE )",
+    "IVideoWindow_put_Visible( vw, OATRUE )",
+    "IBasicVideo_GetCurrentImage",
+    "IGraphBuilder_RenderFile",
+    "EC_COMPLETE",
+]:
+    assert sym in p_rf, ("missing in visible RenderFile helper", sym)
+p7 = c_src[c_src.index("static BOOL run_path7_dshow_renderfile_avi("):c_src.index("static BOOL run_path8_kirikiri_m1v(")]
+assert "run_dshow_renderfile_visible" in p7 and "g_paths.avi_path" in p7
 
 # Path 4: MF session with EVR + SAR, GetCurrentImage, presentation clock, MESessionEnded
 p4 = c_src[c_src.index("static BOOL run_path4_mf_session("):c_src.index("static BOOL run_path5_mf_source_reader(")]
@@ -94,40 +134,60 @@ for sym in [
 ]:
     assert sym in p4, ("missing in path 4", sym)
 
-# Path 5: MF Source Reader -> RGB32
+# Path 5: MF Source Reader -> RGB32 (native 320x240)
 p5 = c_src[c_src.index("static BOOL run_path5_mf_source_reader("):c_src.index("static BOOL run_path6_mci_mpeg(")]
 assert "MFCreateSourceReaderFromURL" in p5 and "MFVideoFormat_RGB32" in p5 and "IMFSourceReader_ReadSample" in p5
 
 # Path 6: MCI open/play/close
-p6 = c_src[c_src.index("static BOOL run_path6_mci_mpeg("):c_src.index("static DWORD WINAPI watchdog_thread(")]
+p6 = c_src[c_src.index("static BOOL run_path6_mci_mpeg("):c_src.index("static BOOL run_path7_dshow_renderfile_avi(")]
 assert "mciSendStringW" in p6 and "open \\\"" in p6 and "play selftest_mci" in p6 and "close selftest_mci" in p6
 
-# Entry point exits with failed count & docs cover running + output lines
+# Path 10: MF Source Reader resize + convert (320x240 -> 160x120 RGB32)
+p10 = c_src[c_src.index("static BOOL run_path10_mf_source_reader_resize("):c_src.index("static DWORD WINAPI watchdog_thread(")]
+for sym in [
+    "MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING",
+    "MFCreateSourceReaderFromURL",
+    "MFVideoFormat_RGB32",
+    "MF_MT_FRAME_SIZE",
+    "SELFTEST_RESIZE_W",
+    "SELFTEST_RESIZE_H",
+    "IMFSourceReader_ReadSample",
+]:
+    assert sym in p10, ("missing in path 10", sym)
+
+# Watchdog & entry point scaled to 10 paths
+wd = c_src[c_src.index("static DWORD WINAPI watchdog_thread("):c_src.index("void __cdecl start( void )")]
+assert "SELFTEST_TOTAL_PATHS" in c_src and "#define SELFTEST_TOTAL_PATHS 10u" in c_src
+assert "#define WATCHDOG_TIMEOUT_MS 150000u" in c_src
+assert "ExitProcess( SELFTEST_TOTAL_PATHS )" in wd
+
 entry = c_src[c_src.index("void __cdecl start( void )"):]
 assert "ExitProcess( failed )" in entry
+for idx in range(1, 11):
+    assert ("[%d/10]" % idx) in c_src or idx in (2, 3, 7, 8, 9)
+    assert ("[%d/10]" % idx) in media_md, ("docs/MEDIA.md missing path line", idx)
 for doc_tok in [
     "video-selftest-x86.exe",
     "build-video-selftest.sh",
-    "[1/6]",
-    "[2/6]",
-    "[3/6]",
-    "[4/6]",
-    "[5/6]",
-    "[6/6]",
+    "MADEIRA_BUILD_SELFTEST=0",
+    "video-selftest.avi",
+    "video-selftest.m1v",
+    "video-selftest.dat",
     "video-selftest.log",
 ]:
     assert doc_tok in media_md, ("docs/MEDIA.md missing documentation token", doc_tok)
 
-print("PASS: source and docs checks cover all 6 video paths, log report, exit code, and docs/MEDIA.md")
+print("PASS: source and docs checks cover all 10 video paths, GDI read, resize, watchdog, exit code, and docs/MEDIA.md")
 
 
-# ------------------------------------------------------------------ 2. clip generation + host FFmpeg decode
+# ------------------------------------------------------------------ 2. clip generation + host FFmpeg + wg_parser core under ASan/UBSan
 tarball = os.environ.get("MADEIRA_FFMPEG_TARBALL") or str(ROOT / "build/ffmpeg/src/ffmpeg-7.1.5.tar.xz")
 prefix = host_ffmpeg(MEDIA_FLAGS, tarball, tag="asf-", override=os.environ.get("MADEIRA_HOST_FFMPEG_ASF"))
 inc, lib = prefix / "include", prefix / "lib"
 
-DECODE_VERIFIER_C = r"""
+HARNESS_C = r"""
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +196,8 @@ DECODE_VERIFIER_C = r"""
 #include <libavformat/avformat.h>
 #include <libavutil/mem.h>
 #include <libswresample/swresample.h>
+
+#include "wg_parser_av_ios.c"
 
 #define CHECK(cond, ...) do { \
     if (!(cond)) { \
@@ -192,8 +254,10 @@ static int load_whole_file( const char *path, struct memreader *m )
     return 0;
 }
 
-static int verify_clip( const char *path, const char *expect_fmt_substr,
-                        enum AVCodecID expect_vcodec, enum AVCodecID expect_acodec )
+/* 1. Independent host FFmpeg demux + decode check */
+static int verify_ffmpeg_decode( const char *path, const char *expect_fmt_substr,
+                                 enum AVCodecID expect_vcodec, uint32_t expect_vtag,
+                                 enum AVCodecID expect_acodec )
 {
     struct memreader mr = { 0 };
     AVFormatContext *ic = NULL;
@@ -207,7 +271,7 @@ static int verify_clip( const char *path, const char *expect_fmt_substr,
     int64_t pcm_frames = 0, zc = 0;
     int prev_sign = 0, peak = 0;
     unsigned int i;
-    int ret, rc = 1;
+    int ret;
 
     CHECK( load_whole_file( path, &mr ) == 0, "read %s", path );
     ic = avformat_alloc_context();
@@ -225,33 +289,43 @@ static int verify_clip( const char *path, const char *expect_fmt_substr,
         if (par->codec_type == AVMEDIA_TYPE_VIDEO && vs_idx < 0) vs_idx = (int)i;
         else if (par->codec_type == AVMEDIA_TYPE_AUDIO && as_idx < 0) as_idx = (int)i;
     }
-    CHECK( vs_idx >= 0 && as_idx >= 0, "missing video/audio stream in %s", path );
+    CHECK( vs_idx >= 0, "missing video stream in %s", path );
+    if (expect_acodec == AV_CODEC_ID_NONE)
+        CHECK( as_idx < 0, "unexpected audio stream in video-only %s", path );
+    else
+        CHECK( as_idx >= 0, "missing audio stream in %s", path );
+
     CHECK( ic->streams[vs_idx]->codecpar->codec_id == expect_vcodec,
            "vcodec %d != %d", ic->streams[vs_idx]->codecpar->codec_id, expect_vcodec );
-    CHECK( ic->streams[as_idx]->codecpar->codec_id == expect_acodec,
-           "acodec %d != %d", ic->streams[as_idx]->codecpar->codec_id, expect_acodec );
+    if (expect_vtag)
+        CHECK( ic->streams[vs_idx]->codecpar->codec_tag == expect_vtag,
+               "vtag 0x%x != 0x%x", ic->streams[vs_idx]->codecpar->codec_tag, expect_vtag );
     CHECK( ic->streams[vs_idx]->codecpar->width == 320 && ic->streams[vs_idx]->codecpar->height == 240,
            "dimensions %dx%d", ic->streams[vs_idx]->codecpar->width, ic->streams[vs_idx]->codecpar->height );
 
     {
         const AVCodec *vc = avcodec_find_decoder( expect_vcodec );
-        const AVCodec *ac = avcodec_find_decoder( expect_acodec );
-        CHECK( vc && ac, "missing decoder in host FFmpeg" );
+        CHECK( vc != NULL, "missing video decoder" );
         vd = avcodec_alloc_context3( vc );
-        ad = avcodec_alloc_context3( ac );
-        CHECK( vd && ad, "alloc codec ctx" );
-        CHECK( avcodec_parameters_to_context( vd, ic->streams[vs_idx]->codecpar ) >= 0, "v params" );
-        CHECK( avcodec_parameters_to_context( ad, ic->streams[as_idx]->codecpar ) >= 0, "a params" );
+        CHECK( vd && avcodec_parameters_to_context( vd, ic->streams[vs_idx]->codecpar ) >= 0, "v params" );
         CHECK( avcodec_open2( vd, vc, NULL ) == 0, "open vdec" );
-        CHECK( avcodec_open2( ad, ac, NULL ) == 0, "open adec" );
     }
-
-    CHECK( ad->sample_rate == 44100 && ad->ch_layout.nb_channels == 2,
-           "audio geometry %d Hz %d ch", ad->sample_rate, ad->ch_layout.nb_channels );
-    CHECK( swr_alloc_set_opts2( &swr, &ad->ch_layout, AV_SAMPLE_FMT_S16, ad->sample_rate,
-                                &ad->ch_layout, ad->sample_fmt, ad->sample_rate, 0, NULL ) == 0 && swr,
-           "swr_alloc" );
-    CHECK( swr_init( swr ) == 0, "swr_init" );
+    if (expect_acodec != AV_CODEC_ID_NONE)
+    {
+        const AVCodec *ac = avcodec_find_decoder( expect_acodec );
+        CHECK( ac != NULL, "missing audio decoder" );
+        CHECK( ic->streams[as_idx]->codecpar->codec_id == expect_acodec,
+               "acodec %d != %d", ic->streams[as_idx]->codecpar->codec_id, expect_acodec );
+        ad = avcodec_alloc_context3( ac );
+        CHECK( ad && avcodec_parameters_to_context( ad, ic->streams[as_idx]->codecpar ) >= 0, "a params" );
+        CHECK( avcodec_open2( ad, ac, NULL ) == 0, "open adec" );
+        CHECK( ad->sample_rate == 44100 && ad->ch_layout.nb_channels == 2,
+               "audio geometry %d Hz %d ch", ad->sample_rate, ad->ch_layout.nb_channels );
+        CHECK( swr_alloc_set_opts2( &swr, &ad->ch_layout, AV_SAMPLE_FMT_S16, ad->sample_rate,
+                                    &ad->ch_layout, ad->sample_fmt, ad->sample_rate, 0, NULL ) == 0 && swr,
+               "swr_alloc" );
+        CHECK( swr_init( swr ) == 0, "swr_init" );
+    }
 
     pkt = av_packet_alloc();
     frm = av_frame_alloc();
@@ -260,24 +334,22 @@ static int verify_clip( const char *path, const char *expect_fmt_substr,
     for (;;)
     {
         int got_eof = (av_read_frame( ic, pkt ) < 0);
-        AVCodecContext *dec = NULL;
-
         if (!got_eof)
         {
-            if (pkt->stream_index == vs_idx) dec = vd;
-            else if (pkt->stream_index == as_idx) dec = ad;
+            AVCodecContext *dec = (pkt->stream_index == vs_idx) ? vd : ((pkt->stream_index == as_idx) ? ad : NULL);
             if (dec) CHECK( avcodec_send_packet( dec, pkt ) >= 0, "send_packet" );
             av_packet_unref( pkt );
         }
         else
         {
             avcodec_send_packet( vd, NULL );
-            avcodec_send_packet( ad, NULL );
+            if (ad) avcodec_send_packet( ad, NULL );
         }
 
         for (int pass = 0; pass < 2; pass++)
         {
             AVCodecContext *cur = (pass == 0) ? vd : ad;
+            if (!cur) continue;
             while ((ret = avcodec_receive_frame( cur, frm )) >= 0)
             {
                 if (cur == vd)
@@ -325,17 +397,22 @@ static int verify_clip( const char *path, const char *expect_fmt_substr,
         if (got_eof) break;
     }
 
-    double hz = pcm_frames > 0 ? ((double)zc * 44100.0) / (2.0 * (double)pcm_frames) : 0.0;
     CHECK( vframes == 50, "%s: expected 50 video frames, got %d", path, vframes );
     CHECK( nonblack_frames == 50, "%s: expected 50 non-black frames, got %d", path, nonblack_frames );
     CHECK( asym_frames >= 45, "%s: top/bottom rows not distinct (%d/50)", path, asym_frames );
-    CHECK( pcm_frames >= 80000 && pcm_frames <= 100000, "%s: unexpected pcm_frames=%lld", path, (long long)pcm_frames );
-    CHECK( peak >= 8000, "%s: audio peak too low (%d)", path, peak );
-    CHECK( hz >= 420.0 && hz <= 460.0, "%s: expected ~440 Hz tone, got %.1f Hz", path, hz );
-
-    printf( "PASS: decoded %s: %d frames 320x240 non-black, %lld PCM frames peak=%d freq=%.1f Hz\n",
-            path, vframes, (long long)pcm_frames, peak, hz );
-    rc = 0;
+    if (expect_acodec != AV_CODEC_ID_NONE)
+    {
+        double hz = pcm_frames > 0 ? ((double)zc * 44100.0) / (2.0 * (double)pcm_frames) : 0.0;
+        CHECK( pcm_frames >= 80000 && pcm_frames <= 100000, "%s: unexpected pcm_frames=%lld", path, (long long)pcm_frames );
+        CHECK( peak >= 8000, "%s: audio peak too low (%d)", path, peak );
+        CHECK( hz >= 420.0 && hz <= 460.0, "%s: expected ~440 Hz tone, got %.1f Hz", path, hz );
+        printf( "PASS: host FFmpeg decoded %s: %d frames 320x240 non-black, %lld PCM frames peak=%d freq=%.1f Hz\n",
+                path, vframes, (long long)pcm_frames, peak, hz );
+    }
+    else
+    {
+        printf( "PASS: host FFmpeg decoded %s: %d frames 320x240 non-black (video-only)\n", path, vframes );
+    }
 
     av_frame_free( &frm );
     av_packet_free( &pkt );
@@ -346,15 +423,360 @@ static int verify_clip( const char *path, const char *expect_fmt_substr,
     av_freep( &avio->buffer );
     avio_context_free( &avio );
     free( mr.data );
-    return rc;
+    return 0;
+}
+
+/* 2. Unix-side wg_parser_av_ios.c pull-thread harness */
+struct pull_ctx
+{
+    struct mav_parser *p;
+    const uint8_t *data;
+    size_t size;
+};
+
+static void *pull_thread_main( void *arg )
+{
+    struct pull_ctx *ctx = arg;
+    uint64_t off = 0;
+    uint32_t sz = 0;
+
+    while (mav_get_next_read_offset( ctx->p, &off, &sz ) == MAV_OK)
+    {
+        if (off >= ctx->size)
+        {
+            mav_push_data( ctx->p, ctx->data, 0 );
+        }
+        else
+        {
+            size_t avail = ctx->size - (size_t)off;
+            if (avail > sz) avail = sz;
+            mav_push_data( ctx->p, ctx->data + (size_t)off, (uint32_t)avail );
+        }
+    }
+    return NULL;
+}
+
+static int verify_wg_parser_decoded( const char *path, int expect_audio, int test_rewind )
+{
+    struct memreader mr = { 0 };
+    struct pull_ctx pctx;
+    pthread_t th;
+    struct mav_parser *p = NULL;
+    unsigned int nstreams, i;
+    int v_idx = -1, a_idx = -1;
+    uint8_t *frame_buf = NULL;
+    int passes = test_rewind ? 2 : 1;
+
+    CHECK( load_whole_file( path, &mr ) == 0, "load %s", path );
+    p = mav_create( 0 );
+    CHECK( p != NULL, "mav_create(0)" );
+    pctx.p = p;
+    pctx.data = mr.data;
+    pctx.size = mr.size;
+    CHECK( pthread_create( &th, NULL, pull_thread_main, &pctx ) == 0, "pthread_create" );
+
+    CHECK( mav_connect( p, mr.size ) == MAV_OK, "mav_connect(decoded) failed on %s", path );
+    nstreams = mav_stream_count( p );
+    CHECK( nstreams == (expect_audio ? 2u : 1u), "%s: expected %u streams, got %u",
+           path, expect_audio ? 2u : 1u, nstreams );
+
+    for (i = 0; i < nstreams; i++)
+    {
+        struct mav_stream_info info;
+        CHECK( mav_stream_info( p, i, &info ) == MAV_OK, "mav_stream_info" );
+        if (info.type == MAV_STREAM_VIDEO)
+        {
+            struct mav_video_output vout;
+            v_idx = (int)i;
+            CHECK( info.vnative.width == 320 && info.vnative.height == 240,
+                   "%s: vnative %dx%d", path, info.vnative.width, info.vnative.height );
+            vout.fmt = MAV_PIX_BGRx;
+            vout.width = 320;
+            vout.height = 240; /* bottom-up positive or top-down: BGRx 320x240 */
+            vout.fps_n = 25;
+            vout.fps_d = 1;
+            CHECK( mav_enable_video( p, i, &vout ) == MAV_OK, "mav_enable_video" );
+        }
+        else if (info.type == MAV_STREAM_AUDIO)
+        {
+            struct mav_output aout = { MAV_FMT_S16, 44100, 2, 0x3 };
+            a_idx = (int)i;
+            CHECK( mav_enable( p, i, &aout ) == MAV_OK, "mav_enable(audio)" );
+        }
+    }
+    CHECK( v_idx >= 0 && (expect_audio ? (a_idx >= 0) : (a_idx < 0)), "stream indices" );
+
+    frame_buf = malloc( 320 * 240 * 4 );
+    CHECK( frame_buf != NULL, "malloc frame_buf" );
+
+    for (int pass = 0; pass < passes; pass++)
+    {
+        int pics = 0, nonblack = 0;
+        int64_t pcm_samples = 0;
+        struct mav_buffer buf;
+        int st;
+
+        if (pass > 0)
+            CHECK( mav_seek( p, (unsigned int)v_idx, 1, 0, 0, 0 ) == MAV_OK, "mav_seek(0) on %s", path );
+
+        while ((st = mav_get_buffer( p, -1, &buf )) == MAV_OK)
+        {
+            if ((int)buf.stream == v_idx)
+            {
+                int px, bright = 0;
+                CHECK( buf.size == 320 * 240 * 4, "%s: video buf size %u", path, buf.size );
+                CHECK( mav_copy_buffer( p, buf.stream, frame_buf, 0, buf.size ) == MAV_OK, "mav_copy_buffer" );
+                for (px = 0; px < 320 * 240; px++)
+                {
+                    uint8_t b = frame_buf[px * 4 + 0];
+                    uint8_t g = frame_buf[px * 4 + 1];
+                    uint8_t r = frame_buf[px * 4 + 2];
+                    if (r > 20 || g > 20 || b > 20) bright++;
+                }
+                pics++;
+                if (bright > (320 * 240) / 2) nonblack++;
+            }
+            else if ((int)buf.stream == a_idx)
+            {
+                CHECK( (buf.size % 4) == 0, "S16 stereo alignment" );
+                pcm_samples += buf.size / 4;
+            }
+            mav_release_buffer( p, buf.stream );
+        }
+        CHECK( st == MAV_NO_BUFFER, "%s: expected MAV_NO_BUFFER at EOS, got %d", path, st );
+        CHECK( pics == 50 && nonblack == 50, "%s pass %d: expected 50 non-black pictures, got %d (%d non-black)",
+               path, pass + 1, pics, nonblack );
+        if (expect_audio)
+            CHECK( pcm_samples >= 80000 && pcm_samples <= 100000,
+                   "%s pass %d: unexpected pcm_samples=%lld", path, pass + 1, (long long)pcm_samples );
+    }
+
+    mav_disconnect( p );
+    pthread_join( th, NULL );
+    mav_destroy( p );
+    free( frame_buf );
+    free( mr.data );
+    printf( "PASS: wg_parser decoded %s: 50x 320x240 BGRx pictures%s%s\n",
+            path, expect_audio ? " + 44.1kHz S16 audio" : " (video-only)",
+            test_rewind ? " + seek(0) replay" : "" );
+    return 0;
+}
+
+static int verify_wg_parser_compressed_mpeg( const char *path, int expect_audio )
+{
+    struct memreader mr = { 0 };
+    struct pull_ctx pctx;
+    pthread_t th;
+    struct mav_parser *p = NULL;
+    unsigned int nstreams, i;
+    int v_idx = -1, a_idx = -1;
+    const AVCodec *vc = avcodec_find_decoder( AV_CODEC_ID_MPEG1VIDEO );
+    AVCodecParserContext *vparser = NULL;
+    AVCodecContext *vd = NULL;
+    AVPacket *pkt = NULL;
+    AVFrame *frm = NULL;
+    uint8_t *raw = NULL;
+    uint32_t raw_cap = 0;
+    int v_pkts = 0, a_pkts = 0, pics = 0, nonblack = 0;
+    struct mav_buffer buf;
+    int st;
+
+    CHECK( vc != NULL, "mpeg1video decoder" );
+    CHECK( load_whole_file( path, &mr ) == 0, "load %s", path );
+    p = mav_create( 1 );
+    CHECK( p != NULL, "mav_create(1)" );
+    pctx.p = p;
+    pctx.data = mr.data;
+    pctx.size = mr.size;
+    CHECK( pthread_create( &th, NULL, pull_thread_main, &pctx ) == 0, "pthread_create" );
+
+    CHECK( mav_connect( p, mr.size ) == MAV_OK, "mav_connect(compressed) failed on %s", path );
+    nstreams = mav_stream_count( p );
+    CHECK( nstreams == (expect_audio ? 2u : 1u), "%s compressed: expected %u streams, got %u",
+           path, expect_audio ? 2u : 1u, nstreams );
+
+    for (i = 0; i < nstreams; i++)
+    {
+        struct mav_stream_info info;
+        CHECK( mav_stream_info( p, i, &info ) == MAV_OK, "mav_stream_info" );
+        CHECK( mav_can_pass_compressed( p, i ) == 1, "%s stream %u not compressed-capable", path, i );
+        CHECK( mav_enable_compressed( p, i ) == MAV_OK, "mav_enable_compressed" );
+        if (info.type == MAV_STREAM_VIDEO)
+        {
+            v_idx = (int)i;
+            CHECK( info.vnative.width == 320 && info.vnative.height == 240,
+                   "%s compressed vnative %dx%d", path, info.vnative.width, info.vnative.height );
+        }
+        else if (info.type == MAV_STREAM_AUDIO)
+        {
+            a_idx = (int)i;
+        }
+    }
+    CHECK( v_idx >= 0 && (expect_audio ? (a_idx >= 0) : (a_idx < 0)), "compressed stream indices" );
+
+    vparser = av_parser_init( AV_CODEC_ID_MPEG1VIDEO );
+    vd = avcodec_alloc_context3( vc );
+    pkt = av_packet_alloc();
+    frm = av_frame_alloc();
+    CHECK( vparser && vd && pkt && frm, "alloc mpeg1 decoder" );
+    CHECK( avcodec_open2( vd, vc, NULL ) == 0, "open mpeg1 decoder" );
+
+    while ((st = mav_get_buffer( p, -1, &buf )) == MAV_OK)
+    {
+        if ((int)buf.stream == v_idx)
+        {
+            uint8_t *in_ptr;
+            int in_left;
+            v_pkts++;
+            if (buf.size + AV_INPUT_BUFFER_PADDING_SIZE > raw_cap)
+            {
+                raw_cap = buf.size + AV_INPUT_BUFFER_PADDING_SIZE + 4096;
+                raw = realloc( raw, raw_cap );
+                CHECK( raw != NULL, "realloc raw" );
+            }
+            memset( raw, 0, raw_cap );
+            CHECK( mav_copy_buffer( p, buf.stream, raw, 0, buf.size ) == MAV_OK, "copy compressed" );
+            in_ptr = raw;
+            in_left = (int)buf.size;
+            while (in_left > 0)
+            {
+                uint8_t *out_data = NULL;
+                int out_size = 0;
+                int used = av_parser_parse2( vparser, vd, &out_data, &out_size,
+                                             in_ptr, in_left, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 );
+                CHECK( used >= 0, "av_parser_parse2" );
+                in_ptr += used;
+                in_left -= used;
+                if (out_size > 0)
+                {
+                    pkt->data = out_data;
+                    pkt->size = out_size;
+                    CHECK( avcodec_send_packet( vd, pkt ) >= 0, "send_packet" );
+                    while (avcodec_receive_frame( vd, frm ) >= 0)
+                    {
+                        CHECK( frm->width == 320 && frm->height == 240, "decoded %dx%d", frm->width, frm->height );
+                        int bright = 0;
+                        for (int y = 0; y < frm->height; y++)
+                            for (int x = 0; x < frm->width; x++)
+                                if (frm->data[0][y * frm->linesize[0] + x] > 40) bright++;
+                        pics++;
+                        if (bright > (320 * 240) / 2) nonblack++;
+                        av_frame_unref( frm );
+                    }
+                }
+            }
+        }
+        else if ((int)buf.stream == a_idx)
+        {
+            a_pkts++;
+        }
+        mav_release_buffer( p, buf.stream );
+    }
+    CHECK( st == MAV_NO_BUFFER, "expected MAV_NO_BUFFER" );
+
+    /* Flush parser + decoder at EOS, just like wg_transform drain */
+    {
+        uint8_t *out_data = NULL;
+        int out_size = 0;
+        av_parser_parse2( vparser, vd, &out_data, &out_size, NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 );
+        if (out_size > 0)
+        {
+            pkt->data = out_data;
+            pkt->size = out_size;
+            CHECK( avcodec_send_packet( vd, pkt ) >= 0, "send final parsed pkt" );
+        }
+        avcodec_send_packet( vd, NULL );
+        while (avcodec_receive_frame( vd, frm ) >= 0)
+        {
+            CHECK( frm->width == 320 && frm->height == 240, "decoded %dx%d", frm->width, frm->height );
+            int bright = 0;
+            for (int y = 0; y < frm->height; y++)
+                for (int x = 0; x < frm->width; x++)
+                    if (frm->data[0][y * frm->linesize[0] + x] > 40) bright++;
+            pics++;
+            if (bright > (320 * 240) / 2) nonblack++;
+            av_frame_unref( frm );
+        }
+    }
+
+    CHECK( v_pkts > 0 && pics == 50 && nonblack == 50,
+           "%s compressed: pkts=%d pics=%d nonblack=%d", path, v_pkts, pics, nonblack );
+    if (expect_audio)
+        CHECK( a_pkts > 0, "%s compressed: expected audio packets, got 0", path );
+
+    mav_disconnect( p );
+    pthread_join( th, NULL );
+    mav_destroy( p );
+    av_frame_free( &frm );
+    av_packet_free( &pkt );
+    avcodec_free_context( &vd );
+    av_parser_close( vparser );
+    free( raw );
+    free( mr.data );
+    printf( "PASS: wg_parser compressed %s: %d video pkts -> 50x 320x240 pictures, %d audio pkts\n",
+            path, v_pkts, a_pkts );
+    return 0;
+}
+
+static int verify_wg_parser_avi_compressed_refused( const char *avi_path )
+{
+    struct memreader mr = { 0 };
+    struct pull_ctx pctx;
+    pthread_t th;
+    struct mav_parser *p = NULL;
+    int rc;
+
+    CHECK( load_whole_file( avi_path, &mr ) == 0, "load %s", avi_path );
+    p = mav_create( 1 );
+    CHECK( p != NULL, "mav_create(1)" );
+    pctx.p = p;
+    pctx.data = mr.data;
+    pctx.size = mr.size;
+    CHECK( pthread_create( &th, NULL, pull_thread_main, &pctx ) == 0, "pthread_create" );
+
+    rc = mav_connect( p, mr.size );
+    CHECK( rc == MAV_E_UNSUPPORTED, "compressed AVI must be refused (got %d)", rc );
+
+    mav_disconnect( p );
+    pthread_join( th, NULL );
+    mav_destroy( p );
+    free( mr.data );
+    printf( "PASS: wg_parser compressed mode refuses %s (falls back to decoding splitter)\n", avi_path );
+    return 0;
 }
 
 int main( int argc, char **argv )
 {
-    if (argc != 3) return 2;
+    uint32_t xvid_tag = (uint32_t)'X' | ((uint32_t)'V' << 8) | ((uint32_t)'I' << 16) | ((uint32_t)'D' << 24);
+
+    if (argc != 6) return 2;
     av_log_set_level( AV_LOG_ERROR );
-    if (verify_clip( argv[1], "asf", AV_CODEC_ID_WMV2, AV_CODEC_ID_WMAV2 ) != 0) return 1;
-    if (verify_clip( argv[2], "mpeg", AV_CODEC_ID_MPEG1VIDEO, AV_CODEC_ID_MP2 ) != 0) return 1;
+    mav_configure( 1, NULL, NULL, MAV_PIX_BGRx );
+    mav_allow_compressed_asf( 1 );
+    mav_allow_video_ahead( 1 );
+    mav_allow_mpeg_raw( 1 );
+    mav_allow_avi( 1 );
+    mav_allow_summary( 0 );
+
+    /* Host FFmpeg decode checks for .wmv, .mpg, .avi, .m1v */
+    if (verify_ffmpeg_decode( argv[1], "asf", AV_CODEC_ID_WMV2, 0, AV_CODEC_ID_WMAV2 ) != 0) return 1;
+    if (verify_ffmpeg_decode( argv[2], "mpeg", AV_CODEC_ID_MPEG1VIDEO, 0, AV_CODEC_ID_MP2 ) != 0) return 1;
+    if (verify_ffmpeg_decode( argv[3], "avi", AV_CODEC_ID_MPEG4, xvid_tag, AV_CODEC_ID_ADPCM_IMA_WAV ) != 0) return 1;
+    if (verify_ffmpeg_decode( argv[4], "mpegvideo", AV_CODEC_ID_MPEG1VIDEO, 0, AV_CODEC_ID_NONE ) != 0) return 1;
+
+    /* Unix-side wg_parser_av_ios.c decoded playback for all 5 clips (including RIFF/CDXA .dat) */
+    if (verify_wg_parser_decoded( argv[1], 1, 0 ) != 0) return 1;
+    if (verify_wg_parser_decoded( argv[2], 1, 1 ) != 0) return 1;
+    if (verify_wg_parser_decoded( argv[3], 1, 0 ) != 0) return 1;
+    if (verify_wg_parser_decoded( argv[4], 0, 1 ) != 0) return 1;
+    if (verify_wg_parser_decoded( argv[5], 1, 1 ) != 0) return 1;
+
+    /* Unix-side wg_parser_av_ios.c compressed splitter mode for .mpg, .m1v, .dat (+ .avi refusal) */
+    if (verify_wg_parser_avi_compressed_refused( argv[3] ) != 0) return 1;
+    if (verify_wg_parser_compressed_mpeg( argv[2], 1 ) != 0) return 1;
+    if (verify_wg_parser_compressed_mpeg( argv[4], 0 ) != 0) return 1;
+    if (verify_wg_parser_compressed_mpeg( argv[5], 1 ) != 0) return 1;
+
     return 0;
 }
 """
@@ -366,19 +788,46 @@ with tempfile.TemporaryDirectory(prefix="madeira-check-selftest-") as tmp:
         [sys.executable, str(ROOT / "tests/x86/make-video-clips.py"), str(tmp_dir), "--header", str(hdr_path)],
         check=True,
     )
-    wmv_file = tmp_dir / "video-selftest.wmv"
-    mpg_file = tmp_dir / "video-selftest.mpg"
-    wmv_bytes = wmv_file.read_bytes()
-    mpg_bytes = mpg_file.read_bytes()
-    assert 4096 < len(wmv_bytes) < 512 * 1024, ("unexpected WMV clip size", len(wmv_bytes))
-    assert 4096 < len(mpg_bytes) < 512 * 1024, ("unexpected MPG clip size", len(mpg_bytes))
+    clip_names = [
+        ("wmv", "video-selftest.wmv"),
+        ("mpg", "video-selftest.mpg"),
+        ("avi", "video-selftest.avi"),
+        ("m1v", "video-selftest.m1v"),
+        ("dat", "video-selftest.dat"),
+    ]
+    clip_bytes = {}
     hdr_text = hdr_path.read_text()
-    assert ("selftest_wmv_bytes[%d]" % len(wmv_bytes)) in hdr_text
-    assert ("selftest_mpg_bytes[%d]" % len(mpg_bytes)) in hdr_text
+    for short, fname in clip_names:
+        b = (tmp_dir / fname).read_bytes()
+        assert 4096 < len(b) < 512 * 1024, ("unexpected %s clip size" % short, len(b))
+        assert ("selftest_%s_bytes[%d]" % (short, len(b))) in hdr_text
+        clip_bytes[short] = b
+
+    # Check RIFF/CDXA .dat structure and sector payload unwrapping against .mpg
+    dat_b = clip_bytes["dat"]
+    mpg_b = clip_bytes["mpg"]
+    assert dat_b[:4] == b"RIFF" and dat_b[8:16] == b"CDXAfmt " and dat_b[36:40] == b"data"
+    data_len = struct.unpack_from("<I", dat_b, 40)[0]
+    assert len(dat_b) == 44 + data_len and data_len % 2352 == 0
+    total_secs = data_len // 2352
+    assert total_secs >= 3
+    unwrapped = bytearray()
+    for s in range(2, total_secs):
+        sec = dat_b[44 + s * 2352:44 + (s + 1) * 2352]
+        assert sec[:12] == b"\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00"
+        assert sec[18] == 0x66 and sec[22] == 0x66
+        assert sec[2348:2352] == b"\xde\xad\xbe\xef"
+        unwrapped.extend(sec[24:24 + 2324])
+    assert bytes(unwrapped[:len(mpg_b)]) == mpg_b, "unwrapped .dat payload does not match .mpg"
+
+    # Also verify unwrapped .dat decodes through host FFmpeg (since raw FFmpeg has no CDXA demuxer,
+    # unwrap the Form 2 payload to a temp file for host FFmpeg decode verification too).
+    dat_unwrapped_file = tmp_dir / "dat-unwrapped.mpg"
+    dat_unwrapped_file.write_bytes(bytes(unwrapped))
 
     verifier_c = tmp_dir / "verify_clips.c"
     verifier_exe = tmp_dir / "verify_clips"
-    verifier_c.write_text(DECODE_VERIFIER_C)
+    verifier_c.write_text(HARNESS_C)
     cc = os.environ.get("CC", "cc")
     libs = [
         str(lib / "libavformat.a"),
@@ -392,12 +841,15 @@ with tempfile.TemporaryDirectory(prefix="madeira-check-selftest-") as tmp:
         [
             cc,
             "-std=c11",
+            "-D_GNU_SOURCE",
             "-O1",
             "-g",
             "-Wall",
             "-Werror",
+            "-Wno-unused-function",
             "-fsanitize=address,undefined",
             "-fno-sanitize-recover=undefined",
+            "-I" + str(ROOT / "build/ntdll-unix"),
             "-I" + str(inc),
             str(verifier_c),
             "-o",
@@ -408,7 +860,20 @@ with tempfile.TemporaryDirectory(prefix="madeira-check-selftest-") as tmp:
     )
     env = dict(os.environ)
     env["ASAN_OPTIONS"] = "detect_leaks=1"
-    out = subprocess.run([str(verifier_exe), str(wmv_file), str(mpg_file)], env=env, capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [
+            str(verifier_exe),
+            str(tmp_dir / "video-selftest.wmv"),
+            str(tmp_dir / "video-selftest.mpg"),
+            str(tmp_dir / "video-selftest.avi"),
+            str(tmp_dir / "video-selftest.m1v"),
+            str(tmp_dir / "video-selftest.dat"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     print(out.stdout, end="")
     assert "ERROR: AddressSanitizer" not in out.stderr and "runtime error" not in out.stderr, out.stderr
 
@@ -509,22 +974,23 @@ res = subprocess.run(
 )
 assert res.returncode == 0, res.stdout + "\n" + res.stderr
 
-exe_built = ROOT / "tests/x86/video-selftest-x86.exe"
-wmv_built = ROOT / "tests/x86/video-selftest.wmv"
-mpg_built = ROOT / "tests/x86/video-selftest.mpg"
+all_files = [
+    "video-selftest-x86.exe",
+    "video-selftest.wmv",
+    "video-selftest.mpg",
+    "video-selftest.avi",
+    "video-selftest.m1v",
+    "video-selftest.dat",
+]
 bundle_dir = ROOT / "app/Madeira/i386-windows"
-exe_staged = bundle_dir / "video-selftest-x86.exe"
-wmv_staged = bundle_dir / "video-selftest.wmv"
-mpg_staged = bundle_dir / "video-selftest.mpg"
+for fname in all_files:
+    built = ROOT / "tests/x86" / fname
+    staged = bundle_dir / fname
+    assert built.is_file() and built.stat().st_size > 0, ("missing built artifact", built)
+    assert staged.is_file() and staged.stat().st_size > 0, ("missing staged artifact", staged)
+    assert staged.read_bytes() == built.read_bytes(), ("staged artifact differs from built", fname)
 
-for p in (exe_built, wmv_built, mpg_built, exe_staged, wmv_staged, mpg_staged):
-    assert p.is_file() and p.stat().st_size > 0, ("missing build/staged artifact", p)
-
-pe_bytes = exe_staged.read_bytes()
-assert pe_bytes == exe_built.read_bytes(), "staged exe differs from built exe"
-assert wmv_staged.read_bytes() == wmv_built.read_bytes(), "staged WMV differs"
-assert mpg_staged.read_bytes() == mpg_built.read_bytes(), "staged MPG differs"
-
+pe_bytes = (bundle_dir / "video-selftest-x86.exe").read_bytes()
 pe = parse_pe32(pe_bytes)
 assert pe["machine"] == 0x014C, ("expected IMAGE_FILE_MACHINE_I386 (0x014c)", hex(pe["machine"]))
 assert pe["magic"] == 0x010B, ("expected PE32 optional header (0x010b)", hex(pe["magic"]))
@@ -546,7 +1012,17 @@ unexpected_dlls = imported_dlls - allowed_dlls
 assert not unexpected_dlls, ("unexpected static DLL imports", sorted(unexpected_dlls))
 assert imported_dlls == allowed_dlls, ("expected exact import DLL set", sorted(imported_dlls))
 
-for forbidden in ("wmvcore.dll", "winegstreamer.dll", "wmadmod.dll", "quartz.dll", "evr.dll", "msvcrt.dll", "ucrtbase.dll"):
+for forbidden in (
+    "gdi32.dll",
+    "wmvcore.dll",
+    "winegstreamer.dll",
+    "wmadmod.dll",
+    "quartz.dll",
+    "evr.dll",
+    "msvproc.dll",
+    "msvcrt.dll",
+    "ucrtbase.dll",
+):
     assert forbidden not in imported_dlls, ("forbidden static import", forbidden)
 
 assert "LoadLibraryA" in pe["imports"]["kernel32.dll"] and "GetProcAddress" in pe["imports"]["kernel32.dll"]
@@ -555,11 +1031,12 @@ assert "MFCreateMediaSession" in pe["imports"]["mf.dll"]
 assert "MFCreateSourceReaderFromURL" in pe["imports"]["mfreadwrite.dll"]
 assert "mciSendStringW" in pe["imports"]["winmm.dll"]
 
-# Embedded clip arrays must be present inside the PE image for standalone fallback.
-assert wmv_staged.read_bytes()[:64] in pe_bytes, "embedded WMV fallback missing from PE image"
-assert mpg_staged.read_bytes()[:64] in pe_bytes, "embedded MPG fallback missing from PE image"
+# Embedded clip arrays must all be present inside the PE image for standalone fallback.
+for clip_f in all_files[1:]:
+    cb = (bundle_dir / clip_f).read_bytes()
+    assert cb[:64] in pe_bytes, ("embedded fallback missing from PE image", clip_f)
 
 print(
-    "PASS: built i386 PE32 video-selftest-x86.exe (%d bytes, LAA=1, imports=%s) and staged clips (%d + %d bytes)"
-    % (len(pe_bytes), ",".join(sorted(imported_dlls)), wmv_staged.stat().st_size, mpg_staged.stat().st_size)
+    "PASS: built i386 PE32 video-selftest-x86.exe (%d bytes, LAA=1, imports=%s) and staged all 5 clips"
+    % (len(pe_bytes), ",".join(sorted(imported_dlls)))
 )

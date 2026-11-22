@@ -85,11 +85,12 @@ def code(text):
 steps = re.search(r'^STEPS="([^"]*)"', driver, re.M).group(1).split()
 check(steps == ["tools", "llvm-mingw", "wine-host", "gnutls", "ffmpeg", "freetype", "ntdll-unix", "wineserver",
                 "win32u-unix", "llvm-ios", "fex-ios", "dxmt-ios", "rppairing", "dock", "vcruntime", "mono", "i386",
-                "licences", "app", "ipa"], "the steps, in an order their inputs allow: %s" % " ".join(steps))
+                "selftest", "licences", "app", "ipa"], "the steps, in an order their inputs allow: %s" % " ".join(steps))
 before = lambda a, b: steps.index(a) < steps.index(b)
 for a, b in [("tools", "wine-host"), ("llvm-mingw", "wine-host"), ("wine-host", "ntdll-unix"), ("wine-host", "wineserver"),
              ("wine-host", "win32u-unix"), ("gnutls", "ntdll-unix"), ("ffmpeg", "ntdll-unix"), ("freetype", "win32u-unix"),
-             ("llvm-ios", "dxmt-ios"), ("llvm-mingw", "dock"), ("llvm-mingw", "i386"), ("tools", "i386")]:
+             ("llvm-ios", "dxmt-ios"), ("llvm-mingw", "dock"), ("llvm-mingw", "i386"), ("tools", "i386"),
+             ("llvm-mingw", "selftest"), ("i386", "selftest"), ("selftest", "licences")]:
     check(before(a, b), "%s runs before %s" % (a, b))
 for s in steps:
     if s != "app" and s != "ipa":
@@ -97,7 +98,7 @@ for s in steps:
 check(re.search(r"^s_%s\(\)" % re.escape("ipa"), driver, re.M) and all(re.search(r"^s_%s\(\)" % re.escape(s), driver, re.M) for s in steps),
       "every step has its function")
 
-called = sorted(set(re.findall(r'bash "\$R/((?:build|tools)/[\w./-]+\.sh)"', driver)))
+called = sorted(set(re.findall(r'bash "\$R/((?:build|tools|tests)/[\w./-]+\.sh)"', driver)))
 check(len(called) >= 15, "the driver runs %d repository scripts" % len(called))
 for c in called:
     check((root / c).is_file(), "%s exists" % c)
@@ -144,7 +145,7 @@ vc_fetch = re.findall(r'^\s+"(\w+\.dll)"', (root / "tools/fetch-vcruntime.sh").r
 check(sorted(vc_driver) == sorted(vc_fetch) and len(vc_driver) == 14, "the 14 VC++ runtime DLLs, as tools/fetch-vcruntime.sh")
 ipa_check = driver[driver.index("python3 - \"$DIST/$name.ipa\""):]
 for s in ["arm64ec-windows/dockhost.exe", "arm64ec-windows/dock-notices.txt", "wine-mono/", "i386-windows",
-          "x86_64-vcruntime/", "mf.dll", "first picture delivered", "using rgb32"]:
+          "video-selftest-x86.exe", "x86_64-vcruntime/", "mf.dll", "first picture delivered", "using rgb32"]:
     check(s in ipa_check, "the IPA check asks for %s" % s)
 cfg = (root / "build/wine-macos/configure.sh").read_text()
 check("--without-freetype --without-gnutls --enable-winegstreamer" in cfg and "include/all" in cfg and "brew" not in code(cfg),
@@ -184,7 +185,8 @@ def make_tree(tmp):
               "app/Madeira/d3d12/libmetalirconverter.dylib", "app/Madeira/arm64ec-windows/xtajit64.dll",
               "app/Madeira/arm64ec-windows/ntdll.dll", "app/Madeira/aarch64-windows/ntdll.dll",
               "build/wine-i386/build.sh", "build/wine-macos/configure.sh", "build/llvm-ios/build.sh",
-              "build/freetype-ios/build.sh", "build/dxmt-patches/README.md"]:
+              "build/freetype-ios/build.sh", "build/dxmt-patches/README.md",
+              "tests/x86/video-selftest-x86.c", "tests/x86/make-video-clips.py", "tests/host/host_ffmpeg.py"]:
         (t / f).parent.mkdir(parents=True, exist_ok=True)
         (t / f).write_text("x\n")
     (t / "build/gnutls-ios/src").mkdir(parents=True)
@@ -264,6 +266,17 @@ def make_tree(tmp):
         for i in $(seq 1 700); do echo x > "@A@/i386-windows/mod$i.dll"; done
         for d in ntdll kernel32 mf winegstreamer d3d9 d3d9-emulated winemetal d3d11 dxgi; do echo x > "@A@/i386-windows/$d.dll"; done
         echo "== 709 files in app/Madeira/i386-windows, 0 missing imports =="
+    """)
+    stub(t, "tests/x86/build-video-selftest.sh", """
+        [ -x "${LLVM_MINGW:-}/bin/i686-w64-mingw32-clang" ] || { echo "missing LLVM_MINGW"; exit 1; }
+        [ -z "${FAKE_SELFTEST_FAIL:-}" ] || { echo "the host FFmpeg did not build"; exit 1; }
+        mkdir -p "@A@/i386-windows"
+        if [ -z "${FAKE_NO_SELFTEST:-}" ]; then
+            for f in video-selftest-x86.exe video-selftest.wmv video-selftest.mpg video-selftest.avi video-selftest.m1v video-selftest.dat; do
+                echo MZ > "@A@/i386-windows/$f"
+            done
+        fi
+        [ -n "${FAKE_NO_SELFTEST_LAA:-}" ] || echo "LARGE_ADDRESS_AWARE present"
     """)
     stub(t, "build/stage-licenses.sh", """
         mkdir -p "@A@/licenses"; echo x > "@A@/licenses/LICENSE-MADEIRA-GPL-3.0.txt"; echo x > "@A@/licenses/LICENSE-MADEIRA-EXCEPTION.txt"
@@ -366,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix="madeira-mac-build-") as d:
     order = ["build/wine-macos/configure.sh", "build/gnutls-ios/build.sh", "build/ffmpeg/build.sh", "build/freetype-ios/build.sh",
              "build/ntdll-unix/build.sh", "build/wineserver/build.sh", "build/win32u-unix/build.sh", "build/llvm-ios/build.sh",
              "build/fex-ios/build.sh", "build/dxmt-ios/build.sh", "build/rppairing-ios/build.sh", "build/madeira-dock/build.sh",
-             "build/wine-mono/fetch.sh", "build/wine-i386/build.sh", "build/stage-licenses.sh"]
+             "build/wine-mono/fetch.sh", "build/wine-i386/build.sh", "tests/x86/build-video-selftest.sh", "build/stage-licenses.sh"]
 
     # freetype's step clones FreeType when research/freetype is not that tag; give it one.
     ft = tree / "research/freetype"
@@ -389,15 +402,24 @@ with tempfile.TemporaryDirectory(prefix="madeira-mac-build-") as d:
         n = zipfile.ZipFile(ipas[0]).namelist()
         check("Payload/Madeira.app/arm64ec-windows/dockhost.exe" in n and any("/wine-mono/" in x for x in n),
               "mock Mac: the IPA has the Dock and Wine Mono")
+        check("Payload/Madeira.app/i386-windows/video-selftest-x86.exe" in n
+              and "Payload/Madeira.app/i386-windows/video-selftest.avi" in n
+              and "Payload/Madeira.app/i386-windows/video-selftest.dat" in n,
+              "mock Mac: the IPA has video-selftest-x86.exe and its clips in i386-windows")
         rec = ipas[0].with_suffix(".txt").read_text()
         check("Xcode 27.3" in rec and "sha256:" in rec and "revisions:" in rec, "mock Mac: the build record names Xcode, the hash and the revisions")
 
     rc, out, trace, calls = run(tmp, ["--plan"])
     plan = dict(re.findall(r"^\s+(\S+)\s+(up to date|runs|skipped.*)$", out, re.M))
-    keyed = ["tools", "llvm-mingw", "wine-host", "gnutls", "ffmpeg", "freetype", "llvm-ios", "mono", "i386"]
+    keyed = ["tools", "llvm-mingw", "wine-host", "gnutls", "ffmpeg", "freetype", "llvm-ios", "mono", "i386", "selftest"]
     check(rc == 0 and all(plan.get(s) == "up to date" for s in keyed) and plan.get("ntdll-unix") == "runs" and plan.get("app") == "runs",
           "mock Mac: --plan shows the built inputs up to date and the unix side and app to run" + ("" if rc == 0 else out[-800:]))
     check(trace == [], "mock Mac: --plan ran nothing")
+
+    rc, out, trace, calls = run(tmp, ["--plan"], MADEIRA_BUILD_SELFTEST="0")
+    plan_skip = dict(re.findall(r"^\s+(\S+)\s+(up to date|runs|skipped.*)$", out, re.M))
+    check(rc == 0 and plan_skip.get("selftest") == "skipped (MADEIRA_BUILD_SELFTEST=0)",
+          "mock Mac: --plan shows selftest skipped when MADEIRA_BUILD_SELFTEST=0")
 
     rc, out, trace, calls = run(tmp)
     check(rc == 0 and trace == ["build/ntdll-unix/build.sh", "build/wineserver/build.sh", "build/win32u-unix/build.sh",
@@ -410,6 +432,20 @@ with tempfile.TemporaryDirectory(prefix="madeira-mac-build-") as d:
     check(rc == 0 and trace == ["build/wine-i386/build.sh", "build/stage-licenses.sh"],
           "mock Mac: a changed i386 recipe rebuilds the i386 farm (--from i386)" + ("" if rc == 0 else out[-1500:]) + " %s" % trace)
 
+    (tree / "tests/x86/video-selftest-x86.c").write_text((tree / "tests/x86/video-selftest-x86.c").read_text() + "/* changed */\n")
+    rc, out, trace, calls = run(tmp, ["--from", "selftest"])
+    check(rc == 0 and trace == ["tests/x86/build-video-selftest.sh", "build/stage-licenses.sh"],
+          "mock Mac: a changed selftest source rebuilds selftest before licences/app (--from selftest)"
+          + ("" if rc == 0 else out[-1500:]) + " %s" % trace)
+
+    for sf in (tree / "app/Madeira/i386-windows").glob("video-selftest*"):
+        sf.unlink()
+    rc, out, trace, calls = run(tmp, ["--from", "selftest"], MADEIRA_BUILD_SELFTEST="0")
+    check(rc == 0 and "tests/x86/build-video-selftest.sh" not in trace
+          and "selftest: skipped (MADEIRA_BUILD_SELFTEST=0)" in out and "selftest left out" in out,
+          "mock Mac: MADEIRA_BUILD_SELFTEST=0 skips selftest and builds an IPA without it"
+          + ("" if rc == 0 else out[-1500:]))
+
     rc, out, trace, calls = run(tmp, ["--only", "dock"])
     check(rc == 0 and trace == ["build/madeira-dock/build.sh"], "mock Mac: --only dock runs that step alone %s" % trace)
 
@@ -419,7 +455,22 @@ with tempfile.TemporaryDirectory(prefix="madeira-mac-build-") as d:
         check(ok, "mock Mac stops on %s ('%s')" % (what, msg) + ("" if ok else ":\n" + out[-1500:]))
         return trace
 
-    t = fails("an undefined link symbol (the 21e6697 app link)", "check-native-link-externs.py failed",
+    fails("an undefined link symbol (the 21e6697 app link)", "check-native-link-externs.py failed",
+          FAKE_FAIL_CHECK_NATIVE_LINK_EXTERNS_PY="1")
+    fails("an app without video-selftest-x86.exe when selftest is enabled", "i386-windows/video-selftest-x86.exe", ["--only", "ipa"])
+    # A self-test that fails to build costs the IPA only the self-test.
+    for what, env in [("its script fails", {"FAKE_SELFTEST_FAIL": "1"}),
+                      ("it lacks LARGE_ADDRESS_AWARE", {"FAKE_NO_SELFTEST_LAA": "1"}),
+                      ("it writes no exe", {"FAKE_NO_SELFTEST": "1"})]:
+        rc, out, trace, calls = run(tmp, ["--from", "selftest"], MADEIRA_FORCE="1", **env)
+        left = [f.name for f in (tree / "app/Madeira/i386-windows").glob("video-selftest*")]
+        check(rc == 0 and "the IPA goes without video-selftest-x86.exe" in out and "selftest left out" in out
+              and not left and trace[-1:] == ["build/stage-licenses.sh"],
+              "mock Mac: when %s, the build warns and makes the IPA without the self-test" % what
+              + ("" if rc == 0 else ":\n" + out[-1500:]))
+    run(tmp, ["--only", "selftest"], MADEIRA_FORCE="1")
+    run(tmp, ["--only", "app"])
+    t = fails("an undefined link symbol (before any step builds)", "check-native-link-externs.py failed",
               FAKE_FAIL_CHECK_NATIVE_LINK_EXTERNS_PY="1")
     check(t == [], "mock Mac: nothing is built before that check")
     fails("a compile FAILED the script only reported", "step ntdll-unix failed to compile", ["--only", "ntdll-unix"],

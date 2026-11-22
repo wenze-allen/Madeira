@@ -116,6 +116,7 @@ jobs:
             build/ffmpeg/obj
             research/freetype
             build/freetype-ios/build
+            ~/.cache/madeira-host-ffmpeg
           key: mac-build-v1-${{ github.run_id }}
           restore-keys: mac-build-v1-
 
@@ -142,6 +143,7 @@ jobs:
             build/ffmpeg/obj
             research/freetype
             build/freetype-ios/build
+            ~/.cache/madeira-host-ffmpeg
           key: mac-build-v1-${{ github.run_id }}
 
       - name: The IPA
