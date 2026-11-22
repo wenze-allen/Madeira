@@ -17,9 +17,13 @@
 #     decodes them in software (wg_parser_av_ios.c, mav_lavc_video). A game's
 #     cutscenes played through the Windows Media Format reader (wmvcore) are
 #     such files; without these the reader failed to connect (0x80040265) and
-#     the game showed a white screen.
-#   - libavformat: the wg_parser's demuxers -- mp3, wav, mov (MP4/MOV/M4A)
-#     and asf (WMV/WMA) -- and the mpegaudio parser the mp3 demuxer selects. No
+#     the game showed a white screen.  Likewise MPEG-1/2 video for .mpg program
+#     streams, and AVI video (mpeg4, mjpeg, cinepak, msvideo1, msrle,
+#     indeo3-5, rawvideo) plus ADPCM / A-law / mu-law audio (adpcm_ms,
+#     adpcm_ima_wav, pcm_alaw, pcm_mulaw) for .avi cutscenes.
+#   - libavformat: the wg_parser's demuxers -- mp3, wav, mov (MP4/MOV/M4A),
+#     asf (WMV/WMA), mpegps (.mpg) and avi -- and the mpegaudio, mpegvideo,
+#     mpeg4video and mjpeg parsers they select. No
 #     protocols: the parser reads through its own AVIOContext (the PE read
 #     thread's pull protocol), never a URL. No muxers.
 #   - libswresample, libavutil.
@@ -121,8 +125,12 @@ CONFIG_ARGS=(
     --enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le
     --enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3
     --enable-decoder=mpeg1video,mpeg2video
+    --enable-decoder=mpeg4,mjpeg,cinepak,msvideo1,msrle,indeo3,indeo4,indeo5,rawvideo
+    --enable-decoder=adpcm_ms,adpcm_ima_wav,pcm_alaw,pcm_mulaw
     --enable-demuxer=mp3,wav,mov,asf,mpegps,mpegvideo
+    --enable-demuxer=avi
     --enable-parser=mpegaudio,mpegvideo
+    --enable-parser=mpeg4video,mjpeg
     --disable-programs
     --disable-doc
     --disable-network

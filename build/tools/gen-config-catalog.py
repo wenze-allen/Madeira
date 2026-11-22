@@ -457,6 +457,10 @@ OVERLAY = {
                 "choices": [("", "Utility (default)"), ("background", "Background"), ("initiated", "User initiated")]},
     "env.MADEIRA_WG_VIDEO": {"title": "Media: MP4 video (32-bit programs)",
                 "note": "0 limits the media parser to MP3/WAV; by default MP4 with H.264/HEVC video decodes through VideoToolbox."},
+    "env.MADEIRA_WG_AVI": {"title": "Media: AVI movies (32-bit programs)",
+                "note": "0 refuses AVI files at connect again; by default an AVI movie (MPEG-4/Xvid/DivX, MJPEG, "
+                        "Cinepak, MS Video 1, MS RLE, Indeo 3-5, raw video; PCM, ADPCM, A-law/mu-law, MPEG audio) "
+                        "plays through the decoding splitter and Media Foundation's source."},
     "env.MADEIRA_WG_MPEG_TRANSFORM": {"title": "Media: MPEG audio decoder (32-bit programs)",
                 "note": "0 refuses the MPEG audio decoder behind DirectShow's MPEG audio and MP3 decoders again; by default "
                         "an MPEG movie built on quartz's MPEG-1 splitter (KiriKiri, BURIKO) gets its sound decoded by libavcodec."},

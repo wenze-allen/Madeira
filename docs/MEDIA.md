@@ -42,7 +42,7 @@ has been tested game by game.
 | File | What it is |
 |---|---|
 | `build/ntdll-unix/winegstreamer_unixlib_ios.c` | Both unix call tables (entry for entry with `dlls/winegstreamer/unixlib.h`), the wow64 thunks, and three kinds of `wg_transform` on libavcodec: the WMA decoder `wma_decoder.c` uses (WMA v1/v2/Pro/Lossless, XMA1/2), the video decoder `video_decoder.c`'s WMVideo Decoder DMO/MFT and `quartz_transform.c`'s MPEG video decoder use (WMV1, WMV2, WMV3, WMVA, WVC1; MPEG-1/2 video; see below), and the MPEG audio decoder `quartz_transform.c`'s MPEG audio and layer-3 decoders use (layers I-III). `transform_create` gives a create to the first kind that claims its input type; every other entry finds the kind by the magic its object starts with. Raw audio in is a third kind, the resampler `resampler.c` uses, on libswresample (see below). Other transforms (AAC, H.264, the colour converter) are refused at create, and `wg_muxer` returns `STATUS_NOT_IMPLEMENTED`. |
-| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext (with RIFF/CDXA 2352-byte sector unwrapping for VideoCD `.dat` files), libavformat demux (mp3, wav, mov, asf, mpegps, mpegvideo), MPEG audio / PCM / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3) and MPEG-1/2 video decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
+| `build/ntdll-unix/wg_parser_av_ios.c` | The `wg_parser` core, `#include`d by the file above: the PE read thread's pull protocol as an AVIOContext (with RIFF/CDXA 2352-byte sector unwrapping for VideoCD `.dat` files), libavformat demux (mp3, wav, mov, asf, mpegps, mpegvideo, avi), MPEG audio / PCM / ADPCM / A-law / mu-law / WMA decode through libavcodec + libswresample, Windows Media video (WMV7/8/9, VC-1, MS-MPEG4 v1-v3), MPEG-1/2 video and AVI video (MPEG-4/Xvid/DivX, MJPEG, Cinepak, MS Video 1, MS RLE, Indeo 3-5, raw video) decoded in software by libavcodec (`mav_lavc_video`), a packet queue with back-pressure, B-frame reordering, keyframe seek with exact trim, and conversion (`mav_convert_picture`, which the WMV transform uses too) to the formats `quartz_parser.c`, `media_source.c` and `wm_reader.c` ask for: NV12, I420, YV12, YUY2, UYVY, YVYU, BGRx, BGRA, RGBA, 24-bit BGR (the WM reader's default, bottom-up), RGB565 and RGB555. |
 | `build/ntdll-unix/wg_parser_apple_ios.c` | H.264/HEVC on VideoToolbox (NV12 out) and AAC on an AudioToolbox AudioConverter (float PCM out). Its own translation unit with no Wine or FFmpeg header. |
 | `build/ntdll-unix/wg_parser_backend_ios.h` | The contract between the core and a decoder backend; plain C types only, so the host test can supply stub backends. |
 | `build/ffmpeg/build.sh` | FFmpeg 7.1.5, pinned by SHA-256, LGPL-only configuration. |
@@ -53,19 +53,27 @@ so FFmpeg's LGPL `wmv1`, `wmv2`, `wmv3`, `vc1` and `msmpeg4v1-3` decoders are
 built and decode it on the CPU (one thread, FFmpeg's C code: `--disable-asm`),
 and so are `mpeg1video` and `mpeg2video` for MPEG program streams (with the
 `mpegvideo` parser, and the `mpegvideo` demuxer, which `mpegps` probes a
-program stream's video with).
+program stream's video with), plus the AVI video (`mpeg4`, `mjpeg`, `cinepak`,
+`msvideo1`, `msrle`, `indeo3`, `indeo4`, `indeo5`, `rawvideo`, with the
+`mpeg4video` and `mjpeg` parsers) and ADPCM / A-law / mu-law audio
+(`adpcm_ms`, `adpcm_ima_wav`, `pcm_alaw`, `pcm_mulaw`) decoders.
 See `THIRD-PARTY-NOTICES.md` for the exact component list and its licence.
 
-**Containers and codecs.** MP3/WAV: MPEG audio and PCM. MP4/MOV: H.264 or
-HEVC video (VideoToolbox) with AAC, MPEG audio or PCM. ASF (WMV/WMA): Windows
-Media video (libavcodec) with WMA v1/v2/Pro/Lossless or MPEG audio. MPEG
-program streams (`.mpg`, MPEG-1 and MPEG-2) and RIFF/CDXA VideoCD sector files
-(`.dat`, unwrapped to 2324-byte packs): MPEG-1/2 video (libavcodec) with MPEG
-audio. Raw MPEG-1 video elementary streams (`.m1v`/`.mpv`): MPEG-1 video
-(libavcodec), timed in display order from the sequence header's frame rate and
-each picture's `temporal_reference`. AVI, raw MPEG-2 video (`.m2v`), transport
-streams, Bink and the like are not handled here (Bink and most engines' own
-formats are decoded by the game itself). The codec format of an
+**Containers and codecs.** MP3/WAV: MPEG audio, PCM, ADPCM and A-law/mu-law.
+MP4/MOV: H.264 or HEVC video (VideoToolbox) with AAC, MPEG audio or PCM. ASF
+(WMV/WMA): Windows Media video (libavcodec) with WMA v1/v2/Pro/Lossless or
+MPEG audio. MPEG program streams (`.mpg`, MPEG-1 and MPEG-2) and RIFF/CDXA
+VideoCD sector files (`.dat`, unwrapped to 2324-byte packs): MPEG-1/2 video
+(libavcodec) with MPEG audio. Raw MPEG-1 video elementary streams
+(`.m1v`/`.mpv`): MPEG-1 video (libavcodec), timed in display order from the
+sequence header's frame rate and each picture's `temporal_reference`. AVI
+(`.avi`): MPEG-4 Part 2 (Xvid, DivX, DX50, FMP4, MP4V), MJPEG, Cinepak, MS
+Video 1, MS RLE, Indeo 3/4/5, raw video, Windows Media / MS-MPEG4 and MPEG-1/2
+video (all libavcodec; H.264 in AVI is refused under the platform-decoder-only
+policy) with PCM, ADPCM (`adpcm_ms`, `adpcm_ima_wav`), A-law, mu-law, MPEG
+audio or WMA. Raw MPEG-2 video (`.m2v`), transport streams, Bink and the like
+are not handled here (Bink and most engines' own formats are decoded by the
+game itself). The codec format of an
 ASF stream (`wg_parser_stream_get_codec_format`) is the one Wine's GStreamer
 backend reports: WMV1/WMV2/WMV3/WMVA/WVC1 video, WMA audio with its version,
 block alignment and codec data, so a game that reads the file's profile
@@ -163,6 +171,25 @@ decoders behind quartz's MPEG filters are two more `wg_transform` kinds:
   is Wine's own.
 Both parsers read past the end of their input, so a sample is copied with
 FFmpeg's padding first.
+
+**AVI files (`.avi`).** A visual novel's `.avi` movie reaches this parser on
+its decoded path in both DirectShow and Media Foundation: a compressed-output
+parser keeps refusing AVI (compressed AVI splitter output is not implemented),
+so Wine's AVI splitter and Media Foundation's AVI handler fall back to
+winegstreamer's decoding splitter (`CLSID_decodebin_parser`) and media source,
+which open a decoding `wg_parser`. Video is decoded by `mav_lavc_video`
+(`mpeg4` including DivX packed B-frame bitstreams, `mjpeg`, `cinepak`,
+`msvideo1`, `msrle`, `indeo3`, `indeo4`, `indeo5`, `rawvideo`, plus the
+existing MS-MPEG4 / WMV / MPEG-1/2 decoders; H.264 in AVI stays off), with the
+`mpeg4video` and `mjpeg` parsers so libavformat derives B-frame presentation
+times from the AVI index. Non-4:2:0 decoder outputs (MJPEG 4:2:2/4:4:4, Indeo
+4:1:0, Cinepak `rgb24`, MS Video 1 `rgb555`/`pal8`, MS RLE `pal8`/monochrome,
+bottom-up raw `bgr24`) are converted straight into the core's NV12 picture
+layout without `libswscale`, and paletted streams keep their `BITMAPINFOHEADER`
+palette across seeks. Audio uses the existing libavcodec + libswresample path
+(`pcm_*`, `adpcm_ms`, `adpcm_ima_wav`, `pcm_alaw`, `pcm_mulaw`, `mp1-3`, WMA).
+`MADEIRA_WG_AVI=0` refuses AVI at connect again, and `MADEIRA_WG_VIDEO=0`
+disables it with the other video containers.
 
 **The WMV decoder (`wg_transform`).** `video_decoder.c` probes a WMV3
 1920x1080 to I420 transform without codec private data when the DMO is
@@ -277,7 +304,8 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 |---|---|---|
 | `MADEIRA_WG_64BIT` | off | `1`: 64-bit processes get the real unix side too (see above). |
 | `MADEIRA_WG_PARSER` | on | `0`: `wg_parser_create` returns `STATUS_NOT_IMPLEMENTED` again, as before this series; quartz and the MF source then fail the way they did. The WMA decoder is unaffected. |
-| `MADEIRA_WG_VIDEO` | on | `0`: MP3/WAV only; an MP4/MOV or ASF is refused at connect. |
+| `MADEIRA_WG_VIDEO` | on | `0`: MP3/WAV only; an MP4/MOV, ASF, MPEG program stream or AVI is refused at connect. |
+| `MADEIRA_WG_AVI` | on | `0`: an AVI file is refused at connect again, while the other video containers stay enabled. |
 | `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: every video `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT and quartz's MPEG video decoder cannot be created, as before. Read once per process. WMA is unaffected. |
 | `MADEIRA_WG_MPEG_TRANSFORM` | on | `0`: the MPEG audio `wg_transform` is refused at create, so quartz's MPEG audio and layer-3 decoders cannot be created, as before. |
 | `MADEIRA_WG_RESAMPLER` | on | `0`: the resampler transform is refused at create, as before. |
@@ -465,6 +493,23 @@ none:
     MP2 in 333-byte pieces to S16 and float; refusals,
     `MADEIRA_WG_MPEG_TRANSFORM=0` and `MADEIRA_WG_MPEG_RAW=0`;
   - the threaded cases again under ThreadSanitizer.
+- `tests/host/check-wg-parser-avi.py` (Linux): source checks on the FFmpeg
+  configuration (the `avi` demuxer, the AVI video and ADPCM/A-law/mu-law audio
+  decoders, `mpeg4video` and `mjpeg` parsers, still no H.264/HEVC/AAC), the
+  `MADEIRA_WG_AVI` switch, `docs/MEDIA.md` and the catalog; then compiles the
+  parser core under ASan/UBSan against the shared host FFmpeg build and
+  synthesises AVI files with FFmpeg's own encoders: `mpeg4` with B-frames +
+  `adpcm_ima_wav`, a DivX packed-bitstream `mpeg4` (`[P+B]` chunks + N-VOPs),
+  `mjpeg` (`yuvj422p`) + PCM, `msvideo1` (`rgb555`) + `adpcm_ms`, `cinepak`
+  (`rgb24`) + `pcm_alaw`, bottom-up `rawvideo` (`bgr24`) + `pcm_mulaw`, and
+  `msrle` (`pal8`). Checks every picture in order against an independent
+  libavcodec decode (bit-exact for 4:2:0 sources, within format-conversion
+  accuracy for 4:2:2, RGB and paletted sources) and the audio tone; keyframe
+  seek with exact trim (including paletted `msrle` after a seek); compressed
+  output refusal; `MADEIRA_WG_AVI=0`, `MADEIRA_WG_VIDEO=0` and H.264-in-AVI
+  refusal; `indeo3`/`indeo4`/`indeo5` codec-id plumbing; back-pressure; and
+  ThreadSanitizer on the threaded cases. Indeo 3/4/5 bitstreams are not
+  decoded: FFmpeg has no Indeo encoder.
 - `tests/host/check-wg-resampler.py` (needs a configured Wine tree, like
   the WMA test): drives the resampler through the `wg_transform` entries under
   ASan/UBSan. It covers:

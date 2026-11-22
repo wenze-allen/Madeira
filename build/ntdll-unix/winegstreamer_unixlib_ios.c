@@ -4453,6 +4453,14 @@ static BOOL wg_video_switch_on(void)
     return !(v && v[0] == '0' && !v[1]);
 }
 
+/* AVI movies through the decoding splitter and Media Foundation's source; 0
+ * refuses an AVI at connect again, as before. */
+static BOOL wg_avi_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_AVI" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
 /* Each decoded video stream decodes ahead on a thread of its own, so a request
  * for another stream on the same thread is not held up behind a picture
  * (mav_ahead_main).  0 decodes on the requesting thread, as before. */
@@ -4525,6 +4533,9 @@ static void wgp_configure(void)
     mav_allow_mpeg_raw( wg_mpeg_raw_switch_on() );
     if (!wg_mpeg_raw_switch_on())
         mav_log( "raw MPEG-1 video and RIFF/CDXA unwrapping disabled by MADEIRA_WG_MPEG_RAW=0" );
+    mav_allow_avi( wg_avi_switch_on() );
+    if (!wg_avi_switch_on())
+        mav_log( "AVI disabled by MADEIRA_WG_AVI=0" );
 
 #ifdef __APPLE__
     mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native );
