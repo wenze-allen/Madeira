@@ -15,6 +15,11 @@ Changes intended for an upstream project should be sent to that project against
 its own tree, under its own licence. Note that FEX-Emu's contribution policy
 prohibits AI-generated code; see the note in `README.md`.
 
+Madeira's own C code follows [docs/C-STANDARD.md](docs/C-STANDARD.md): the
+style of the surrounding code (Wine's), a clean compile with GCC and Clang under
+its warnings, clang-tidy, and host checks under the sanitizers. The submodules
+follow their own projects' rules.
+
 ## Additional permission for Apple's Metal Shader Converter
 
 Madeira links with Apple's proprietary Metal Shader Converter library and

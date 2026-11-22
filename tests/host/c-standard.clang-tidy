@@ -1,0 +1,29 @@
+# docs/C-STANDARD.md, M-AC-2. The general standard's set (c-standards 454f771,
+# tooling/.clang-tidy) with three more checks disabled; the reasons are in
+# docs/C-STANDARD.md, DEVIATIONS.
+#
+# Disabled, as in the general standard:
+#   bugprone-assignment-in-if-condition: ordinary C, as in if ((p = f()) == NULL)
+#   bugprone-easily-swappable-parameters: noise on adjacent parameters of one type
+#   bugprone-narrowing-conversions: duplicates -Wconversion
+#   bugprone-signed-bitwise: C's promotions before <<, >>, & and |
+#   clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling:
+#     recommends Annex K functions, which the libcs here lack
+# Disabled here:
+#   bugprone-assignment-in-selection-statement: the first one's newer name
+#   bugprone-branch-clone: parallel arms written so on purpose
+#   bugprone-multi-level-implicit-pointer-conversion: memmove/free on pointer arrays
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-assignment-in-selection-statement,
+  -bugprone-branch-clone,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-narrowing-conversions,
+  -bugprone-signed-bitwise,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  portability-*
+HeaderFilterRegex: '.*/build/ntdll-unix/.*'
