@@ -164,14 +164,19 @@ fi
 # ----------------------------------------------------------- import closure
 # Every DLL an installed module imports must be in the farm (api-ms-win-* is
 # resolved through apisetschema.dll, which the breadth set includes).
+# The names are looked up with a pattern, not `echo "$present" | grep -qx`: under
+# pipefail that pipeline failed whenever grep found its line and exited before
+# echo had written the whole list (SIGPIPE), and a DLL that was there counted
+# as missing.
 missing=0
-present="$(ls "$DEST" | tr '[:upper:]' '[:lower:]')"
+NL=$'\n'
+present="$NL$(ls "$DEST" | tr '[:upper:]' '[:lower:]')$NL"
 for f in "$DEST"/*; do
     case "$f" in *.tlb) continue ;; esac
     while IFS= read -r imp; do
         l="$(echo "$imp" | tr '[:upper:]' '[:lower:]')"
         case "$l" in api-ms-win-*|ext-ms-win-*) continue ;; esac
-        echo "$present" | grep -qx "$l" && continue
+        case "$present" in *"$NL$l$NL"*) continue ;; esac
         echo "missing import: $(basename "$f") -> $imp"; missing=$((missing + 1))
     done < <("$OBJDUMP" -p "$f" 2>/dev/null | sed -n 's/^ *DLL Name: //p')
 done
