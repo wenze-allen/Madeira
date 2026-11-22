@@ -4160,6 +4160,1208 @@ static NTSTATUS mpa_flush( wg_transform_t handle )
 }
 
 /***********************************************************************
+ *           wg_transform: the video converter   (MADEIRA)
+ *
+ * Media Foundation's color converter (CLSID_CColorConvertDMO, color_convert.c)
+ * and video processor (CLSID_VideoProcessorMFT, video_processor.c) are
+ * wg_transforms whose input is RAW video.  Upstream Wine builds a GStreamer
+ * videoconvert pipeline for them; without a raw-video kind ahead of the WMV /
+ * MPEG video decoder in transform_kinds, every raw video input fell through to
+ * wmv_claims and was refused ("is not a Windows Media or MPEG video stream"),
+ * so IMFSourceReader with advanced video processing (Unity visual novels) and
+ * topologies needing a pixel-format or size change could not create them.
+ * (Wine's vidreszr.dll registers CLSID_CResizerDMO, whose DllGetClassObject is
+ * still a stub in upstream Wine.)
+ *
+ * Supported raw formats, in and out (any pair):
+ *   4:2:0 planar / bi-planar: NV12, YV12, I420, IYUV
+ *   4:2:2 packed:             YUY2, UYVY, YVYU
+ *   4:4:4:4 packed:           AYUV (Windows MFVideoFormat_AYUV / DXGI_FORMAT_AYUV:
+ *                             little-endian 0xAAYYUUVV, bytes V, U, Y, A, just
+ *                             as ARGB32 D3DFMT_A8R8G8B8 is bytes B, G, R, A)
+ *   RGB:                      RGB32 (BGRx), ARGB32 (BGRA), ABGR32 (RGBA),
+ *                             RGB24 (BGR), RGB565, RGB555
+ *
+ * Unscaled 4:2:0 inputs to non-AYUV outputs go straight through the core's
+ * mav_convert_picture.  Every other pair and every scaled output runs a 2-row
+ * streaming pipeline in plain C (pixel-center bilinear scaling clamped at the
+ * edges, YUV<->YUV and RGB<->RGB kept in their own space without a lossy
+ * round-trip, YUV<->RGB in BT.601 or BT.709 limited range matching the core).
+ * MADEIRA_WG_VIDEO_CONVERT=0 refuses it again.
+ */
+#define MADEIRA_WG_VCONV_MAGIC 0x56434e56  /* 'VCNV' */
+#define MADEIRA_VCONV_MAX_LOGS 64
+
+static unsigned int vconv_log_count;
+
+#define VCONV_LOG( fmt, ... )                                                          \
+    do {                                                                               \
+        unsigned int _n = __atomic_add_fetch( &vconv_log_count, 1, __ATOMIC_RELAXED ); \
+        if (_n <= MADEIRA_VCONV_MAX_LOGS)                                              \
+            dprintf( 2, "[vconv] " fmt, ## __VA_ARGS__ );                              \
+        else if (_n == MADEIRA_VCONV_MAX_LOGS + 1)                                     \
+            dprintf( 2, "[vconv] further lines suppressed after %u "                   \
+                        "(MADEIRA_DIAG=1 removes the cap)\n",                          \
+                     (unsigned int)MADEIRA_VCONV_MAX_LOGS );                           \
+        else if (wma_diag_on())                                                        \
+            dprintf( 2, "[vconv] " fmt, ## __VA_ARGS__ );                              \
+    } while (0)
+
+enum vconv_fmt
+{
+    VCONV_FMT_UNKNOWN = 0,
+    VCONV_FMT_NV12,
+    VCONV_FMT_YV12,
+    VCONV_FMT_I420,     /* I420 and IYUV */
+    VCONV_FMT_YUY2,
+    VCONV_FMT_UYVY,
+    VCONV_FMT_YVYU,
+    VCONV_FMT_AYUV,
+    VCONV_FMT_BGRX,     /* MFVideoFormat_RGB32 (D3DFMT_X8R8G8B8) */
+    VCONV_FMT_BGRA,     /* MFVideoFormat_ARGB32 (D3DFMT_A8R8G8B8) */
+    VCONV_FMT_RGBA,     /* MFVideoFormat_ABGR32 (D3DFMT_A8B8G8R8) */
+    VCONV_FMT_BGR,      /* MFVideoFormat_RGB24 (D3DFMT_R8G8B8) */
+    VCONV_FMT_RGB565,   /* MFVideoFormat_RGB565 (D3DFMT_R5G6B5) */
+    VCONV_FMT_RGB555,   /* MFVideoFormat_RGB555 (D3DFMT_X1R5G5B5) */
+};
+
+struct vconv_frame
+{
+    BYTE *buf;
+    size_t cap;
+    UINT32 size;
+    UINT32 stride;          /* sample->stride from push_data (0: default layout) */
+    UINT32 flags;
+    INT64 pts, duration;    /* 100 ns; INT64_MIN: none on the input sample */
+};
+
+struct vconv_transform
+{
+    UINT32 magic;
+    pthread_mutex_t lock;
+    struct wg_transform_attrs attrs;
+
+    MFVideoInfo in_info;
+    enum vconv_fmt in_fmt;
+    INT64 frame_duration;   /* 100 ns, from input/output FramesPerSecond; 0 without one */
+
+    MFVIDEOFORMAT *out_format;
+    UINT32 out_format_size;
+    enum vconv_fmt out_fmt;
+
+    struct vconv_frame *frames;
+    UINT32 frame_count, frame_cap;
+
+    BYTE *scratch;          /* reused conversion / scaling workspace */
+    size_t scratch_cap;
+
+    BOOL draining;
+    BOOL discontinuity;
+    INT64 next_pts;
+
+    UINT32 pushed, delivered, short_dropped;
+    BOOL size_logged, in_stride_logged, out_stride_logged;
+};
+
+static BOOL vconv_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_VIDEO_CONVERT" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
+static struct vconv_transform *get_vconv_transform( wg_transform_t handle )
+{
+    struct vconv_transform *transform = (struct vconv_transform *)(UINT_PTR)handle;
+
+    if (!transform || transform->magic != MADEIRA_WG_VCONV_MAGIC) return NULL;
+    return transform;
+}
+
+static enum vconv_fmt vconv_format( const GUID *subtype )
+{
+    UINT tag;
+
+    if (!madeira_subtype_tag( subtype, &tag )) return VCONV_FMT_UNKNOWN;
+    switch (tag)
+    {
+    case MAKEFOURCC('N','V','1','2'): return VCONV_FMT_NV12;
+    case MAKEFOURCC('Y','V','1','2'): return VCONV_FMT_YV12;
+    case MAKEFOURCC('I','4','2','0'):
+    case MAKEFOURCC('I','Y','U','V'): return VCONV_FMT_I420;
+    case MAKEFOURCC('Y','U','Y','2'): return VCONV_FMT_YUY2;
+    case MAKEFOURCC('U','Y','V','Y'): return VCONV_FMT_UYVY;
+    case MAKEFOURCC('Y','V','Y','U'): return VCONV_FMT_YVYU;
+    case MAKEFOURCC('A','Y','U','V'): return VCONV_FMT_AYUV;
+    case WMV_D3DFMT_X8R8G8B8:         return VCONV_FMT_BGRX;
+    case WMV_D3DFMT_A8R8G8B8:         return VCONV_FMT_BGRA;
+    case WMV_D3DFMT_A8B8G8R8:         return VCONV_FMT_RGBA;
+    case WMV_D3DFMT_R8G8B8:           return VCONV_FMT_BGR;
+    case WMV_D3DFMT_R5G6B5:           return VCONV_FMT_RGB565;
+    case WMV_D3DFMT_X1R5G5B5:         return VCONV_FMT_RGB555;
+    default:                          return VCONV_FMT_UNKNOWN;
+    }
+}
+
+static const char *vconv_fmt_name( enum vconv_fmt fmt )
+{
+    switch (fmt)
+    {
+    case VCONV_FMT_NV12:   return "nv12";
+    case VCONV_FMT_YV12:   return "yv12";
+    case VCONV_FMT_I420:   return "i420";
+    case VCONV_FMT_YUY2:   return "yuy2";
+    case VCONV_FMT_UYVY:   return "uyvy";
+    case VCONV_FMT_YVYU:   return "yvyu";
+    case VCONV_FMT_AYUV:   return "ayuv";
+    case VCONV_FMT_BGRX:   return "bgrx";
+    case VCONV_FMT_BGRA:   return "bgra";
+    case VCONV_FMT_RGBA:   return "rgba";
+    case VCONV_FMT_BGR:    return "bgr";
+    case VCONV_FMT_RGB565: return "rgb16";
+    case VCONV_FMT_RGB555: return "rgb15";
+    default:               return "?";
+    }
+}
+
+static enum mav_pixel_format vconv_to_mav_pix( enum vconv_fmt fmt )
+{
+    switch (fmt)
+    {
+    case VCONV_FMT_NV12:   return MAV_PIX_NV12;
+    case VCONV_FMT_YV12:   return MAV_PIX_YV12;
+    case VCONV_FMT_I420:   return MAV_PIX_I420;
+    case VCONV_FMT_YUY2:   return MAV_PIX_YUY2;
+    case VCONV_FMT_UYVY:   return MAV_PIX_UYVY;
+    case VCONV_FMT_YVYU:   return MAV_PIX_YVYU;
+    case VCONV_FMT_BGRX:   return MAV_PIX_BGRx;
+    case VCONV_FMT_BGRA:   return MAV_PIX_BGRA;
+    case VCONV_FMT_RGBA:   return MAV_PIX_RGBA;
+    case VCONV_FMT_BGR:    return MAV_PIX_BGR;
+    case VCONV_FMT_RGB565: return MAV_PIX_RGB16;
+    case VCONV_FMT_RGB555: return MAV_PIX_RGB15;
+    default:               return MAV_PIX_UNKNOWN;
+    }
+}
+
+static inline BOOL vconv_is_yuv( enum vconv_fmt fmt )
+{
+    return fmt >= VCONV_FMT_NV12 && fmt <= VCONV_FMT_AYUV;
+}
+
+static inline BOOL vconv_is_planar( enum vconv_fmt fmt )
+{
+    return fmt >= VCONV_FMT_NV12 && fmt <= VCONV_FMT_I420;
+}
+
+static inline BOOL vconv_is_subsampled( enum vconv_fmt fmt )
+{
+    return fmt >= VCONV_FMT_NV12 && fmt <= VCONV_FMT_YVYU;
+}
+
+static inline UINT32 vconv_bpp( enum vconv_fmt fmt )
+{
+    switch (fmt)
+    {
+    case VCONV_FMT_NV12:
+    case VCONV_FMT_YV12:
+    case VCONV_FMT_I420:   return 1;
+    case VCONV_FMT_YUY2:
+    case VCONV_FMT_UYVY:
+    case VCONV_FMT_YVYU:
+    case VCONV_FMT_RGB565:
+    case VCONV_FMT_RGB555: return 2;
+    case VCONV_FMT_BGR:    return 3;
+    default:               return 4;
+    }
+}
+
+struct vconv_geom
+{
+    enum vconv_fmt fmt;
+    BOOL flip;
+    UINT32 w, h, aw, ah, ch;
+    UINT32 rx, ry, rw, rh;
+    struct mav_layout frame;
+    struct mav_layout shifted;
+};
+
+static BOOL vconv_geometry( const MFVideoInfo *info, enum vconv_fmt fmt, UINT32 plane_align, UINT32 stride,
+                            BOOL *stride_logged, void *log_owner, struct vconv_geom *g )
+{
+    const MFVideoArea *aperture = &info->MinimumDisplayAperture;
+    UINT32 w = info->dwWidth, h = info->dwHeight, bpp = vconv_bpp( fmt );
+    UINT32 align = (plane_align && !(plane_align & (plane_align + 1))) ? plane_align : 0;
+    UINT32 aw, ah, ch, s0, s1 = 0, s2 = 0, rx = 0, ry = 0, rw, rh, p, planes;
+    struct mav_layout *l = &g->frame;
+
+    if (!w || !h || w > MAV_MAX_DIMENSION || h > MAV_MAX_DIMENSION) return FALSE;
+    aw = (w + align) & ~align;
+    ah = (h + align) & ~align;
+    ch = (ah + 1) / 2;
+    rw = w;
+    rh = h;
+
+    if (fmt == VCONV_FMT_NV12)
+        s0 = s1 = align ? ((MAV_ALIGN4( aw ) + align) & ~align) : ((w + 1) & ~1u);
+    else if (vconv_is_planar( fmt ))
+    {
+        s0 = (MAV_ALIGN4( aw ) + align) & ~align;
+        s1 = s2 = (MAV_ALIGN4( (aw + 1) / 2 ) + align) & ~align;
+    }
+    else if (fmt == VCONV_FMT_BGR)
+        s0 = (MAV_ALIGN4( aw * 3 ) + align) & ~align;
+    else if (bpp == 4)
+        s0 = (aw * 4 + align) & ~align;
+    else
+        s0 = (MAV_ALIGN4( aw * 2 ) + align) & ~align;
+
+    if (stride)
+    {
+        UINT32 row = vconv_is_subsampled( fmt ) ? ((w + 1) & ~1u) * bpp : w * bpp;
+
+        if (stride >= row)
+        {
+            s0 = stride;
+            if (fmt == VCONV_FMT_NV12) s1 = stride;
+            else if (vconv_is_planar( fmt )) s1 = s2 = stride / 2;
+        }
+        else if (stride_logged && !*stride_logged)
+        {
+            *stride_logged = TRUE;
+            VCONV_LOG( "transform %p: a stride of %u is too short for %u pixels of %s; using the default\n",
+                       log_owner, stride, w, vconv_fmt_name( fmt ) );
+        }
+    }
+
+    memset( l, 0, sizeof(*l) );
+    l->stride[0] = s0;
+    l->stride[1] = s1;
+    l->stride[2] = s2;
+    l->chroma_height = ch;
+    if (!vconv_is_planar( fmt )) l->size = (size_t)s0 * ah;
+    else
+    {
+        l->offset[1] = (size_t)s0 * ah;
+        l->offset[2] = l->offset[1] + (size_t)s1 * ch;
+        l->size = fmt == VCONV_FMT_NV12 ? l->offset[2] : l->offset[2] + (size_t)s2 * ch;
+    }
+
+    if ((aperture->OffsetX.value || aperture->OffsetY.value || aperture->Area.cx || aperture->Area.cy)
+        && aperture->OffsetX.value >= 0 && aperture->OffsetY.value >= 0
+        && (UINT32)aperture->OffsetX.value < w && (UINT32)aperture->OffsetY.value < h
+        && aperture->Area.cx > 0 && aperture->Area.cy > 0)
+    {
+        rx = (UINT32)aperture->OffsetX.value;
+        ry = (UINT32)aperture->OffsetY.value;
+        rw = min( (UINT32)aperture->Area.cx, w - rx );
+        rh = min( (UINT32)aperture->Area.cy, h - ry );
+        if (vconv_is_subsampled( fmt )) rx &= ~1u;
+        if (vconv_is_planar( fmt )) ry &= ~1u;
+    }
+
+    g->fmt = fmt;
+    g->flip = !!(info->VideoFlags & MFVideoFlag_BottomUpLinearRep);
+    g->w = w; g->h = h; g->aw = aw; g->ah = ah; g->ch = ch;
+    g->rx = rx; g->ry = ry; g->rw = rw; g->rh = rh;
+
+    g->shifted = *l;
+    planes = fmt == VCONV_FMT_NV12 ? 2 : vconv_is_planar( fmt ) ? 3 : 1;
+    for (p = 0; p < planes; p++)
+    {
+        UINT32 rows = p ? ch : ah, y = p ? ry / 2 : ry, n = p ? (rh + 1) / 2 : rh;
+        UINT32 x = p ? (fmt == VCONV_FMT_NV12 ? rx : rx / 2) : rx * bpp;
+
+        g->shifted.offset[p] += (size_t)l->stride[p] * (g->flip ? rows - y - n : y) + x;
+    }
+    g->shifted.chroma_height = (rh + 1) / 2;
+    return TRUE;
+}
+
+static int vconv_bt709( const MFVideoInfo *in_info, enum vconv_fmt in_fmt,
+                        const MFVideoInfo *out_info, enum vconv_fmt out_fmt )
+{
+    const MFVideoInfo *yuv = vconv_is_yuv( in_fmt ) ? in_info : out_info;
+    UINT32 matrix = yuv->TransferMatrix ? yuv->TransferMatrix
+                    : (in_info->TransferMatrix ? in_info->TransferMatrix : out_info->TransferMatrix);
+
+    switch (matrix)
+    {
+    case MFVideoTransferMatrix_BT709:     return 1;
+    case MFVideoTransferMatrix_BT601:
+    case MFVideoTransferMatrix_SMPTE240M: return 0;
+    default:                              return yuv->dwHeight >= 720;
+    }
+}
+
+/* Studio-range RGB -> YCbCr (Y in 16..235, Cb/Cr in 16..240), 16-bit fixed
+ * point, matching mav_yuv_coefs in the opposite direction.  yr+yg+yb == 219/255
+ * and ur+ug+ub == vr+vg+vb == 0 so black is 16, white is 235, and every gray
+ * lands on Cb=Cr=128 without drift. */
+struct vconv_rgb_coefs
+{
+    int yr, yg, yb;
+    int ur, ug, ub;
+    int vr, vg, vb;
+};
+
+static void vconv_rgb_coefs( int bt709, struct vconv_rgb_coefs *c )
+{
+    double kr = bt709 ? 0.2126 : 0.299, kb = bt709 ? 0.0722 : 0.114, kg = 1.0 - kr - kb;
+    double ys = 219.0 / 255.0, cs = 224.0 / 255.0;
+
+    c->yr = (int)lround( kr * ys * 65536 );
+    c->yg = (int)lround( kg * ys * 65536 );
+    c->yb = (int)lround( ys * 65536 ) - c->yr - c->yg;
+    c->ub = (int)lround( 0.5 * cs * 65536 );
+    c->ur = -(int)lround( 0.5 * kr / (1.0 - kb) * cs * 65536 );
+    c->ug = -c->ub - c->ur;
+    c->vr = c->ub;
+    c->vg = -(int)lround( 0.5 * kg / (1.0 - kr) * cs * 65536 );
+    c->vb = -c->vr - c->vg;
+}
+
+/* Unpacks display row `ry` (0..g->rh-1) of `src` into 4-byte pixels: [Y,U,V,A]
+ * for YUV inputs, [R,G,B,A] for RGB inputs. */
+static void vconv_unpack_row( const BYTE *src, const struct vconv_geom *g, UINT32 ry, uint8_t *dst )
+{
+    UINT32 fy = g->ry + ry, brow = g->flip ? g->ah - 1 - fy : fy;
+    const BYTE *row0 = src + g->frame.offset[0] + (size_t)g->frame.stride[0] * brow;
+    UINT32 x, fx;
+
+    switch (g->fmt)
+    {
+    case VCONV_FMT_NV12:
+    {
+        UINT32 fcy = fy / 2, bcrow = g->flip ? g->ch - 1 - fcy : fcy;
+        const BYTE *uv = src + g->frame.offset[1] + (size_t)g->frame.stride[1] * bcrow;
+        for (x = 0; x < g->rw; x++)
+        {
+            fx = g->rx + x;
+            dst[4 * x + 0] = row0[fx];
+            dst[4 * x + 1] = uv[fx & ~1u];
+            dst[4 * x + 2] = uv[(fx & ~1u) + 1];
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    }
+    case VCONV_FMT_I420:
+    case VCONV_FMT_YV12:
+    {
+        UINT32 fcy = fy / 2, bcrow = g->flip ? g->ch - 1 - fcy : fcy;
+        int up = g->fmt == VCONV_FMT_I420 ? 1 : 2, vp = 3 - up;
+        const BYTE *ur = src + g->frame.offset[up] + (size_t)g->frame.stride[up] * bcrow;
+        const BYTE *vr = src + g->frame.offset[vp] + (size_t)g->frame.stride[vp] * bcrow;
+        for (x = 0; x < g->rw; x++)
+        {
+            fx = g->rx + x;
+            dst[4 * x + 0] = row0[fx];
+            dst[4 * x + 1] = ur[fx / 2];
+            dst[4 * x + 2] = vr[fx / 2];
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    }
+    case VCONV_FMT_YUY2:
+    case VCONV_FMT_UYVY:
+    case VCONV_FMT_YVYU:
+    {
+        int y0 = g->fmt == VCONV_FMT_UYVY ? 1 : 0, y1 = y0 + 2;
+        int uo = g->fmt == VCONV_FMT_YUY2 ? 1 : g->fmt == VCONV_FMT_UYVY ? 0 : 3;
+        int vo = g->fmt == VCONV_FMT_YUY2 ? 3 : g->fmt == VCONV_FMT_UYVY ? 2 : 1;
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)((g->rx + x) & ~1u) * 2;
+            dst[4 * x + 0] = p[(g->rx + x) & 1u ? y1 : y0];
+            dst[4 * x + 1] = p[uo];
+            dst[4 * x + 2] = p[vo];
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    }
+    case VCONV_FMT_AYUV:
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)(g->rx + x) * 4;
+            dst[4 * x + 0] = p[2];
+            dst[4 * x + 1] = p[1];
+            dst[4 * x + 2] = p[0];
+            dst[4 * x + 3] = p[3];
+        }
+        break;
+    case VCONV_FMT_BGRX:
+    case VCONV_FMT_BGRA:
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)(g->rx + x) * 4;
+            dst[4 * x + 0] = p[2];
+            dst[4 * x + 1] = p[1];
+            dst[4 * x + 2] = p[0];
+            dst[4 * x + 3] = g->fmt == VCONV_FMT_BGRA ? p[3] : 0xff;
+        }
+        break;
+    case VCONV_FMT_RGBA:
+        memcpy( dst, row0 + (size_t)g->rx * 4, (size_t)g->rw * 4 );
+        break;
+    case VCONV_FMT_BGR:
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)(g->rx + x) * 3;
+            dst[4 * x + 0] = p[2];
+            dst[4 * x + 1] = p[1];
+            dst[4 * x + 2] = p[0];
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    case VCONV_FMT_RGB565:
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)(g->rx + x) * 2;
+            UINT32 px = (UINT32)p[0] | ((UINT32)p[1] << 8);
+            UINT32 r5 = (px >> 11) & 31u, g6 = (px >> 5) & 63u, b5 = px & 31u;
+            dst[4 * x + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+            dst[4 * x + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+            dst[4 * x + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    case VCONV_FMT_RGB555:
+        for (x = 0; x < g->rw; x++)
+        {
+            const BYTE *p = row0 + (size_t)(g->rx + x) * 2;
+            UINT32 px = (UINT32)p[0] | ((UINT32)p[1] << 8);
+            UINT32 r5 = (px >> 10) & 31u, g5 = (px >> 5) & 31u, b5 = px & 31u;
+            dst[4 * x + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+            dst[4 * x + 1] = (uint8_t)((g5 << 3) | (g5 >> 2));
+            dst[4 * x + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+            dst[4 * x + 3] = 0xff;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+struct vconv_tap
+{
+    UINT32 i0, i1;
+    int w;              /* 0..256 */
+};
+
+/* Pixel-center coordinate mapping: destination pixel `o` samples at
+ * ((o + 0.5) * src_n / dst_n) - 0.5, clamped to [0, src_n - 1]. */
+static inline void vconv_scale_coord( UINT32 o, UINT32 src_n, UINT32 dst_n,
+                                      UINT32 *i0, UINT32 *i1, int *w )
+{
+    int64_t num, den = (int64_t)2 * dst_n, pos;
+
+    if (src_n <= 1 || src_n == dst_n)
+    {
+        *i0 = *i1 = src_n <= 1 ? 0 : o;
+        *w = 0;
+        return;
+    }
+    num = ((int64_t)(2 * o + 1) * src_n - dst_n) * 256;
+    if (num <= 0)
+    {
+        *i0 = *i1 = 0;
+        *w = 0;
+        return;
+    }
+    pos = (num + den / 2) / den;
+    if (pos >= (int64_t)(src_n - 1) * 256)
+    {
+        *i0 = *i1 = src_n - 1;
+        *w = 0;
+        return;
+    }
+    *i0 = (UINT32)(pos >> 8);
+    *i1 = *i0 + 1;
+    *w = (int)(pos & 255);
+}
+
+static void vconv_bilinear_row( const uint8_t *s0, const uint8_t *s1, int wy,
+                                const struct vconv_tap *xt, UINT32 dst_w, uint8_t *dst )
+{
+    int wy0 = 256 - wy, wy1 = wy;
+    UINT32 x;
+    int c;
+
+    for (x = 0; x < dst_w; x++)
+    {
+        const uint8_t *p00 = s0 + (size_t)xt[x].i0 * 4, *p10 = s0 + (size_t)xt[x].i1 * 4;
+        const uint8_t *p01 = s1 + (size_t)xt[x].i0 * 4, *p11 = s1 + (size_t)xt[x].i1 * 4;
+        int wx1 = xt[x].w, wx0 = 256 - wx1;
+        int w00 = wx0 * wy0, w10 = wx1 * wy0, w01 = wx0 * wy1, w11 = wx1 * wy1;
+
+        for (c = 0; c < 4; c++)
+            dst[4 * x + c] = (uint8_t)((w00 * p00[c] + w10 * p10[c] + w01 * p01[c] + w11 * p11[c] + 32768) >> 16);
+    }
+}
+
+static void vconv_row_yuv_to_rgb( uint8_t *row, UINT32 n, const struct mav_yuv_coefs *c )
+{
+    UINT32 x;
+
+    for (x = 0; x < n; x++)
+    {
+        int yy = ((int)row[4 * x + 0] - c->yoff) * c->y + 32768;
+        int u = (int)row[4 * x + 1] - 128, v = (int)row[4 * x + 2] - 128;
+        row[4 * x + 0] = mav_clip8( (yy + c->rv * v) >> 16 );
+        row[4 * x + 1] = mav_clip8( (yy - c->gu * u - c->gv * v) >> 16 );
+        row[4 * x + 2] = mav_clip8( (yy + c->bu * u) >> 16 );
+    }
+}
+
+static void vconv_row_rgb_to_yuv( uint8_t *row, UINT32 n, const struct vconv_rgb_coefs *c )
+{
+    UINT32 x;
+
+    for (x = 0; x < n; x++)
+    {
+        int r = row[4 * x + 0], g = row[4 * x + 1], b = row[4 * x + 2];
+        row[4 * x + 0] = mav_clip8( 16 + ((c->yr * r + c->yg * g + c->yb * b + 32768) >> 16) );
+        row[4 * x + 1] = mav_clip8( 128 + ((c->ur * r + c->ug * g + c->ub * b + 32768) >> 16) );
+        row[4 * x + 2] = mav_clip8( 128 + ((c->vr * r + c->vg * g + c->vb * b + 32768) >> 16) );
+    }
+}
+
+/* Packs one non-planar display row `ry` (0..g->rh-1) from 4-byte pixels into `dst`. */
+static void vconv_pack_packed_row( const uint8_t *src, const struct vconv_geom *g, UINT32 ry, BYTE *dst )
+{
+    UINT32 fy = g->ry + ry, brow = g->flip ? g->ah - 1 - fy : fy, x;
+    BYTE *o = dst + g->frame.offset[0] + (size_t)g->frame.stride[0] * brow + (size_t)g->rx * vconv_bpp( g->fmt );
+
+    switch (g->fmt)
+    {
+    case VCONV_FMT_YUY2:
+    case VCONV_FMT_UYVY:
+    case VCONV_FMT_YVYU:
+    {
+        int y0 = g->fmt == VCONV_FMT_UYVY ? 1 : 0, y1 = y0 + 2;
+        int uo = g->fmt == VCONV_FMT_YUY2 ? 1 : g->fmt == VCONV_FMT_UYVY ? 0 : 3;
+        int vo = g->fmt == VCONV_FMT_YUY2 ? 3 : g->fmt == VCONV_FMT_UYVY ? 2 : 1;
+        for (x = 0; x < g->rw; x += 2)
+        {
+            UINT32 x1 = x + 1 < g->rw ? x + 1 : x;
+            o[2 * x + y0] = src[4 * x + 0];
+            o[2 * x + y1] = src[4 * x1 + 0];
+            o[2 * x + uo] = (uint8_t)(((int)src[4 * x + 1] + src[4 * x1 + 1] + 1) >> 1);
+            o[2 * x + vo] = (uint8_t)(((int)src[4 * x + 2] + src[4 * x1 + 2] + 1) >> 1);
+        }
+        break;
+    }
+    case VCONV_FMT_AYUV:
+        for (x = 0; x < g->rw; x++)
+        {
+            o[4 * x + 0] = src[4 * x + 2];
+            o[4 * x + 1] = src[4 * x + 1];
+            o[4 * x + 2] = src[4 * x + 0];
+            o[4 * x + 3] = src[4 * x + 3];
+        }
+        break;
+    case VCONV_FMT_BGRX:
+    case VCONV_FMT_BGRA:
+        for (x = 0; x < g->rw; x++)
+        {
+            o[4 * x + 0] = src[4 * x + 2];
+            o[4 * x + 1] = src[4 * x + 1];
+            o[4 * x + 2] = src[4 * x + 0];
+            o[4 * x + 3] = g->fmt == VCONV_FMT_BGRA ? src[4 * x + 3] : 0xff;
+        }
+        break;
+    case VCONV_FMT_RGBA:
+        memcpy( o, src, (size_t)g->rw * 4 );
+        break;
+    case VCONV_FMT_BGR:
+        for (x = 0; x < g->rw; x++)
+        {
+            o[3 * x + 0] = src[4 * x + 2];
+            o[3 * x + 1] = src[4 * x + 1];
+            o[3 * x + 2] = src[4 * x + 0];
+        }
+        break;
+    case VCONV_FMT_RGB565:
+    case VCONV_FMT_RGB555:
+        for (x = 0; x < g->rw; x++)
+        {
+            UINT32 r = src[4 * x + 0], gr = src[4 * x + 1], b = src[4 * x + 2];
+            UINT32 px = g->fmt == VCONV_FMT_RGB565
+                        ? ((r >> 3) << 11) | ((gr >> 2) << 5) | (b >> 3)
+                        : ((r >> 3) << 10) | ((gr >> 3) << 5) | (b >> 3);
+            o[2 * x + 0] = (uint8_t)px;
+            o[2 * x + 1] = (uint8_t)(px >> 8);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Packs a pair of 4:2:0 display rows `ry` and `ry + 1` (if `has_r1`) into `dst`. */
+static void vconv_pack_planar_pair( const uint8_t *r0, const uint8_t *r1, BOOL has_r1,
+                                    const struct vconv_geom *g, UINT32 ry, BYTE *dst )
+{
+    UINT32 fy0 = g->ry + ry, brow0 = g->flip ? g->ah - 1 - fy0 : fy0;
+    BYTE *y0 = dst + g->frame.offset[0] + (size_t)g->frame.stride[0] * brow0 + g->rx;
+    UINT32 fcy = (g->ry + ry) / 2, bcrow = g->flip ? g->ch - 1 - fcy : fcy;
+    UINT32 ccw = (g->rw + 1) / 2, x, cx;
+
+    for (x = 0; x < g->rw; x++) y0[x] = r0[4 * x + 0];
+    if (has_r1)
+    {
+        UINT32 fy1 = fy0 + 1, brow1 = g->flip ? g->ah - 1 - fy1 : fy1;
+        BYTE *y1 = dst + g->frame.offset[0] + (size_t)g->frame.stride[0] * brow1 + g->rx;
+        for (x = 0; x < g->rw; x++) y1[x] = r1[4 * x + 0];
+    }
+
+    if (g->fmt == VCONV_FMT_NV12)
+    {
+        BYTE *uv = dst + g->frame.offset[1] + (size_t)g->frame.stride[1] * bcrow + g->rx;
+        for (cx = 0; cx < ccw; cx++)
+        {
+            UINT32 x0 = 2 * cx, x1 = x0 + 1 < g->rw ? x0 + 1 : x0;
+            uv[2 * cx + 0] = (uint8_t)(((int)r0[4 * x0 + 1] + r0[4 * x1 + 1] + r1[4 * x0 + 1] + r1[4 * x1 + 1] + 2) >> 2);
+            uv[2 * cx + 1] = (uint8_t)(((int)r0[4 * x0 + 2] + r0[4 * x1 + 2] + r1[4 * x0 + 2] + r1[4 * x1 + 2] + 2) >> 2);
+        }
+    }
+    else
+    {
+        int up = g->fmt == VCONV_FMT_I420 ? 1 : 2, vp = 3 - up;
+        BYTE *ur = dst + g->frame.offset[up] + (size_t)g->frame.stride[up] * bcrow + g->rx / 2;
+        BYTE *vr = dst + g->frame.offset[vp] + (size_t)g->frame.stride[vp] * bcrow + g->rx / 2;
+        for (cx = 0; cx < ccw; cx++)
+        {
+            UINT32 x0 = 2 * cx, x1 = x0 + 1 < g->rw ? x0 + 1 : x0;
+            ur[cx] = (uint8_t)(((int)r0[4 * x0 + 1] + r0[4 * x1 + 1] + r1[4 * x0 + 1] + r1[4 * x1 + 1] + 2) >> 2);
+            vr[cx] = (uint8_t)(((int)r0[4 * x0 + 2] + r0[4 * x1 + 2] + r1[4 * x0 + 2] + r1[4 * x1 + 2] + 2) >> 2);
+        }
+    }
+}
+
+static NTSTATUS vconv_convert_frame( struct vconv_transform *transform, const BYTE *src,
+                                     const struct vconv_geom *gin, const struct vconv_geom *gout, BYTE *dst )
+{
+    int bt709 = vconv_bt709( &transform->in_info, gin->fmt, &transform->out_format->videoInfo, gout->fmt );
+    BOOL unscaled = gin->rw == gout->rw && gin->rh == gout->rh;
+
+    /* Fast path: unscaled 4:2:0 input -> any non-AYUV output reuses the core's
+     * mav_convert_picture directly (zero-copy for top-down NV12, interleaved
+     * into scratch for I420/YV12 or bottom-up NV12). */
+    if (unscaled && vconv_is_planar( gin->fmt ) && gout->fmt != VCONV_FMT_AYUV)
+    {
+        struct mav_video_output vout;
+        struct mav_vplanes planes;
+
+        memset( &vout, 0, sizeof(vout) );
+        vout.fmt = vconv_to_mav_pix( gout->fmt );
+        vout.width = (int32_t)gout->rw;
+        vout.height = gout->flip ? -(int32_t)gout->rh : (int32_t)gout->rh;
+
+        if (gin->fmt == VCONV_FMT_NV12 && !gin->flip)
+        {
+            planes.y = src + gin->shifted.offset[0];
+            planes.uv = src + gin->shifted.offset[1];
+            planes.y_stride = gin->frame.stride[0];
+            planes.uv_stride = gin->frame.stride[1];
+            planes.width = gin->rw;
+            planes.height = gin->rh;
+            planes.full_range = 0;
+            mav_convert_picture( &vout, bt709, &planes, dst, &gout->shifted );
+            return STATUS_SUCCESS;
+        }
+        else
+        {
+            UINT32 y_stride = gin->rw, uv_stride = (gin->rw + 1) & ~1u;
+            UINT32 ccw = (gin->rw + 1) / 2, cch = (gin->rh + 1) / 2, x, y;
+            size_t y_bytes = (size_t)y_stride * gin->rh;
+            size_t need = y_bytes + (size_t)uv_stride * cch;
+
+            if (!buffer_reserve( &transform->scratch, &transform->scratch_cap, need ))
+                return STATUS_NO_MEMORY;
+            for (y = 0; y < gin->rh; y++)
+            {
+                UINT32 fy = gin->ry + y, brow = gin->flip ? gin->ah - 1 - fy : fy;
+                memcpy( transform->scratch + (size_t)y * y_stride,
+                        src + gin->frame.offset[0] + (size_t)gin->frame.stride[0] * brow + gin->rx, gin->rw );
+            }
+            if (gin->fmt == VCONV_FMT_NV12)
+            {
+                for (y = 0; y < cch; y++)
+                {
+                    UINT32 fcy = gin->ry / 2 + y, bcrow = gin->flip ? gin->ch - 1 - fcy : fcy;
+                    memcpy( transform->scratch + y_bytes + (size_t)y * uv_stride,
+                            src + gin->frame.offset[1] + (size_t)gin->frame.stride[1] * bcrow + gin->rx, ccw * 2 );
+                }
+            }
+            else
+            {
+                int up = gin->fmt == VCONV_FMT_I420 ? 1 : 2, vp = 3 - up;
+                for (y = 0; y < cch; y++)
+                {
+                    UINT32 fcy = gin->ry / 2 + y, bcrow = gin->flip ? gin->ch - 1 - fcy : fcy;
+                    const BYTE *ur = src + gin->frame.offset[up] + (size_t)gin->frame.stride[up] * bcrow + gin->rx / 2;
+                    const BYTE *vr = src + gin->frame.offset[vp] + (size_t)gin->frame.stride[vp] * bcrow + gin->rx / 2;
+                    BYTE *uv = transform->scratch + y_bytes + (size_t)y * uv_stride;
+                    for (x = 0; x < ccw; x++)
+                    {
+                        uv[2 * x + 0] = ur[x];
+                        uv[2 * x + 1] = vr[x];
+                    }
+                }
+            }
+            planes.y = transform->scratch;
+            planes.uv = transform->scratch + y_bytes;
+            planes.y_stride = y_stride;
+            planes.uv_stride = uv_stride;
+            planes.width = gin->rw;
+            planes.height = gin->rh;
+            planes.full_range = 0;
+            mav_convert_picture( &vout, bt709, &planes, dst, &gout->shifted );
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* General streaming path: 2 cached unpacked source rows + 2 output rows. */
+    {
+        size_t tap_bytes = ((size_t)gout->rw * sizeof(struct vconv_tap) + 15u) & ~(size_t)15u;
+        size_t srow_bytes = (size_t)gin->rw * 4;
+        size_t drow_bytes = (size_t)gout->rw * 4;
+        size_t need = tap_bytes + srow_bytes * 2 + drow_bytes * 2;
+        struct vconv_tap *xt;
+        uint8_t *srows[2], *drows[2];
+        INT64 cached_sy[2] = { -1, -1 };
+        BOOL in_yuv = vconv_is_yuv( gin->fmt ), out_yuv = vconv_is_yuv( gout->fmt );
+        BOOL out_planar = vconv_is_planar( gout->fmt );
+        struct mav_yuv_coefs yuv2rgb;
+        struct vconv_rgb_coefs rgb2yuv;
+        UINT32 step = out_planar ? 2 : 1, x, dy, k;
+
+        if (!buffer_reserve( &transform->scratch, &transform->scratch_cap, need ))
+            return STATUS_NO_MEMORY;
+        xt = (struct vconv_tap *)transform->scratch;
+        srows[0] = transform->scratch + tap_bytes;
+        srows[1] = srows[0] + srow_bytes;
+        drows[0] = srows[1] + srow_bytes;
+        drows[1] = drows[0] + drow_bytes;
+
+        if (!unscaled)
+            for (x = 0; x < gout->rw; x++)
+                vconv_scale_coord( x, gin->rw, gout->rw, &xt[x].i0, &xt[x].i1, &xt[x].w );
+        if (in_yuv && !out_yuv) mav_yuv_coefs( bt709, 0, &yuv2rgb );
+        else if (!in_yuv && out_yuv) vconv_rgb_coefs( bt709, &rgb2yuv );
+
+        for (dy = 0; dy < gout->rh; dy += step)
+        {
+            UINT32 count = (out_planar && dy + 1 < gout->rh) ? 2 : 1;
+
+            for (k = 0; k < count; k++)
+            {
+                UINT32 oy = dy + k;
+
+                if (unscaled)
+                {
+                    vconv_unpack_row( src, gin, oy, drows[k] );
+                }
+                else
+                {
+                    UINT32 sy0, sy1;
+                    int wy, slot0, slot1;
+
+                    vconv_scale_coord( oy, gin->rh, gout->rh, &sy0, &sy1, &wy );
+                    if (cached_sy[0] == (INT64)sy0) slot0 = 0;
+                    else if (cached_sy[1] == (INT64)sy0) slot0 = 1;
+                    else
+                    {
+                        slot0 = (cached_sy[0] == (INT64)sy1) ? 1 : 0;
+                        vconv_unpack_row( src, gin, sy0, srows[slot0] );
+                        cached_sy[slot0] = (INT64)sy0;
+                    }
+                    if (sy1 == sy0) slot1 = slot0;
+                    else if (cached_sy[0] == (INT64)sy1) slot1 = 0;
+                    else if (cached_sy[1] == (INT64)sy1) slot1 = 1;
+                    else
+                    {
+                        slot1 = 1 - slot0;
+                        vconv_unpack_row( src, gin, sy1, srows[slot1] );
+                        cached_sy[slot1] = (INT64)sy1;
+                    }
+                    vconv_bilinear_row( srows[slot0], srows[slot1], wy, xt, gout->rw, drows[k] );
+                }
+
+                if (in_yuv && !out_yuv) vconv_row_yuv_to_rgb( drows[k], gout->rw, &yuv2rgb );
+                else if (!in_yuv && out_yuv) vconv_row_rgb_to_yuv( drows[k], gout->rw, &rgb2yuv );
+            }
+
+            if (out_planar)
+                vconv_pack_planar_pair( drows[0], count == 2 ? drows[1] : drows[0],
+                                        count == 2, gout, dy, dst );
+            else
+                vconv_pack_packed_row( drows[0], gout, dy, dst );
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_set_output( struct vconv_transform *transform, const struct wg_media_type *type )
+{
+    const MFVIDEOFORMAT *out = video_format( type );
+    enum vconv_fmt fmt;
+    MFVIDEOFORMAT *copy;
+
+    if (!out || (fmt = vconv_format( &out->guidFormat )) == VCONV_FMT_UNKNOWN) return STATUS_NOT_SUPPORTED;
+    if (out->videoInfo.dwWidth > MAV_MAX_DIMENSION || out->videoInfo.dwHeight > MAV_MAX_DIMENSION)
+        return STATUS_NOT_SUPPORTED;
+    if (!(copy = malloc( type->format_size ))) return STATUS_NO_MEMORY;
+    memcpy( copy, out, type->format_size );
+    if (!copy->videoInfo.dwWidth || !copy->videoInfo.dwHeight)
+    {
+        copy->videoInfo.dwWidth = transform->in_info.dwWidth;
+        copy->videoInfo.dwHeight = transform->in_info.dwHeight;
+    }
+    if (!transform->frame_duration
+        && copy->videoInfo.FramesPerSecond.Numerator && copy->videoInfo.FramesPerSecond.Denominator)
+        transform->frame_duration = (INT64)copy->videoInfo.FramesPerSecond.Denominator * 10000000
+                                    / copy->videoInfo.FramesPerSecond.Numerator;
+    free( transform->out_format );
+    transform->out_format = copy;
+    transform->out_format_size = type->format_size;
+    transform->out_fmt = fmt;
+    transform->size_logged = FALSE;
+    transform->out_stride_logged = FALSE;
+    return STATUS_SUCCESS;
+}
+
+static void vconv_pop_frame( struct vconv_transform *transform )
+{
+    struct vconv_frame first = transform->frames[0];
+
+    if (transform->frame_count > 1)
+        memmove( transform->frames, transform->frames + 1,
+                 (transform->frame_count - 1) * sizeof(*transform->frames) );
+    memset( &transform->frames[transform->frame_count - 1], 0, sizeof(first) );
+    transform->frames[transform->frame_count - 1].buf = first.buf;
+    transform->frames[transform->frame_count - 1].cap = first.cap;
+    transform->frame_count--;
+}
+
+static BOOL vconv_claims( const struct wg_transform_create_params *params )
+{
+    const MFVIDEOFORMAT *in = video_format( &params->input_type );
+    return in && vconv_format( &in->guidFormat ) != VCONV_FMT_UNKNOWN;
+}
+
+static NTSTATUS vconv_create( struct wg_transform_create_params *params )
+{
+    const MFVIDEOFORMAT *in = video_format( &params->input_type );
+    const MFVIDEOFORMAT *out = video_format( &params->output_type );
+    struct vconv_transform *transform;
+    enum vconv_fmt in_fmt;
+    UINT32 fps_n, fps_d;
+    char sub[16];
+    NTSTATUS status;
+
+    params->transform = 0;
+    if (!vconv_switch_on())
+    {
+        VCONV_LOG( "video converter refused: MADEIRA_WG_VIDEO_CONVERT=0\n" );
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (!in || (in_fmt = vconv_format( &in->guidFormat )) == VCONV_FMT_UNKNOWN)
+        return STATUS_NOT_SUPPORTED;
+    if (!in->videoInfo.dwWidth || !in->videoInfo.dwHeight
+        || in->videoInfo.dwWidth > MAV_MAX_DIMENSION || in->videoInfo.dwHeight > MAV_MAX_DIMENSION)
+    {
+        VCONV_LOG( "%s: unusable input frame size %ux%u; refusing\n", vconv_fmt_name( in_fmt ),
+                   (UINT)in->videoInfo.dwWidth, (UINT)in->videoInfo.dwHeight );
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (!out || vconv_format( &out->guidFormat ) == VCONV_FMT_UNKNOWN)
+    {
+        VCONV_LOG( "%s: output subtype %s is not a supported raw video format; refusing\n",
+                   vconv_fmt_name( in_fmt ), out ? wmv_subtype_name( &out->guidFormat, sub ) : "(not video)" );
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (!(transform = calloc( 1, sizeof(*transform) ))) return STATUS_NO_MEMORY;
+    pthread_mutex_init( &transform->lock, NULL );
+    transform->magic = MADEIRA_WG_VCONV_MAGIC;
+    transform->attrs = params->attrs;
+    transform->in_info = in->videoInfo;
+    transform->in_fmt = in_fmt;
+    fps_n = in->videoInfo.FramesPerSecond.Numerator;
+    fps_d = in->videoInfo.FramesPerSecond.Denominator;
+    if (fps_n && fps_d) transform->frame_duration = (INT64)fps_d * 10000000 / fps_n;
+
+    if ((status = vconv_set_output( transform, &params->output_type )))
+    {
+        VCONV_LOG( "%s: output type %ux%u refused (%#x)\n", vconv_fmt_name( in_fmt ),
+                   (UINT)out->videoInfo.dwWidth, (UINT)out->videoInfo.dwHeight, (UINT)status );
+        pthread_mutex_destroy( &transform->lock );
+        transform->magic = 0;
+        free( transform );
+        return status;
+    }
+
+    params->transform = (wg_transform_t)(UINT_PTR)transform;
+    VCONV_LOG( "converter created %s %ux%u%s -> %s %ux%u%s queue=%u%s (transform %p)\n",
+               vconv_fmt_name( transform->in_fmt ), (UINT)transform->in_info.dwWidth,
+               (UINT)transform->in_info.dwHeight,
+               (transform->in_info.VideoFlags & MFVideoFlag_BottomUpLinearRep) ? " bottom-up" : "",
+               vconv_fmt_name( transform->out_fmt ), (UINT)transform->out_format->videoInfo.dwWidth,
+               (UINT)transform->out_format->videoInfo.dwHeight,
+               (transform->out_format->videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep) ? " bottom-up" : "",
+               transform->attrs.input_queue_length, transform->attrs.preserve_timestamps ? " preserve-ts" : "",
+               transform );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_destroy( wg_transform_t handle )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+    UINT32 i;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    if (transform->pushed || transform->short_dropped)
+        VCONV_LOG( "destroy: transform %p, %s -> %s: %u frames in, %u out, %u short dropped\n",
+                   transform, vconv_fmt_name( transform->in_fmt ), vconv_fmt_name( transform->out_fmt ),
+                   transform->pushed, transform->delivered, transform->short_dropped );
+    transform->magic = 0;
+    for (i = 0; i < transform->frame_cap; i++) free( transform->frames[i].buf );
+    free( transform->frames );
+    free( transform->scratch );
+    free( transform->out_format );
+    pthread_mutex_unlock( &transform->lock );
+    pthread_mutex_destroy( &transform->lock );
+    free( transform );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_get_output_type( wg_transform_t handle, struct wg_media_type *type )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+    UINT32 size;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    size = transform->out_format_size;
+    type->major = madeira_MFMediaType_Video;
+    if (!type->u.format || type->format_size < size)
+    {
+        type->format_size = size;
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    memcpy( type->u.format, transform->out_format, size );
+    type->format_size = size;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_set_output_type( wg_transform_t handle, const struct wg_media_type *type )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+    NTSTATUS status;
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    /* Queued input frames are kept and converted to the new output format when read. */
+    if (!(status = vconv_set_output( transform, type )))
+        VCONV_LOG( "transform %p: output type set to %s %ux%u%s\n", transform,
+                   vconv_fmt_name( transform->out_fmt ), (UINT)transform->out_format->videoInfo.dwWidth,
+                   (UINT)transform->out_format->videoInfo.dwHeight,
+                   (transform->out_format->videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep) ? " bottom-up" : "" );
+    pthread_mutex_unlock( &transform->lock );
+    return status;
+}
+
+static NTSTATUS vconv_push_data( wg_transform_t handle, struct wg_sample *sample, const void *data, HRESULT *result )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+    struct vconv_frame *slot;
+    struct vconv_geom gin;
+    UINT32 avail;
+
+    if (!transform || !sample) return STATUS_INVALID_HANDLE;
+    /* wg_sample_create_mf locks a 2D buffer via Lock2DSize: sample->max_size is
+     * the pitched buffer length while sample->size is GetContiguousLength(). */
+    avail = sample->stride ? (sample->max_size ? sample->max_size : sample->size) : sample->size;
+    if (avail && !data) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &transform->lock );
+    if (transform->draining || transform->frame_count > transform->attrs.input_queue_length)
+    {
+        pthread_mutex_unlock( &transform->lock );
+        *result = MF_E_NOTACCEPTING;
+        return STATUS_SUCCESS;
+    }
+    if (!vconv_geometry( &transform->in_info, transform->in_fmt, 0, sample->stride,
+                         &transform->in_stride_logged, transform, &gin ))
+    {
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (avail < gin.frame.size)
+    {
+        transform->short_dropped++;
+        transform->discontinuity = TRUE;
+        if (transform->short_dropped <= 4)
+            VCONV_LOG( "transform %p: %u-byte input sample is smaller than a %ux%u %s frame (%zu bytes); dropping\n",
+                       transform, avail, gin.w, gin.h, vconv_fmt_name( gin.fmt ), gin.frame.size );
+        pthread_mutex_unlock( &transform->lock );
+        *result = S_OK;
+        return STATUS_SUCCESS;
+    }
+    if (transform->frame_count == transform->frame_cap)
+    {
+        UINT32 cap = transform->frame_cap ? transform->frame_cap * 2 : 4;
+        struct vconv_frame *grown = realloc( transform->frames, cap * sizeof(*grown) );
+
+        if (!grown)
+        {
+            pthread_mutex_unlock( &transform->lock );
+            return STATUS_NO_MEMORY;
+        }
+        memset( grown + transform->frame_cap, 0, (cap - transform->frame_cap) * sizeof(*grown) );
+        transform->frames = grown;
+        transform->frame_cap = cap;
+    }
+    slot = &transform->frames[transform->frame_count];
+    if (!buffer_reserve( &slot->buf, &slot->cap, gin.frame.size ))
+    {
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_NO_MEMORY;
+    }
+    memcpy( slot->buf, data, gin.frame.size );
+    slot->size = (UINT32)gin.frame.size;
+    slot->stride = sample->stride;
+    slot->flags = sample->flags;
+    slot->pts = (sample->flags & WG_SAMPLE_FLAG_HAS_PTS) ? sample->pts : INT64_MIN;
+    slot->duration = (sample->flags & WG_SAMPLE_FLAG_HAS_DURATION) ? (INT64)sample->duration : INT64_MIN;
+    transform->frame_count++;
+    transform->pushed++;
+    pthread_mutex_unlock( &transform->lock );
+    *result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_read_data( wg_transform_t handle, struct wg_sample *sample, void *data, HRESULT *result )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+    struct vconv_frame *frame;
+    struct vconv_geom gin, gout;
+    BOOL preserve = FALSE;
+    INT64 pts, duration;
+    NTSTATUS status;
+
+    if (!transform || !sample) return STATUS_INVALID_HANDLE;
+    if (sample->max_size && !data) return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &transform->lock );
+    if (!transform->frame_count)
+    {
+        transform->draining = FALSE;
+        sample->size = 0;
+        pthread_mutex_unlock( &transform->lock );
+        *result = MF_E_TRANSFORM_NEED_MORE_INPUT;
+        return STATUS_SUCCESS;
+    }
+    frame = &transform->frames[0];
+    if (!vconv_geometry( &transform->in_info, transform->in_fmt, 0, frame->stride,
+                         &transform->in_stride_logged, transform, &gin )
+        || !vconv_geometry( &transform->out_format->videoInfo, transform->out_fmt,
+                            transform->attrs.output_plane_align, sample->stride,
+                            &transform->out_stride_logged, transform, &gout ))
+    {
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (gout.frame.size > sample->max_size)
+    {
+        if (!transform->size_logged)
+        {
+            transform->size_logged = TRUE;
+            VCONV_LOG( "transform %p: a %u-byte buffer cannot hold a %ux%u %s frame (%zu bytes)\n",
+                       transform, sample->max_size, gout.w, gout.h, vconv_fmt_name( gout.fmt ), gout.frame.size );
+        }
+        sample->size = 0;
+        pthread_mutex_unlock( &transform->lock );
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if ((status = vconv_convert_frame( transform, frame->buf, &gin, &gout, data )))
+    {
+        sample->size = 0;
+        pthread_mutex_unlock( &transform->lock );
+        return status;
+    }
+
+    if (frame->pts != INT64_MIN)
+    {
+        pts = frame->pts;
+        preserve = transform->attrs.preserve_timestamps;
+    }
+    else pts = transform->next_pts;
+    duration = frame->duration != INT64_MIN ? frame->duration : transform->frame_duration;
+    transform->next_pts = pts + duration;
+
+    sample->size = (UINT32)gout.frame.size;
+    sample->flags &= ~(WG_SAMPLE_FLAG_INCOMPLETE | WG_SAMPLE_FLAG_HAS_PTS | WG_SAMPLE_FLAG_HAS_DURATION |
+                       WG_SAMPLE_FLAG_SYNC_POINT | WG_SAMPLE_FLAG_DISCONTINUITY |
+                       WG_SAMPLE_FLAG_PRESERVE_TIMESTAMPS);
+    sample->flags |= WG_SAMPLE_FLAG_SYNC_POINT | WG_SAMPLE_FLAG_HAS_PTS | WG_SAMPLE_FLAG_HAS_DURATION;
+    if (preserve) sample->flags |= WG_SAMPLE_FLAG_PRESERVE_TIMESTAMPS;
+    if ((frame->flags & WG_SAMPLE_FLAG_DISCONTINUITY) || transform->discontinuity)
+        sample->flags |= WG_SAMPLE_FLAG_DISCONTINUITY;
+    transform->discontinuity = FALSE;
+    sample->pts = pts;
+    sample->duration = duration;
+
+    vconv_pop_frame( transform );
+    if (!transform->frame_count) transform->draining = FALSE;
+    transform->delivered++;
+    pthread_mutex_unlock( &transform->lock );
+    *result = S_OK;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_get_status( wg_transform_t handle, UINT32 *accepts_input )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    *accepts_input = !transform->draining && transform->frame_count <= transform->attrs.input_queue_length;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_drain( wg_transform_t handle )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    transform->draining = transform->frame_count > 0;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS vconv_flush( wg_transform_t handle )
+{
+    struct vconv_transform *transform = get_vconv_transform( handle );
+
+    if (!transform) return STATUS_INVALID_HANDLE;
+    pthread_mutex_lock( &transform->lock );
+    transform->frame_count = 0;
+    transform->draining = FALSE;
+    transform->discontinuity = FALSE;
+    transform->next_pts = 0;
+    pthread_mutex_unlock( &transform->lock );
+    return STATUS_SUCCESS;
+}
+
+/***********************************************************************
  *           transform kinds
  *
  * wg_transform_create gives the create to the first kind below that claims
@@ -4204,6 +5406,13 @@ static const struct wg_transform_ops wma_transform_ops =
     wma_set_output_type, wma_push_data, wma_read_data, wma_get_status, wma_drain, wma_flush,
 };
 
+static const struct wg_transform_ops vconv_transform_ops =
+{
+    "video converter", MADEIRA_WG_VCONV_MAGIC, vconv_claims, vconv_create, vconv_destroy,
+    vconv_get_output_type, vconv_set_output_type, vconv_push_data, vconv_read_data,
+    vconv_get_status, vconv_drain, vconv_flush,
+};
+
 static const struct wg_transform_ops wmv_transform_ops =
 {
     "wmv", MADEIRA_WG_WMV_MAGIC, wmv_claims, wmv_create, wmv_destroy, wmv_get_output_type,
@@ -4211,12 +5420,14 @@ static const struct wg_transform_ops wmv_transform_ops =
 };
 
 /* In claim order: raw audio is the resampler's, MPEG audio the MPEG audio
- * decoder's, other audio the WMA decoder's. */
+ * decoder's, other audio the WMA decoder's; raw video is the video converter's,
+ * ahead of the WMV/MPEG decoder which claims the remaining video inputs. */
 static const struct wg_transform_ops *const transform_kinds[] =
 {
     &rs_transform_ops,
     &mpa_transform_ops,
     &wma_transform_ops,
+    &vconv_transform_ops,
     &wmv_transform_ops,
 };
 

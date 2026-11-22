@@ -240,6 +240,30 @@ now libswresample:
 It logs one `[resampler] created ...` line per transform.
 `MADEIRA_WG_RESAMPLER=0` refuses it again.
 
+**The video converters (`wg_transform`).** Media Foundation's color converter
+(`CLSID_CColorConvertDMO`, `color_convert.c`) and video processor
+(`CLSID_VideoProcessorMFT`, `video_processor.c`) are `wg_transforms` whose
+input is raw video (`IMFSourceReader` with video processing enabled in Unity
+visual novels, or a topology needing a format or frame-size change; upstream
+Wine's `vidreszr.dll` registers `CLSID_CResizerDMO` as a stub). Without a
+raw-video kind ahead of the WMV/MPEG decoder in `transform_kinds`, both failed
+their `check_video_transform_support` (`I420` 1920x1080 -> `NV12` 1920x1080)
+probe at creation. The `"video converter"` kind claims raw video inputs before
+the decoder kind:
+- converts between any pair of NV12, YV12, I420, IYUV, YUY2, UYVY, YVYU, AYUV,
+  RGB32, ARGB32, ABGR32, RGB24, RGB565 and RGB555, top-down or bottom-up
+  (`MFVideoFlag_BottomUpLinearRep`), at default strides, `output_plane_align`,
+  or a 2D buffer's `sample->stride` on input and output, and honours input and
+  output `MinimumDisplayAperture`s;
+- reuses `mav_convert_picture` for unscaled 4:2:0 inputs to non-AYUV outputs,
+  keeps YUV-to-YUV and RGB-to-RGB conversions in their own colour space (so
+  planar/packed reorderings and alpha channels stay exact), and converts
+  YUV<->RGB in BT.601 or BT.709 limited range;
+- scales in plain C with edge-clamped pixel-center bilinear interpolation when
+  the input and output active sizes differ.
+
+It logs under `[vconv]`. `MADEIRA_WG_VIDEO_CONVERT=0` refuses it again.
+
 **One demuxer, several readers: back-pressure.** Quartz reads each stream on
 its own thread (Media Foundation's source does not; see decode-ahead below); a
 packet read for another stream is queued for it. A stream whose reader falls behind (a video decoded slower
@@ -306,7 +330,8 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_PARSER` | on | `0`: `wg_parser_create` returns `STATUS_NOT_IMPLEMENTED` again, as before this series; quartz and the MF source then fail the way they did. The WMA decoder is unaffected. |
 | `MADEIRA_WG_VIDEO` | on | `0`: MP3/WAV only; an MP4/MOV, ASF, MPEG program stream or AVI is refused at connect. |
 | `MADEIRA_WG_AVI` | on | `0`: an AVI file is refused at connect again, while the other video containers stay enabled. |
-| `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: every video `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT and quartz's MPEG video decoder cannot be created, as before. Read once per process. WMA is unaffected. |
+| `MADEIRA_WG_WMV_TRANSFORM` | on | `0`: the WMV/MPEG video decoder `wg_transform` is refused at create again, so the WMVideo Decoder DMO/MFT and quartz's MPEG video decoder cannot be created, as before. Read once per process. WMA and the video converter are unaffected. |
+| `MADEIRA_WG_VIDEO_CONVERT` | on | `0`: the raw video converter `wg_transform` is refused at create again, so `CLSID_CColorConvertDMO` and `CLSID_VideoProcessorMFT` cannot be created, as before. |
 | `MADEIRA_WG_MPEG_TRANSFORM` | on | `0`: the MPEG audio `wg_transform` is refused at create, so quartz's MPEG audio and layer-3 decoders cannot be created, as before. |
 | `MADEIRA_WG_RESAMPLER` | on | `0`: the resampler transform is refused at create, as before. |
 | `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF, an MPEG program stream and a raw MPEG-1 video stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
@@ -320,11 +345,12 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 ## Reading playback logs
 
 Log tags: `[wg-parser]` for the parser, `[wmv]` for the WMV and MPEG-1/2 video
-decoder, `[wma]` for the WMA decoder, and `[resampler]` for the resampler and
-the MPEG audio decoder (plus `av:` lines from libavformat/libavcodec routed
-under the owner's tag). All are rate-limited per process (`[wg-parser]`
-deduplicates identical lines and caps at 63 distinct lines; `MADEIRA_DIAG=1`
-lifts the `[wma]`, `[wmv]` and `[resampler]` caps).
+decoder, `[vconv]` for the video converter, `[wma]` for the WMA decoder, and
+`[resampler]` for the resampler and the MPEG audio decoder (plus `av:` lines
+from libavformat/libavcodec routed under the owner's tag). All are rate-limited
+per process (`[wg-parser]` deduplicates identical lines and caps at 63 distinct
+lines; `MADEIRA_DIAG=1` lifts the `[wma]`, `[wmv]`, `[vconv]` and `[resampler]`
+caps).
 
 **Parser stream summaries (`[wg-parser]`).** Each exposed stream logs one line
 on its first delivered buffer (`stream N first: ...`, in case the game hangs or
@@ -365,11 +391,12 @@ Fields:
   pixel/sample conversion time per picture or audio buffer, excluding demuxing
   and back-pressure waits.
 
-**Transform summaries (`[wmv]`, `[wma]`, `[resampler]`).** Each `wg_transform`
+**Transform summaries (`[wmv]`, `[vconv]`, `[wma]`, `[resampler]`).** Each `wg_transform`
 that received a sample logs one `destroy:` line when torn down (with its
 `created` line at open); the support probes, created and destroyed unused, log
 none:
 - `[wmv] destroy: transform 0x..., WMV3 1280x720 -> bgrx 1280x-720 bottom-up: S samples in, P pictures out, R rejected by the decoder, D dropped without a decoder, L lost to memory`
+- `[vconv] destroy: transform 0x..., i420 -> nv12: F frames in, O out, S short dropped`
 - `[wma] destroy: transform 0x..., wmav2 44100 Hz 2ch block=2973 (128000 bit/s) -> s16 44100 Hz 2ch: S samples (K packets) in, O samples (F frames) out, E packet errors (Z silence frames)` (plus `[muted]` if the parameter ladder exhausted without a valid decode)
 - `[resampler] destroy: transform 0x..., s16 48000 Hz 2ch -> f32 48000 Hz 2ch: S samples (I frames) in, O samples (F frames) out, E errors`
 - `[resampler] MPEG audio destroy: transform 0x..., MPEG-1 layer II 44100 Hz 2ch -> s16 44100 Hz 2ch: S samples (B bytes) in, O samples (F frames) out, E errors`
@@ -520,6 +547,26 @@ none:
   - `check_audio_transform_support()`'s probe, back-pressure, flush, a new
     output type mid-stream, drain;
   - refusals and `MADEIRA_WG_RESAMPLER=0`.
+- `tests/host/check-wg-video-convert.py` (needs a configured Wine tree, like
+  the WMV test): source checks on both call tables, `transform_kinds[]` order
+  ahead of the decoder kind, the kill switch, Wine's `color_convert_create` and
+  `video_processor_create` probes, `docs/MEDIA.md` and the settings catalog;
+  then compiles `winegstreamer_unixlib_ios.c` under ASan/UBSan and drives the
+  `"video converter"` kind through both call tables. It checks:
+  - Wine's `color_convert.c` and `video_processor.c` `I420` 1920x1080 -> `NV12`
+    1920x1080 probes and a 1080p conversion;
+  - all 196 pairs of NV12, YV12, I420, IYUV, YUY2, UYVY, YVYU, AYUV, RGB32,
+    ARGB32, ABGR32, RGB24, RGB565 and RGB555 in all four top-down/bottom-up
+    combinations against an independent BT.601 limited-range oracle (plus
+    BT.709), with guard bytes untouched;
+  - 2D buffer `sample->stride` on input and output, `output_plane_align`, and
+    input/output `MinimumDisplayAperture`s;
+  - upscale, downscale and edge/1x1 cases against an independent floating-point
+    bilinear reference;
+  - timestamps, queue limits, drain, flush, mid-stream `set_output_type`,
+    two-phase `get_output_type`, `STATUS_BUFFER_TOO_SMALL`, short input
+    buffers, two threads, the wow64 32-bit thunks (`MAP_32BIT`), coexistence
+    with WMV and WMA, refusals, and `MADEIRA_WG_VIDEO_CONVERT=0`.
 - `tests/x86/wma-x86.c` (`build-wma-test.sh`): a 32-bit program that
   reaches the WMA decoder exactly as FAudio does and checks that the decoded
   PCM has the 440 Hz fundamental it was encoded from. Exit 62 pass, 63 decode

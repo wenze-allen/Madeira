@@ -470,6 +470,9 @@ OVERLAY = {
     "env.MADEIRA_WG_RESAMPLER": {"title": "Media: audio resampler (32-bit programs)",
                 "note": "0 refuses the resampler transform again; by default Media Foundation converts a movie's audio to the "
                         "device mix format with libswresample."},
+    "env.MADEIRA_WG_VIDEO_CONVERT": {"title": "Media: video colour converter and processor (32-bit programs)",
+                "note": "0 refuses the raw video converter transform again; by default Media Foundation's colour converter "
+                        "(CLSID_CColorConvertDMO) and video processor (CLSID_VideoProcessorMFT) convert and scale decoded video."},
     "env.MADEIRA_WG_COMPRESSED": {"title": "Media: compressed WMV/WMA samples (32-bit programs)",
                 "note": "0 refuses the WM reader's compressed samples of an ASF again; by default an application that "
                         "decodes them itself (KiriKiri's movie plugin, through the WMV/WMA decoder DMOs) gets the file's packets."},

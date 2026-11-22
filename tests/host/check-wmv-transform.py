@@ -935,7 +935,7 @@ static int test_refusals(void)
         { FCC('H','2','6','4'), FCC('N','V','1','2'), W, H, NULL, 0, "H.264 in" },
         { FCC('W','M','V','P'), FCC('N','V','1','2'), W, H, NULL, 0, "WMVP in" },
         { FCC('V','C','1','S'), FCC('N','V','1','2'), W, H, NULL, 0, "VC1S in" },
-        { FCC('N','V','1','2'), FCC('I','4','2','0'), W, H, NULL, 0, "raw NV12 in (a video processor)" },
+        { FCC('N','V','1','1'), FCC('I','4','2','0'), W, H, NULL, 0, "unsupported raw NV11 in" },
         { FCC('W','M','V','2'), FCC('N','V','1','1'), W, H, NULL, 0, "NV11 out" },
         { FCC('W','M','V','2'), 41 /* D3DFMT_P8 */, W, H, NULL, 0, "RGB8 out" },
         { FCC('W','M','V','2'), FCC('A','Y','U','V'), W, H, NULL, 0, "AYUV out" },
