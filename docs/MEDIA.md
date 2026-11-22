@@ -571,3 +571,72 @@ none:
   reaches the WMA decoder exactly as FAudio does and checks that the decoded
   PCM has the 440 Hz fundamental it was encoded from. Exit 62 pass, 63 decode
   failed, 64 class not registered, 65 watchdog.
+- `tests/x86/video-selftest-x86.c` (`build-video-selftest.sh`,
+  `make-video-clips.py`, host check `tests/host/check-video-selftest.py`):
+  one 32-bit on-device self-test covering every video path visual novels use
+  (see below).
+
+### Running `video-selftest-x86.exe` on the iPad
+
+Build and stage the 32-bit executable and its two 2-second test clips
+(`video-selftest.wmv` and `video-selftest.mpg`, 320x240 25 fps with a 440 Hz
+stereo tone, also embedded in the PE as a standalone fallback):
+
+```sh
+./tests/x86/build-video-selftest.sh
+```
+
+This copies `video-selftest-x86.exe`, `video-selftest.wmv` and
+`video-selftest.mpg` into `app/Madeira/i386-windows/`, which `WineProcessBridge`
+links into `C:\windows\syswow64\` at launch (requires the i386 farm from
+`build/wine-i386/build.sh`). Package and install the app, then set in
+`madeira.cfg`:
+
+```ini
+env.MADEIRA_EXE = video-selftest-x86.exe
+```
+
+The program writes its report both to `stderr`/`stdout` (captured in Madeira's
+console log) and to `%USERPROFILE%\Documents\video-selftest.log` (override with
+`env.MADEIRA_SELFTEST_LOG = C:\path\to\log.txt`).
+
+**What each output line means:**
+
+- Header (`log:`, `wmv:`, `mpg:`): the active log file path and where each test
+  clip was loaded from (`beside-exe` when staged in `syswow64`, `cwd`, or
+  `embedded-temp` / `embedded-docs` when extracted from the binary).
+- `[1/6] PASS|FAIL kirikiri2-wmv-dmo`: Sabbat of the Witch's path —
+  `LoadLibrary("wmvcore.dll")` + `GetProcAddress("WMCreateSyncReader")`,
+  `SetReadStreamSamples(TRUE)` on both ASF streams, and direct DMO decode
+  (`CLSID_CWMVDecMediaObject` to RGB32, `CLSID_CWMADecMediaObject` to 16-bit
+  PCM). Prints compressed packet counts (`pkts=video+audio`), decoded RGB32
+  `frames`, `size`, `rgb_crc`, `pcm_frames`, `peak`, Zero-crossing `freq` (~440
+  Hz) and `pcm_crc`; on `FAIL`, prints the failing `step=` and `hr=`.
+- `[2/6] PASS|FAIL kirikiri-mpeg1`: KiriKiri's hand-built DirectShow MPEG-1
+  graph (`ConnectDirect` only, no `RenderFile`): `CLSID_AsyncReader` →
+  `CLSID_MPEG1Splitter` → `CLSID_CMpegVideoCodec` → custom sink accepting only
+  bottom-up RGB32 (`biHeight > 0`), and splitter → `CLSID_CMpegAudioCodec` →
+  custom PCM sink. Checks `size=320x240` from `ConnectionMediaType`,
+  `IAMStreamSelect` `Count`/`Info` (`streams=2`), plays to `EC_COMPLETE`
+  (`pass1_frames`), rewinds with `IMediaPosition::put_CurrentPosition(0)`, and
+  plays to `EC_COMPLETE` again (`pass2_frames`, `pcm_frames`, `rgb_crc`).
+- `[3/6] PASS|FAIL dshow-renderfile-mpeg`: `IGraphBuilder::RenderFile` on the
+  MPEG-1 clip with the default renderer attached to a hidden window, running to
+  `EC_COMPLETE` (`elapsed` in ms).
+- `[4/6] PASS|FAIL mf-session-evr-sar`: Senren Banka's path — the ASF clip
+  through `MFCreateMediaSession` with `MFCreateVideoRendererActivate` (EVR on a
+  window) and `MFCreateAudioRendererActivate` (SAR). Checks that
+  `IMFVideoDisplayControl::GetCurrentImage` returns a non-black DIB mid-way
+  (`image=320x240`, `nonblack_px`, `img_ts`), that
+  `IMFPresentationClock::GetTime` advances (`clock=start->end`), and that the
+  session reaches `MESessionEnded` (`ended=1`).
+- `[5/6] PASS|FAIL mf-source-reader`: `MFCreateSourceReaderFromURL` on the ASF
+  clip configured for `MFVideoFormat_RGB32`, counting non-black decoded frames
+  (`frames`, `size`, `rgb_crc`).
+- `[6/6] PASS|FAIL mci-mpeg`: `mciSendString` `open` / `play ... notify` /
+  `close` on the MPEG-1 clip, waiting for playback completion (`notify=1`,
+  `elapsed` in ms).
+- `=== SUMMARY: P/6 passed, F failed (exit=F) ===`: final tally. Process exit
+  code is `0` when all 6 paths pass, `1..6` for the exact number of paths that
+  failed (or `6` if the 90 s watchdog fires, `99` if COM or clip staging fails
+  before the paths start).
