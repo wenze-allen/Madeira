@@ -312,6 +312,20 @@ submodule:
   session thread that also feeds the audio. It now locks with
   `D3DLOCK_DISCARD`, since it overwrites every byte.
 
+**DirectShow's default video renderer.** `RenderFile` connects video to the
+"Video Renderer", which is the VMR-7 (the GDI renderer only if the VMR-7
+cannot be created). The VMR-7 draws through DirectDraw, and DirectDraw through
+wined3d, which has no 3D backend in this port: ddraw falls back to wined3d's
+no3d adapter, whose CPU blitter converts only YUY2 to RGB. The VMR-7 takes RGB
+and any FOURCC that DirectDraw lists, and quartz's MPEG video decoder offers
+YV12 first, so an MPEG-1 movie through `RenderFile` connected in YV12. In no3d a
+YV12 surface holds only its luma plane, so each frame's copy overran it, and
+each blit failed: a black window, if the game did not crash. Without 3D, ddraw
+now lists only YUY2 (wine submodule), and the VMR-7 takes the decoder's YUY2.
+Movies that reach the renderer through the decoding splitter (MPEG-2, AVI) get
+RGB32 first and were not affected. `tests/host/check-dshow-default-renderer.py`
+pins the chain.
+
 The PE half of winegstreamer is upstream's but for `wm_reader.c` (above). Wine's configure
 disables the module when GStreamer is missing, so a PE build tree has to be
 configured with `--enable-winegstreamer` (`build/wine-pe/build-ntdll.sh` does
@@ -467,6 +481,9 @@ none:
   - mfplat's discard copy;
   - the allocators that ask for `DXVA2_VideoProcessorRenderTarget`;
   - the one-thread work queue that makes decode-ahead necessary.
+- `tests/host/check-dshow-default-renderer.py`: source checks on the path from
+  `RenderFile`'s default renderer to wined3d's CPU blitter, and that ddraw lists
+  only YUY2 without 3D.
 - `tests/host/check-wma-decoder.py` (Linux or macOS, needs a configured
   Wine tree for the generated headers): compiles the production
   `winegstreamer_unixlib_ios.c` under ASan/UBSan against a host FFmpeg built
