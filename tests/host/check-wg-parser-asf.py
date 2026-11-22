@@ -854,6 +854,29 @@ with tempfile.TemporaryDirectory() as t:
     assert any("first compressed packet delivered (wmv2" in l for l in lines) and \
         any("first compressed packet delivered (wmav2" in l for l in lines), lines
     assert any("connect refused (asf, compressed_out=1): compressed output requested" in l for l in lines), lines
+    # playback summary lines: decoded, seek-trimmed, undecodable (errors), and compressed
+    assert any("stream 0 first: container=asf codec=wmv2 backend=libavcodec out=nv12 320x240 mode=ahead "
+               "delivered=1 " in l and " decode=" in l for l in lines), lines
+    wmv2_sum = [l for l in lines if "stream 0 summary: container=asf codec=wmv2 backend=libavcodec out=nv12 320x240 mode=ahead "
+                "delivered=100 dropped=0 (trim=0 errors=0 bp=0)" in l]
+    assert wmv2_sum and float(re.search(r"decode=[0-9.]+/([0-9.]+)ms", wmv2_sum[0]).group(1)) > 0.0, lines
+    assert any("stream 0 summary: container=asf codec=wmv2 backend=libavcodec out=bgr 320x-240 mode=ahead "
+               "delivered=100 " in l for l in lines), lines
+    assert any("stream 1 summary: container=asf codec=wmav2 backend=libavcodec out=s16 44100Hz 2ch mode=on-demand " in l
+               and "delivered=0 " not in l for l in lines), lines
+    assert any("stream 0 summary: container=asf codec=wmv2 backend=libavcodec out=bgr 320x240 mode=ahead "
+               "delivered=13 dropped=39 (trim=39 errors=0 bp=0)" in l for l in lines), lines
+    wmv3_err = [m for l in lines for m in [re.search(
+        r"stream 0 summary: container=asf codec=wmv3 backend=libavcodec out=nv12 320x240 mode=ahead "
+        r"delivered=(\d+) dropped=(\d+) \(trim=0 errors=(\d+) bp=0\)", l)] if m]
+    assert wmv3_err and int(wmv3_err[0].group(3)) > 0 and \
+        int(wmv3_err[0].group(1)) + int(wmv3_err[0].group(3)) == 100 and \
+        int(wmv3_err[0].group(2)) == int(wmv3_err[0].group(3)), lines
+    comp_sum = [l for l in lines if "stream 0 summary: container=asf codec=wmv2 backend=libavcodec "
+                "out=compressed mode=compressed delivered=100 dropped=0 (trim=0 errors=0 bp=0)" in l]
+    assert comp_sum and "decode=" not in comp_sum[0], lines
+    assert any("stream 1 summary: container=asf codec=wmav2 backend=libavcodec out=compressed mode=compressed " in l
+               and "decode=" not in l for l in lines), lines
     assert "ERROR: AddressSanitizer" not in out.stderr and "runtime error" not in out.stderr, out.stderr[-4000:]
 
     out = subprocess.run([str(bp), "bp"], env=env, capture_output=True, text=True, timeout=300)
@@ -864,6 +887,15 @@ with tempfile.TemporaryDirectory() as t:
     first = out.stderr[:out.stderr.index("not read for")] if "not read for" in out.stderr else out.stderr
     assert "dropping further packets" not in first, "a packet was dropped while both streams were read:\n" + first[-3000:]
     assert sum("stream 0: not read for 400 ms while stream 1 reads ahead" in l for l in bp_lines) >= 1, bp_lines
+    assert any("stream 0 summary: container=asf codec=wmv2 backend=libavcodec out=nv12 320x240 mode=ahead "
+               "delivered=100 dropped=0 (trim=0 errors=0 bp=0)" in l for l in bp_lines), bp_lines
+    unread_bp = [int(m.group(1)) for l in bp_lines
+                 for m in [re.search(r"stream 0 summary: .* delivered=0 dropped=\d+ \(trim=0 errors=0 bp=(\d+)\)", l)] if m]
+    assert any(b > 0 for b in unread_bp), bp_lines
+    waited_audio = [m for l in bp_lines
+                    for m in [re.search(r"stream 1 summary: .* wait=[0-9.]+/([0-9.]+)ms decode=[0-9.]+/([0-9.]+)ms", l)]
+                    if m and float(m.group(1)) >= 300.0 and float(m.group(2)) < 100.0]
+    assert waited_audio, bp_lines
     assert "ERROR: AddressSanitizer" not in out.stderr and "runtime error" not in out.stderr, out.stderr[-4000:]
 
     # the same two-reader case WITHOUT back-pressure (soft limit above the hard one) does drop:

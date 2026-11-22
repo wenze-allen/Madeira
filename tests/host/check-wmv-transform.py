@@ -1211,6 +1211,10 @@ int main( int argc, char **argv )
         test_switched_off();
         test_wma( "switched off" );
     }
+    else if (argc > 1 && !strcmp( argv[1], "nosummary" ))
+    {
+        test_decode( &wmv1, "WMV1" );
+    }
     else
     {
         test_decode( &wmv1, "WMV1" );
@@ -1257,9 +1261,16 @@ with tempfile.TemporaryDirectory() as tmp:
     env.pop("MADEIRA_WG_WMV_TRANSFORM", None)
     for label, extra_env, args, needles in [
         ("default", {}, [], ["[wmv] decoder created fmt=WMV2 176x144 fps=25/1 codec_data=4 -> nv12 176x144",
+                             "WMV1 176x144 -> nv12 176x144: 40 samples in, 40 pictures out, 0 rejected by the decoder, "
+                             "0 dropped without a decoder, 0 lost to memory",
+                             "WMV2 176x144 -> nv12 176x144: 40 samples in, 40 pictures out",
+                             "WMV3 1920x1080 -> i420 1920x1080: 3 samples in, 0 pictures out, 0 rejected by the decoder, "
+                             "3 dropped without a decoder",
                              "[decoder not open: no sequence header",
                              "is not a Windows Media or MPEG video stream",
                              "[wmv] further lines suppressed after 100"]),
+        ("MADEIRA_WG_SUMMARY=0", {"MADEIRA_WG_SUMMARY": "0"}, ["nosummary"],
+         ["WMV1: 40 frames in, 40 pictures out"]),
         ("MADEIRA_WG_WMV_TRANSFORM=0", {"MADEIRA_WG_WMV_TRANSFORM": "0"}, ["off"],
          ["[wmv] video transform refused: MADEIRA_WG_WMV_TRANSFORM=0"]),
     ]:

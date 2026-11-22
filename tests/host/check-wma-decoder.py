@@ -357,10 +357,17 @@ with tempfile.TemporaryDirectory() as tmp:
     env.pop("MADEIRA_WMA_SEARCH", None)
     ok = True
     for label, extra_env, args in [("parameter search on (default)", {}, []),
-                                   ("MADEIRA_WMA_SEARCH=0", {"MADEIRA_WMA_SEARCH": "0"}, ["off"])]:
+                                   ("MADEIRA_WMA_SEARCH=0", {"MADEIRA_WMA_SEARCH": "0", "MADEIRA_DIAG": "1"}, ["off"])]:
         print("--- %s ---" % label, flush=True)
         r = subprocess.run([str(exe)] + args, env=dict(env, **extra_env), capture_output=True, text=True)
         sys.stdout.write(r.stdout)
+        wma_lines = [l for l in r.stderr.splitlines() if l.startswith("[wma]")]
+        if not args:
+            assert any("destroy: transform " in l and "wmav1 22050 Hz 1ch" in l
+                       and "samples (" in l and "0 packet errors (0 silence frames)" in l for l in wma_lines), wma_lines[:30]
+        else:
+            assert any("destroy: transform " in l and "wmav2 44100 Hz 2ch" in l
+                       and "0 packet errors" not in l and "silence frames)" in l for l in wma_lines), wma_lines[-20:]
         if r.returncode:
             ok = False
             tail = [l for l in r.stderr.splitlines() if not l.startswith("[wma]")][-40:]

@@ -258,14 +258,93 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF and an MPEG program stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
 | `MADEIRA_WG_VIDEO_AHEAD` | on | `0`: video is decoded on the thread that asks for it, as before; a Media Foundation movie's audio then waits behind each picture (see above). |
 | `MADEIRA_WG_VIDEO_FORMAT` | `rgb32` | Native format a video stream reports: `nv12`, `i420`, `yv12`, `yuy2`, `rgb32`, `argb32` or `abgr32` (see above for why the default is `rgb32`). |
+| `MADEIRA_WG_SUMMARY` | on | `0`: omit the one-line playback summaries per parser stream (`stream N first:`, `stream N summary:`) and per `wg_transform` (`destroy:`), restoring the previous log output. |
 | `MADEIRA_WMA_SEARCH` | on | `0`: keep the WMA v1/v2 decoder at the bit rate and flags it opened with; no search over other candidates when a bit-reservoir stream fails. A packet that fails is concealed with silence of its length and the next one is decoded as usual. (An xWMA stream still opens at the rate libavformat's xWMA table normalises to.) |
 | `MADEIRA_WMA_DUMP` | off | Set: write each WMA decoder's input to `wma-dump-<n>.bin` in the Documents folder, for reproducing a decode failure on a host. |
 
-Log tags: `[wma]` for the WMA decoder, `[wmv]` for the WMV decoder (one line
-per create and per destroy, refusals with their reason), `[resampler]` for the
-resampler and the MPEG audio decoder (one line per create), `[wg-parser]` for the parser. All are
-rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]`, `[wmv]` and
-`[resampler]` caps).
+## Reading playback logs
+
+Log tags: `[wg-parser]` for the parser, `[wmv]` for the WMV and MPEG-1/2 video
+decoder, `[wma]` for the WMA decoder, and `[resampler]` for the resampler and
+the MPEG audio decoder (plus `av:` lines from libavformat/libavcodec routed
+under the owner's tag). All are rate-limited per process (`[wg-parser]`
+deduplicates identical lines and caps at 63 distinct lines; `MADEIRA_DIAG=1`
+lifts the `[wma]`, `[wmv]` and `[resampler]` caps).
+
+**Parser stream summaries (`[wg-parser]`).** Each exposed stream logs one line
+on its first delivered buffer (`stream N first: ...`, in case the game hangs or
+is closed mid-movie) and one line at disconnect (`stream N summary: ...`). The
+summaries have a budget of their own, 48 lines per process, outside the 63
+distinct lines: a game that plays many short clips does not crowd out the lines
+of the movie that fails after them.
+
+```text
+[wg-parser] ml1990 stream 0 summary: container=mp4 codec=h264 backend=videotoolbox out=bgrx 1920x1080 mode=ahead delivered=300 dropped=0 (trim=0 errors=0 bp=0) wait=0.12/22.40ms decode=4.80/11.20ms
+```
+
+Fields:
+- `container`, `codec`, `backend`: the demuxer (`mp4`, `asf`, `mpeg`, `mp3`,
+  `wav`), libavcodec's codec name, and the decoder backend (`videotoolbox`,
+  `audiotoolbox`, `libavcodec`).
+- `out`: what the caller actually enabled — `compressed` when handing out
+  demuxer packets, `<pixfmt> <w>x<h>` for decoded video (a negative height
+  means bottom-up rows), or `<samplefmt> <rate>Hz <ch>ch` for decoded audio.
+- `mode`: `compressed` (packets passed through), `ahead` (video decoded on its
+  own worker thread), or `on-demand` (audio, or video with
+  `MADEIRA_WG_VIDEO_AHEAD=0`). ` [disabled]` follows when the stream was
+  disabled at disconnect.
+- `delivered`: unique pictures, audio buffers or compressed packets handed out
+  by `wg_parser_stream_get_buffer`.
+- `dropped (trim=T errors=E bp=B)`: total items discarded and why:
+  - `trim`: pictures, audio buffers or post-seek delta packets before the seek
+    target (including MP4 audio edit-list lead-in at time 0). Non-zero after a
+    keyframe seek is normal.
+  - `errors`: packets rejected by the decoder, unmappable pictures, or failed
+    sample conversions.
+  - `bp`: packets dropped past the hard queue limit after a stream went unread
+    for `MAV_BACKPRESSURE_WAIT_MS` (5 s).
+- `wait=avg/maxms`: average and worst-case wall time `get_buffer` spent
+  waiting for each delivered buffer (lock, demux/AVIO read, back-pressure wait,
+  and either the decode-ahead worker or synchronous decode).
+- `decode=avg/maxms` (decoded streams only): average and worst-case decoder +
+  pixel/sample conversion time per picture or audio buffer, excluding demuxing
+  and back-pressure waits.
+
+**Transform summaries (`[wmv]`, `[wma]`, `[resampler]`).** Each `wg_transform`
+that received a sample logs one `destroy:` line when torn down (with its
+`created` line at open); the support probes, created and destroyed unused, log
+none:
+- `[wmv] destroy: transform 0x..., WMV3 1280x720 -> bgrx 1280x-720 bottom-up: S samples in, P pictures out, R rejected by the decoder, D dropped without a decoder, L lost to memory`
+- `[wma] destroy: transform 0x..., wmav2 44100 Hz 2ch block=2973 (128000 bit/s) -> s16 44100 Hz 2ch: S samples (K packets) in, O samples (F frames) out, E packet errors (Z silence frames)` (plus `[muted]` if the parameter ladder exhausted without a valid decode)
+- `[resampler] destroy: transform 0x..., s16 48000 Hz 2ch -> f32 48000 Hz 2ch: S samples (I frames) in, O samples (F frames) out, E errors`
+- `[resampler] MPEG audio destroy: transform 0x..., MPEG-1 layer II 44100 Hz 2ch -> s16 44100 Hz 2ch: S samples (B bytes) in, O samples (F frames) out, E errors`
+
+**How to read a failure from one or two lines:**
+- **Refused at open:** `[wg-parser] ... connect refused (...)` or a transform
+  refusal line names the container, codec or format and why; no summary line
+  follows.
+- **Downstream topology or renderer failure (empty/white/black window, silent):**
+  `connect` succeeds, no `stream N first:` appears, and `stream N summary:`
+  reports `delivered=0` (or a transform has a `created` line and no `destroy:`
+  line, or one with `0 ... out`). Nobody downstream ever requested
+  samples — e.g. an EVR surface-allocator or audio mix-format negotiation
+  failure.
+- **Hung or closed mid-movie:** `stream N first:` is present without a matching
+  `stream N summary:`. It shows whether the first picture/buffer was delivered
+  and what format, mode and initial `wait`/`decode` times it had before the
+  session stalled.
+- **Undecodable bitstream or missing sequence header:** `errors>0` in `stream N
+  summary:` (past 512 consecutive errors the stream ends), `rejected by the
+  decoder > 0` or `dropped without a decoder > 0` in `[wmv] destroy:`, or
+  `packet errors > 0` / `[muted]` in `[wma] destroy:`.
+- **Unread stream stalling the demuxer:** `stream N: not read for 5000 ms ...`,
+  `delivered=0` with `bp>0` on that stream, and `wait` max ~5000 ms with tiny
+  `decode` max on the sibling stream.
+- **Decode slower than real time (stutter or audio underruns):** `decode` avg
+  approaches or exceeds the frame period (e.g. >33 ms at 30 fps) and `wait` avg
+  rises toward `decode` avg even with `mode=ahead` (the 3-picture lookahead is
+  starved), or `mode=on-demand` shows `MADEIRA_WG_VIDEO_AHEAD=0` blocking the
+  shared request thread on every picture.
 
 ## Tests
 

@@ -263,6 +263,8 @@ static void mav_configure( int video_allowed, const struct mav_video_backend *vi
 static void mav_allow_compressed_asf( int allowed );
 /* 0: video is decoded on the thread that asks for a buffer, as before mav_ahead_main */
 static void mav_allow_video_ahead( int allowed );
+/* 0: omit the per-stream playback summary lines (first buffer and disconnect) */
+static void mav_allow_summary( int allowed );
 static struct mav_parser *mav_create( int output_compressed );
 static void mav_destroy( struct mav_parser *p );
 static int mav_connect( struct mav_parser *p, uint64_t file_size );
@@ -356,6 +358,7 @@ static const struct mav_audio_backend *mav_abackend;
 static enum mav_pixel_format mav_native_pix = MAV_PIX_NV12;
 static int mav_compressed_asf = 1;
 static int mav_video_ahead = 1;
+static int mav_summary = 1;
 
 static void mav_configure( int video_allowed, const struct mav_video_backend *video,
                            const struct mav_audio_backend *audio, enum mav_pixel_format native )
@@ -374,6 +377,11 @@ static void mav_allow_compressed_asf( int allowed )
 static void mav_allow_video_ahead( int allowed )
 {
     mav_video_ahead = !!allowed;
+}
+
+static void mav_allow_summary( int allowed )
+{
+    mav_summary = !!allowed;
 }
 
 /* ---- the log: bounded, and deduplicated ---- */
@@ -436,6 +444,7 @@ struct mav_vframe
 {
     void *handle;               /* the backend's picture */
     int64_t pts, duration;      /* stream time base */
+    uint64_t decode_ns;         /* time spent in the backend decoding it */
 };
 
 /***********************************************************************
@@ -742,6 +751,18 @@ struct mav_stream
     int64_t seek_target;        /* 100 ns, -1 = none */
     unsigned int decode_errors, errors_logged;
     int delivered;              /* a buffer has been handed out (logged once) */
+
+    /* ---- playback summary (mav_log_summary), all under the parser lock ---- */
+    int ahead_used;             /* decoded ahead at least once (ahead_on clears before teardown) */
+    int cur_counted;            /* the currently held buffer was counted in stat_delivered */
+    uint64_t stat_delivered;
+    uint64_t stat_seek_trim;
+    uint64_t stat_decode_errors;
+    uint64_t stat_bp_drops;
+    uint64_t wait_ns_sum, wait_ns_max;
+    uint64_t decode_count, decode_ns_sum, decode_ns_max;
+    uint64_t priming_decode_ns; /* video: backend decode calls that emitted no frame yet */
+    uint64_t cur_audio_ns;      /* audio: decode + swr_convert accumulated for the next buffer */
 };
 
 struct mav_parser
@@ -974,6 +995,7 @@ static void mav_ahead_reset( struct mav_stream *s )
     s->ready_count = 0;
     s->out_slot = -1;
     s->ahead_eos = 0;
+    s->cur_counted = 0;
 }
 
 /* The caller (holding the lock) owns every stream's decoder state once this
@@ -1072,6 +1094,8 @@ static void mav_teardown( struct mav_parser *p )
     p->stop = -1;
 }
 
+static void mav_log_summary( const struct mav_parser *p, const struct mav_stream *s, const char *what );
+
 static void mav_disconnect( struct mav_parser *p )
 {
     /* Wake the PE read thread (it gets an error and exits once the filter
@@ -1087,6 +1111,12 @@ static void mav_disconnect( struct mav_parser *p )
     pthread_cond_broadcast( &p->ahead_cond );
     while (p->bp_waiters) pthread_cond_wait( &p->drain_cond, &p->lock );
     mav_ahead_stop_all( p );
+    if (p->ready && mav_summary)
+    {
+        unsigned int i;
+        for (i = 0; i < p->stream_count; i++)
+            mav_log_summary( p, p->streams[i], "summary" );
+    }
     mav_teardown( p );
     p->closing = 0;
     pthread_mutex_unlock( &p->lock );
@@ -1160,6 +1190,63 @@ static const char *mav_pix_name( enum mav_pixel_format fmt )
     case MAV_PIX_YVYU: return "yvyu";
     default:           return "?";
     }
+}
+
+#define MAV_MAX_SUMMARIES 48
+static unsigned int mav_summary_count;
+
+static uint64_t mav_now_ns( void )
+{
+    struct timespec ts;
+
+    if (!mav_summary || clock_gettime( CLOCK_MONOTONIC, &ts )) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* One line per stream on its first buffer and at disconnect, so a device log
+ * names the container, codec, backend, negotiated output format and mode, and
+ * separates "nothing requested downstream" (delivered=0) from bitstream errors,
+ * unread-queue drops and slow decode/convert. */
+static void mav_log_summary( const struct mav_parser *p, const struct mav_stream *s, const char *what )
+{
+    uint64_t dropped = s->stat_seek_trim + s->stat_decode_errors + s->stat_bp_drops;
+    double wait_avg = s->stat_delivered ? (double)s->wait_ns_sum / (double)s->stat_delivered / 1e6 : 0.0;
+    double wait_max = (double)s->wait_ns_max / 1e6;
+    double dec_avg = s->decode_count ? (double)s->decode_ns_sum / (double)s->decode_count / 1e6 : 0.0;
+    double dec_max = (double)s->decode_ns_max / 1e6;
+    const char *mode = s->compressed ? "compressed"
+                     : (s->type == MAV_STREAM_VIDEO
+                        && (s->ahead_used || (!s->stat_delivered && mav_video_ahead && !s->ahead_failed)))
+                       ? "ahead" : "on-demand";
+    char out[48], dec[48] = "";
+    unsigned int n;
+
+    (void)p;
+    if (s->compressed)
+        snprintf( out, sizeof(out), "compressed" );
+    else if (s->type == MAV_STREAM_VIDEO)
+        snprintf( out, sizeof(out), "%s %dx%d", mav_pix_name( s->vout.fmt ), s->vout.width, s->vout.height );
+    else
+        snprintf( out, sizeof(out), "%s %uHz %uch", mav_format_name( s->out.fmt ), s->out.rate, s->out.channels );
+
+    if (!s->compressed)
+        snprintf( dec, sizeof(dec), " decode=%.2f/%.2fms", dec_avg, dec_max );
+
+    /* Not through mav_log: the timings make every summary a distinct line, and
+     * a game that plays many short clips would spend mav_log's distinct lines
+     * on them, so the lines of the movie that fails afterwards would be lost.
+     * The summaries have a budget of their own. */
+    n = __atomic_add_fetch( &mav_summary_count, 1, __ATOMIC_RELAXED );
+    if (n == MAV_MAX_SUMMARIES + 1)
+        dprintf( 2, MAV_TAG "further stream summaries suppressed after %u\n", MAV_MAX_SUMMARIES );
+    if (n > MAV_MAX_SUMMARIES) return;
+    dprintf( 2, MAV_TAG "stream %u %s: container=%s codec=%s backend=%s out=%s mode=%s%s "
+             "delivered=%llu dropped=%llu (trim=%llu errors=%llu bp=%llu) wait=%.2f/%.2fms%s\n",
+             s->number, what, s->info.container, s->info.codec, s->info.backend, out, mode,
+             s->enabled ? "" : " [disabled]",
+             (unsigned long long)s->stat_delivered, (unsigned long long)dropped,
+             (unsigned long long)s->stat_seek_trim, (unsigned long long)s->stat_decode_errors,
+             (unsigned long long)s->stat_bp_drops, wait_avg, wait_max, dec );
 }
 
 #define MAV_ALIGN4(x) (((x) + 3u) & ~3u)
@@ -1822,6 +1909,7 @@ static int mav_enable( struct mav_parser *p, unsigned int stream, const struct m
          * format nobody asked for. */
         s->enabled = 0;
         s->has_buffer = 0;
+        s->cur_counted = 0;
         status = MAV_E_PARAM;
     }
     else
@@ -1830,6 +1918,7 @@ static int mav_enable( struct mav_parser *p, unsigned int stream, const struct m
         {
             /* the held buffer is in the old format */
             s->has_buffer = 0;
+            s->cur_counted = 0;
             swr_free( &s->swr );
             s->out = *out;
         }
@@ -1914,6 +2003,8 @@ static int mav_enable_compressed( struct mav_parser *p, unsigned int stream )
             mav_ahead_reset( s );
             if (s->pkt_pending) av_packet_unref( s->pkt );
             s->pkt_pending = 0;
+            s->priming_decode_ns = 0;
+            s->cur_audio_ns = 0;
             mav_reorder_clear( s );
             mav_ahead_resume( p );
         }
@@ -1949,6 +2040,7 @@ static void mav_queue_push( struct mav_stream *s, AVPacket *pkt )
 {
     if (s->queue_count >= MAV_QUEUE_MAX_PACKETS || s->queue_bytes + pkt->size > MAV_QUEUE_MAX_BYTES)
     {
+        s->stat_bp_drops++;
         mav_log( "stream %u: %u packets (%zu bytes) queued and not read; dropping further packets",
                  s->number, s->queue_count, s->queue_bytes );
         s->discontinuity = 1;
@@ -2184,7 +2276,12 @@ static int mav_finish_buffer( struct mav_parser *p, struct mav_stream *s, int64_
     s->next_pts = pts + dur;
     if (s->seek_target >= 0)
     {
-        if (pts + dur <= s->seek_target) return 0;
+        if (pts + dur <= s->seek_target)
+        {
+            s->stat_seek_trim++;
+            s->cur_audio_ns = 0;
+            return 0;
+        }
         if (pts < s->seek_target)
         {
             skip = av_rescale( s->seek_target - pts, s->out.rate, 10000000 );
@@ -2198,6 +2295,7 @@ static int mav_finish_buffer( struct mav_parser *p, struct mav_stream *s, int64_
     {
         if (pts >= p->stop)
         {
+            s->cur_audio_ns = 0;
             s->eos = 1;
             return 0;
         }
@@ -2208,9 +2306,18 @@ static int mav_finish_buffer( struct mav_parser *p, struct mav_stream *s, int64_
             s->eos = 1;   /* nothing after this buffer is wanted */
         }
     }
-    if (keep <= 0) return 0;
+    if (keep <= 0)
+    {
+        if (skip > 0) s->stat_seek_trim++;
+        s->cur_audio_ns = 0;
+        return 0;
+    }
     if (skip) memmove( s->buf, s->buf + skip * frame_bytes, keep * frame_bytes );
 
+    s->decode_count++;
+    s->decode_ns_sum += s->cur_audio_ns;
+    if (s->cur_audio_ns > s->decode_ns_max) s->decode_ns_max = s->cur_audio_ns;
+    s->cur_audio_ns = 0;
     s->cur.pts = pts > 0 ? (uint64_t)pts : 0;
     s->cur.duration = av_rescale( keep, 10000000, s->out.rate );
     s->cur.size = (uint32_t)(keep * frame_bytes);
@@ -2242,6 +2349,7 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
 {
     for (;;)
     {
+        uint64_t t0, dt;
         int64_t pts;
         int n, got;
 
@@ -2249,7 +2357,9 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
         if (!mav_next_packet( p, s, s->pkt ))
         {
             /* the converter's tail (only non-empty when resampling) */
+            t0 = mav_now_ns();
             got = mav_convert( s, NULL );
+            if (got >= 0) s->cur_audio_ns += t0 ? mav_now_ns() - t0 : 0;
             s->eos = 1;
             if (got > 0 && mav_finish_buffer( p, s, s->next_pts, got ))
             {
@@ -2267,11 +2377,14 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
             s->apts_count--;
         }
         s->apts[s->apts_count++] = pts;
+        t0 = mav_now_ns();
         n = mav_abackend->decode( s->adec, s->pkt->data, s->pkt->size, (float *)s->bframe->data[0],
                                   MAV_AUDIO_BACKEND_MAX_FRAMES );
+        dt = t0 ? mav_now_ns() - t0 : 0;
         av_packet_unref( s->pkt );
         if (n < 0)
         {
+            s->stat_decode_errors++;
             if (s->errors_logged < 3)
             {
                 s->errors_logged++;
@@ -2281,6 +2394,7 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
             if (++s->decode_errors > MAV_MAX_DECODE_ERRORS) return mav_give_up( s );
             continue;
         }
+        s->cur_audio_ns += dt;
         s->decode_errors = 0;
         if (!n) continue;
         pts = s->apts[0];
@@ -2288,12 +2402,18 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
         s->apts_count--;
         if (pts == INT64_MIN) pts = s->next_pts;
         s->bframe->nb_samples = n > MAV_AUDIO_BACKEND_MAX_FRAMES ? MAV_AUDIO_BACKEND_MAX_FRAMES : n;
-        if ((got = mav_convert( s, s->bframe )) < 0)
+        t0 = mav_now_ns();
+        got = mav_convert( s, s->bframe );
+        dt = t0 ? mav_now_ns() - t0 : 0;
+        if (got < 0)
         {
+            s->stat_decode_errors++;
+            s->cur_audio_ns = 0;
             mav_log( "sample conversion failed; ending the stream" );
             s->eos = 1;
             return MAV_NO_BUFFER;
         }
+        s->cur_audio_ns += dt;
         if (got && mav_finish_buffer( p, s, pts, got )) return MAV_OK;
     }
 }
@@ -2302,6 +2422,7 @@ static int mav_audio_next_backend( struct mav_parser *p, struct mav_stream *s )
  * MAV_NO_BUFFER at end of stream. */
 static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
 {
+    uint64_t t0, dt;
     int err;
 
     if (s->adec) return mav_audio_next_backend( p, s );
@@ -2309,19 +2430,28 @@ static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
     {
         if (s->eos) return MAV_NO_BUFFER;
 
+        t0 = mav_now_ns();
         err = avcodec_receive_frame( s->dec, s->frame );
+        dt = t0 ? mav_now_ns() - t0 : 0;
         if (!err)
         {
             int64_t pts = mav_frame_pts( s, s->frame );
-            int got = mav_convert( s, s->frame );
+            int got;
 
+            s->cur_audio_ns += dt;
+            t0 = mav_now_ns();
+            got = mav_convert( s, s->frame );
+            dt = t0 ? mav_now_ns() - t0 : 0;
             av_frame_unref( s->frame );
             if (got < 0)
             {
+                s->stat_decode_errors++;
+                s->cur_audio_ns = 0;
                 mav_log( "sample conversion failed; ending the stream" );
                 s->eos = 1;
                 return MAV_NO_BUFFER;
             }
+            s->cur_audio_ns += dt;
             s->decode_errors = 0;
             if (got && mav_finish_buffer( p, s, pts, got )) return MAV_OK;
             continue;
@@ -2329,9 +2459,12 @@ static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
         if (err == AVERROR_EOF)
         {
             /* the converter's tail (only non-empty when resampling) */
-            int got = mav_convert( s, NULL );
+            int got;
             int64_t pts = s->next_pts;
 
+            t0 = mav_now_ns();
+            got = mav_convert( s, NULL );
+            if (got >= 0) s->cur_audio_ns += t0 ? mav_now_ns() - t0 : 0;
             s->eos = 1;
             if (got > 0 && mav_finish_buffer( p, s, pts, got ))
             {
@@ -2343,6 +2476,7 @@ static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
         if (err != AVERROR(EAGAIN))
         {
             /* A decoding error on output; the next packet may be fine. */
+            s->stat_decode_errors++;
             if (++s->decode_errors > MAV_MAX_DECODE_ERRORS) return mav_give_up( s );
         }
 
@@ -2357,18 +2491,23 @@ static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
         {
             if (!mav_next_packet( p, s, s->pkt ))
             {
+                t0 = mav_now_ns();
                 avcodec_send_packet( s->dec, NULL );
+                s->cur_audio_ns += t0 ? mav_now_ns() - t0 : 0;
                 s->draining = 1;
                 continue;
             }
             s->pkt_pending = 1;
         }
+        t0 = mav_now_ns();
         err = avcodec_send_packet( s->dec, s->pkt );
+        dt = t0 ? mav_now_ns() - t0 : 0;
         if (err == AVERROR(EAGAIN)) continue;   /* output first, then this packet again */
         av_packet_unref( s->pkt );
         s->pkt_pending = 0;
         if (err < 0)
         {
+            s->stat_decode_errors++;
             if (s->errors_logged < 3)
             {
                 s->errors_logged++;
@@ -2376,6 +2515,7 @@ static int mav_audio_next( struct mav_parser *p, struct mav_stream *s )
             }
             if (++s->decode_errors > MAV_MAX_DECODE_ERRORS) return mav_give_up( s );
         }
+        else s->cur_audio_ns += dt;
     }
 }
 
@@ -2412,7 +2552,25 @@ static void mav_vframe_emit_cb( void *ctx, void *handle, int64_t pts, int64_t du
     s->reorder[i].handle = handle;
     s->reorder[i].pts = pts;
     s->reorder[i].duration = duration;
+    s->reorder[i].decode_ns = UINT64_MAX;
     s->reorder_count++;
+}
+
+static void mav_assign_decode_ns( struct mav_stream *s, uint64_t dt, int ok )
+{
+    unsigned int i, n = 0;
+
+    for (i = 0; i < s->reorder_count; i++)
+        if (s->reorder[i].decode_ns == UINT64_MAX) n++;
+    if (n)
+    {
+        uint64_t share = (s->priming_decode_ns + dt) / n;
+        s->priming_decode_ns = 0;
+        for (i = 0; i < s->reorder_count; i++)
+            if (s->reorder[i].decode_ns == UINT64_MAX) s->reorder[i].decode_ns = share;
+    }
+    else if (ok)
+        s->priming_decode_ns += dt;
 }
 
 static inline uint8_t mav_clip8( int v )
@@ -2616,6 +2774,7 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     struct mav_vplanes planes;
     struct mav_layout l;
     int64_t pts = mav_to_100ns( s, f->pts ), dur;
+    uint64_t t0, conv_ns, pic_ns;
     size_t size;
     int unlocked, mapped;
 
@@ -2626,6 +2785,7 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     {
         if (pts + dur <= s->seek_target)
         {
+            s->stat_seek_trim++;
             s->vbackend->release( f->handle );
             return 0;
         }
@@ -2645,6 +2805,7 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
         mav_log( "stream %u: cannot hold a %zu-byte picture; ending the stream", s->number, size );
         return 0;
     }
+    t0 = mav_now_ns();
     unlocked = mav_heavy_begin( p, s );
     if ((mapped = !s->vbackend->map( f->handle, &planes )))
     {
@@ -2652,9 +2813,11 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
         s->vbackend->unmap( f->handle );
     }
     s->vbackend->release( f->handle );
+    conv_ns = t0 ? mav_now_ns() - t0 : 0;
     mav_heavy_end( p, s, unlocked );
     if (!mapped)
     {
+        s->stat_decode_errors++;
         if (s->errors_logged < 3)
         {
             s->errors_logged++;
@@ -2663,6 +2826,10 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
         s->discontinuity = 1;
         return 0;
     }
+    pic_ns = (f->decode_ns == UINT64_MAX ? 0 : f->decode_ns) + conv_ns;
+    s->decode_count++;
+    s->decode_ns_sum += pic_ns;
+    if (pic_ns > s->decode_ns_max) s->decode_ns_max = pic_ns;
 
     s->next_pts = pts + dur;
     s->cur.pts = pts > 0 ? (uint64_t)pts : 0;
@@ -2706,25 +2873,32 @@ static int mav_video_next( struct mav_parser *p, struct mav_stream *s )
             /* libavcodec holds its last pictures until it is drained */
             if (s->vbackend == &mav_lavc_video && !p->closing)
             {
+                uint64_t t0 = mav_now_ns(), dt;
                 int unlocked = mav_heavy_begin( p, s );
                 mav_lavc_drain( s->vdec, mav_vframe_emit_cb, s );
+                dt = t0 ? mav_now_ns() - t0 : 0;
                 mav_heavy_end( p, s, unlocked );
+                mav_assign_decode_ns( s, dt, 1 );
             }
             s->draining = 1;
             continue;
         }
         {
+            uint64_t t0 = mav_now_ns(), dt;
             int unlocked = mav_heavy_begin( p, s );
             err = s->vbackend->decode( s->vdec, s->pkt->data, s->pkt->size,
                                         s->pkt->pts != AV_NOPTS_VALUE ? s->pkt->pts : INT64_MIN,
                                         s->pkt->duration > 0 ? s->pkt->duration : INT64_MIN,
                                         !!(s->pkt->flags & AV_PKT_FLAG_KEY), mav_vframe_emit_cb, s );
+            dt = t0 ? mav_now_ns() - t0 : 0;
             mav_heavy_end( p, s, unlocked );
+            mav_assign_decode_ns( s, dt, err >= 0 );
         }
         s->last_dts = s->pkt->dts != AV_NOPTS_VALUE ? s->pkt->dts : INT64_MIN;
         av_packet_unref( s->pkt );
         if (err < 0)
         {
+            s->stat_decode_errors++;
             if (s->errors_logged < 3)
             {
                 s->errors_logged++;
@@ -2837,6 +3011,7 @@ static void mav_ahead_start( struct mav_parser *p, struct mav_stream *s )
     else
     {
         s->ahead_on = 1;
+        s->ahead_used = 1;
         mav_log( "stream %u: decoding ahead on a thread of its own (%u pictures)", s->number,
                  MAV_AHEAD_SLOTS - 1 );
     }
@@ -2901,6 +3076,7 @@ static int mav_compressed_next( struct mav_parser *p, struct mav_stream *s )
             && s->skipped < MAV_MAX_SEEK_SKIP)
         {
             s->skipped++;
+            s->stat_seek_trim++;
             av_packet_unref( s->pkt );
             continue;
         }
@@ -2961,6 +3137,7 @@ static int mav_stream_next( struct mav_parser *p, struct mav_stream *s )
 /* The buffer get_buffer handed out is no longer the caller's. */
 static void mav_drop_held( struct mav_parser *p, struct mav_stream *s )
 {
+    s->cur_counted = 0;
     if (mav_ahead_mode( s ))
     {
         if (s->out_slot >= 0)
@@ -2974,6 +3151,7 @@ static void mav_drop_held( struct mav_parser *p, struct mav_stream *s )
 
 static int mav_get_buffer( struct mav_parser *p, int stream, struct mav_buffer *buffer )
 {
+    uint64_t wait_t0 = mav_now_ns();
     struct mav_stream *s = NULL;
     int status = MAV_NO_BUFFER;
     unsigned int i;
@@ -3017,6 +3195,14 @@ static int mav_get_buffer( struct mav_parser *p, int stream, struct mav_buffer *
     if (status == MAV_OK)
     {
         *buffer = s->cur;
+        if (!s->cur_counted)
+        {
+            uint64_t wait_ns = wait_t0 ? mav_now_ns() - wait_t0 : 0;
+            s->cur_counted = 1;
+            s->stat_delivered++;
+            s->wait_ns_sum += wait_ns;
+            if (wait_ns > s->wait_ns_max) s->wait_ns_max = wait_ns;
+        }
         /* One line per stream, so a device log tells a stream nobody asked
          * for (a renderer the media session dropped) from one that fails to
          * decode. */
@@ -3031,6 +3217,7 @@ static int mav_get_buffer( struct mav_parser *p, int stream, struct mav_buffer *
                          s->vout.width, s->vout.height );
             else
                 mav_log( "stream %u: first audio buffer delivered", s->number );
+            if (mav_summary) mav_log_summary( p, s, "first" );
         }
     }
     /* a queue may have shrunk, or a stream ended: a waiter re-checks */
@@ -3155,6 +3342,8 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
                 mav_ahead_reset( c );
                 c->eos = c->draining = 0;
                 c->decode_errors = 0;
+                c->priming_decode_ns = 0;
+                c->cur_audio_ns = 0;
                 c->discontinuity = 1;
                 c->seek_target = target;
                 c->skipped = 0;

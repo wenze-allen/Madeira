@@ -392,6 +392,10 @@ struct wma_transform
     UINT32 push_count;
     UINT32 packet_count;
     UINT32 short_tail_dropped;
+    UINT32 read_count;
+    UINT32 total_fails;
+    UINT64 out_frames;
+    UINT64 total_silence_frames;
     UINT32 candidate;       /* index into the parameter candidate list */
 
     /* w2: a candidate is not "accepted" until it has produced SANE audio for
@@ -916,6 +920,7 @@ static NTSTATUS append_silence_for_packet( struct wma_transform *transform, size
             (size_t)frames * transform->out_frame_size );
     transform->pcm_len += (size_t)frames * transform->out_frame_size;
     transform->silence_frames += frames;
+    transform->total_silence_frames += frames;
     return STATUS_SUCCESS;
 }
 
@@ -1448,6 +1453,7 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         if (transform->muted)
         {
             transform->fail_count++;
+            transform->total_fails++;
             if ((status = append_silence_for_packet( transform, take ))) return status;
             offset += take;
             continue;
@@ -1575,6 +1581,7 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         if (!ok)
         {
             transform->fail_count++;
+            transform->total_fails++;
             if (transform->fail_logged < MADEIRA_WMA_MAX_FAIL_LOGS)
             {
                 transform->fail_logged++;
@@ -1804,6 +1811,8 @@ fail:
     return (NTSTATUS)err;
 }
 
+static BOOL wg_summary_switch_on(void);
+
 static NTSTATUS wma_destroy( wg_transform_t handle )
 {
     struct wma_transform *transform = get_wma_transform( handle );
@@ -1812,6 +1821,18 @@ static NTSTATUS wma_destroy( wg_transform_t handle )
 
     pthread_mutex_lock( &transform->lock );
     report_failures( transform );
+    if (wg_summary_switch_on() && transform->push_count)   /* not the support probes */
+        WMA_LOG( "destroy: transform %p, %s %u Hz %uch block=%u (%d bit/s) -> %s %u Hz %uch: "
+                 "%u samples (%u packets) in, %u samples (%llu frames) out, %u packet errors "
+                 "(%llu silence frames)%s\n",
+                 transform, transform->codec ? transform->codec->name : "?",
+                 transform->rate, transform->in_channels, transform->block_align, (int)transform->bit_rate,
+                 transform->out_sample_fmt == AV_SAMPLE_FMT_FLT ? "float32" : "s16",
+                 transform->rate, transform->out_channels,
+                 transform->push_count, transform->packet_count,
+                 transform->read_count, (unsigned long long)transform->out_frames,
+                 transform->total_fails, (unsigned long long)transform->total_silence_frames,
+                 transform->muted ? " [muted]" : "" );
     transform->magic = 0;
     if (transform->dump_fd >= 0) close( transform->dump_fd );
     if (transform->swr) swr_free( &transform->swr );
@@ -1946,6 +1967,8 @@ static NTSTATUS wma_read_data( wg_transform_t handle, struct wg_sample *sample,
     memcpy( data, transform->pcm_buf + transform->pcm_pos, copy );
     sample->size = copy;
     frames = copy / transform->out_frame_size;
+    transform->read_count++;
+    transform->out_frames += frames;
 
     sample->flags &= ~(WG_SAMPLE_FLAG_INCOMPLETE | WG_SAMPLE_FLAG_HAS_PTS |
                        WG_SAMPLE_FLAG_HAS_DURATION | WG_SAMPLE_FLAG_DISCONTINUITY);
@@ -2622,9 +2645,24 @@ static void wmv_decode_until_picture( struct wmv_transform *transform )
 
 static void wmv_report( struct wmv_transform *transform, const char *when )
 {
+    /* Nothing to say about a transform that got nothing: the support probes
+     * (check_video_transform_support) are created and destroyed unused. */
     if (!transform->pushed && !transform->lost) return;
-    WMV_LOG( "%s: transform %p, %s: %u frames in, %u pictures out, %u rejected by the decoder, "
-             "%u dropped without a decoder, %u lost to memory\n", when, transform, transform->name,
+    if (!wg_summary_switch_on())
+    {
+        WMV_LOG( "%s: transform %p, %s: %u frames in, %u pictures out, %u rejected by the decoder, "
+                 "%u dropped without a decoder, %u lost to memory\n", when, transform, transform->name,
+                 transform->pushed, transform->delivered, transform->rejected, transform->dropped, transform->lost );
+        return;
+    }
+    WMV_LOG( "%s: transform %p, %s %ux%u -> %s %ux%u%s: %u samples in, %u pictures out, "
+             "%u rejected by the decoder, %u dropped without a decoder, %u lost to memory\n",
+             when, transform, transform->name, transform->width, transform->height,
+             mav_pix_name( transform->out_fmt ),
+             transform->out_format ? (UINT)transform->out_format->videoInfo.dwWidth : 0,
+             transform->out_format ? (UINT)transform->out_format->videoInfo.dwHeight : 0,
+             (transform->out_format && (transform->out_format->videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep))
+                 ? " bottom-up" : "",
              transform->pushed, transform->delivered, transform->rejected, transform->dropped, transform->lost );
 }
 
@@ -3172,7 +3210,7 @@ static BOOL wmv_claims( const struct wg_transform_create_params *params )
  */
 #define MADEIRA_WG_RESAMPLER_MAGIC 0x52534d50  /* 'RSMP' */
 #define RS_MAX_CHANNELS 8
-#define RS_MAX_LOGS 32
+#define RS_MAX_LOGS 64
 
 static unsigned int rs_log_count;
 
@@ -3215,6 +3253,8 @@ struct rs_transform
     BOOL have_pts;
     BOOL discontinuity;
     UINT32 partial_logged;
+    UINT32 pushed, delivered, errors;
+    UINT64 in_frames, out_frames;
 };
 
 /* MADEIRA_WG_RESAMPLER=0 refuses the resampler again: raw audio in fails at
@@ -3433,6 +3473,14 @@ static NTSTATUS rs_destroy( wg_transform_t handle )
 
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
+    if (wg_summary_switch_on() && transform->pushed)   /* not the support probes */
+        RS_LOG( "destroy: transform %p, %s %u Hz %uch -> %s %u Hz %uch: "
+                "%u samples (%llu frames) in, %u samples (%llu frames) out, %u errors\n",
+                transform, rs_format_name( &transform->in ), transform->in.rate, transform->in.channels,
+                rs_format_name( &transform->out ), transform->out.rate, transform->out.channels,
+                transform->pushed, (unsigned long long)transform->in_frames,
+                transform->delivered, (unsigned long long)transform->out_frames,
+                transform->errors );
     transform->magic = 0;
     swr_free( &transform->swr );
     av_channel_layout_uninit( &transform->in.layout );
@@ -3464,9 +3512,15 @@ static NTSTATUS rs_push_data( wg_transform_t handle, struct wg_sample *sample, c
     }
     rs_compact( transform );
     frames = sample->size / transform->in.frame_size;
-    if (sample->size % transform->in.frame_size && transform->partial_logged++ < 3)
-        RS_LOG( "a %u-byte sample is not whole %u-byte frames; the tail is dropped (transform %p)\n",
-                (UINT)sample->size, transform->in.frame_size, transform );
+    transform->pushed++;
+    transform->in_frames += frames;
+    if (sample->size % transform->in.frame_size)
+    {
+        transform->errors++;
+        if (transform->partial_logged++ < 3)
+            RS_LOG( "a %u-byte sample is not whole %u-byte frames; the tail is dropped (transform %p)\n",
+                    (UINT)sample->size, transform->in.frame_size, transform );
+    }
     /* The first frame out of this push is what libswresample still holds from
      * earlier ones, so it starts that much before this sample. */
     if (sample->flags & WG_SAMPLE_FLAG_HAS_PTS)
@@ -3477,6 +3531,7 @@ static NTSTATUS rs_push_data( wg_transform_t handle, struct wg_sample *sample, c
     }
     if (sample->flags & WG_SAMPLE_FLAG_DISCONTINUITY) transform->discontinuity = TRUE;
     status = frames ? rs_convert( transform, data, frames ) : STATUS_SUCCESS;
+    if (status) transform->errors++;
     pthread_mutex_unlock( &transform->lock );
 
     *result = status ? E_FAIL : S_OK;
@@ -3519,6 +3574,8 @@ static NTSTATUS rs_read_data( wg_transform_t handle, struct wg_sample *sample, v
             sample->pts = start;
         }
         transform->anchor_frames += frames;
+        transform->delivered++;
+        transform->out_frames += frames;
     }
     if (transform->discontinuity)
     {
@@ -3617,6 +3674,7 @@ static NTSTATUS rs_drain( wg_transform_t handle )
     pthread_mutex_lock( &transform->lock );
     status = rs_convert( transform, NULL, 0 );
     if (swr_init( transform->swr ) < 0) status = STATUS_INTERNAL_ERROR;
+    if (status) transform->errors++;
     pthread_mutex_unlock( &transform->lock );
     return status;
 }
@@ -3678,6 +3736,8 @@ struct mpa_transform
     UINT64 anchor_frames;
     BOOL have_pts, discontinuity;
     UINT32 errors, errors_logged;
+    UINT32 in_rate, in_channels, pushed, delivered;
+    UINT64 in_bytes, out_frames;
 };
 
 /* MADEIRA_WG_MPEG_TRANSFORM=0 refuses MPEG audio transforms again: quartz's
@@ -3864,6 +3924,8 @@ static NTSTATUS mpa_create( struct wg_transform_create_params *params )
     }
     memcpy( transform->out_format, out, params->output_type.format_size );
     transform->out_format_size = params->output_type.format_size;
+    transform->in_rate = in->nSamplesPerSec;
+    transform->in_channels = in->nChannels;
     transform->ctx->sample_rate = in->nSamplesPerSec;
     av_channel_layout_default( &transform->ctx->ch_layout, in->nChannels );
     if (!transform->ctx->codec || avcodec_open2( transform->ctx, transform->ctx->codec, NULL ) < 0
@@ -3889,6 +3951,14 @@ static NTSTATUS mpa_destroy( wg_transform_t handle )
 
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
+    if (wg_summary_switch_on() && transform->pushed)   /* not the support probes */
+        RS_LOG( "MPEG audio destroy: transform %p, %s %u Hz %uch -> %s %u Hz %uch: "
+                "%u samples (%llu bytes) in, %u samples (%llu frames) out, %u errors\n",
+                transform, transform->name, transform->in_rate, transform->in_channels,
+                rs_format_name( &transform->out ), transform->out.rate, transform->out.channels,
+                transform->pushed, (unsigned long long)transform->in_bytes,
+                transform->delivered, (unsigned long long)transform->out_frames,
+                transform->errors );
     transform->magic = 0;
     pthread_mutex_unlock( &transform->lock );
     pthread_mutex_destroy( &transform->lock );
@@ -3940,7 +4010,10 @@ static NTSTATUS mpa_push_data( wg_transform_t handle, struct wg_sample *sample, 
         memcpy( transform->in_buf, data, sample->size );
         memset( transform->in_buf + sample->size, 0, AV_INPUT_BUFFER_PADDING_SIZE );
     }
+    transform->pushed++;
+    transform->in_bytes += sample->size;
     status = sample->size ? mpa_parse( transform, transform->in_buf, sample->size ) : STATUS_SUCCESS;
+    if (status) transform->errors++;
     pthread_mutex_unlock( &transform->lock );
     *result = status ? E_FAIL : S_OK;
     return status;
@@ -3982,6 +4055,8 @@ static NTSTATUS mpa_read_data( wg_transform_t handle, struct wg_sample *sample, 
             sample->pts = start;
         }
         transform->anchor_frames += frames;
+        transform->delivered++;
+        transform->out_frames += frames;
     }
     if (transform->discontinuity)
     {
@@ -4398,6 +4473,14 @@ static BOOL wg_compressed_switch_on(void)
     return !(v && v[0] == '0' && !v[1]);
 }
 
+/* One-line playback summary per parser stream (first buffer and disconnect)
+ * and per wg_transform at destroy.  0 restores the previous log output. */
+static BOOL wg_summary_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_SUMMARY" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
 static enum mav_pixel_format wg_video_native_format(void)
 {
     static const struct { const char *name; enum mav_pixel_format fmt; } names[] =
@@ -4429,6 +4512,7 @@ static void wgp_configure(void)
     mav_allow_video_ahead( wg_video_ahead_switch_on() );
     if (!wg_video_ahead_switch_on())
         mav_log( "video decode-ahead disabled by MADEIRA_WG_VIDEO_AHEAD=0: video decodes on the requesting thread" );
+    mav_allow_summary( wg_summary_switch_on() );
 
 #ifdef __APPLE__
     mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native );

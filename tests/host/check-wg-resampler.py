@@ -447,6 +447,7 @@ static int test_refusals( int disabled )
 int main( int argc, char **argv )
 {
     setvbuf( stdout, NULL, _IONBF, 0 );
+    if (argc > 1 && !strcmp( argv[1], "nosummary" )) return test_senren( 48000 );
     if (argc > 1) return test_refusals( 1 );
     if (test_senren( 48000 ) || test_senren( 44100 ) || test_formats() || test_channels() || test_protocol()
         || test_refusals( 0 ))
@@ -476,16 +477,24 @@ with tempfile.TemporaryDirectory() as tmp:
     env = {k: v for k, v in os.environ.items() if not k.startswith("MADEIRA_")}
     env["ASAN_OPTIONS"] = "detect_leaks=1"
     ok = True
-    for args, extra in [([], {}), (["off"], {"MADEIRA_WG_RESAMPLER": "0"})]:
+    for args, extra in [([], {}), (["nosummary"], {"MADEIRA_WG_SUMMARY": "0"}),
+                        (["off"], {"MADEIRA_WG_RESAMPLER": "0"})]:
         r = subprocess.run([str(exe)] + args, env=dict(env, **extra), capture_output=True, text=True, timeout=300)
         sys.stdout.write(r.stdout)
         bad = "ERROR: AddressSanitizer" in r.stderr or "runtime error" in r.stderr
         if r.returncode or bad:
             ok = False
             print(r.stderr[-4000:])
+        lines = [l for l in r.stderr.splitlines() if l.startswith("[resampler]")]
         if not args:
-            lines = [l for l in r.stderr.splitlines() if l.startswith("[resampler]")]
             assert any("created s16 48000 Hz 2ch -> f32 44100 Hz 2ch" in l for l in lines), lines
+            assert any("destroy: transform " in l and "s16 48000 Hz 2ch -> f32 48000 Hz 2ch: 94 samples (96000 frames) in,"
+                       in l and "(96000 frames) out, 0 errors" in l for l in lines), lines
+            assert any("destroy: transform " in l and "s16 48000 Hz 2ch -> f32 44100 Hz 2ch: 94 samples (96000 frames) in,"
+                       in l and "(88200 frames) out, 0 errors" in l for l in lines), lines
             for l in lines[:6]:
                 print("  " + l)
+        elif args == ["nosummary"]:
+            assert any("created s16 48000 Hz 2ch -> f32 48000 Hz 2ch" in l for l in lines), lines
+            assert not any("destroy:" in l for l in lines), lines
     sys.exit(0 if ok else "FAIL: resampler host test")

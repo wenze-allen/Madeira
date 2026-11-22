@@ -926,6 +926,12 @@ with tempfile.TemporaryDirectory() as t:
     assert any(l.endswith("stream 0: decoding ahead on a thread of its own (3 pictures)") for l in lines), lines
     assert any("connect refused (mpeg, compressed_out=1): compressed output requested" in l for l in lines), lines
     assert any("connect refused (mpegvideo, compressed_out=0): container not in the allowlist" in l for l in lines), lines
+    assert any("stream 0 summary: container=mpeg codec=mpeg1video backend=libavcodec out=nv12 320x240 mode=ahead " in l
+               for l in lines), lines
+    assert any("stream 1 summary: container=mpeg codec=mp2 backend=libavcodec out=s16 44100Hz 2ch mode=on-demand " in l
+               for l in lines), lines
+    assert any("stream 0 summary: container=mpeg codec=mpeg1video backend=libavcodec out=compressed mode=compressed " in l
+               for l in lines), lines
     assert "ERROR: AddressSanitizer" not in out.stderr and "runtime error" not in out.stderr, out.stderr[-4000:]
 
     tsan = Path(t) / "mpeg-tsan"
@@ -959,7 +965,14 @@ with tempfile.TemporaryDirectory() as t:
         sys.exit("FAIL: the glue harness did not compile")
     for label, extra, argv, needles in [
         ("default", {}, [], ["[resampler] MPEG audio decoder created: MPEG-1 layer II 44100 Hz 2ch -> s16 44100 Hz 2ch",
-                             "[wmv] decoder created fmt=MPEG-1 320x240"]),
+                             "MPEG audio destroy: transform ",
+                             "MPEG-1 layer II 44100 Hz 2ch -> s16 44100 Hz 2ch:",
+                             "MPEG-1 layer II 44100 Hz 2ch -> f32 44100 Hz 2ch:",
+                             "[wmv] decoder created fmt=MPEG-1 320x240",
+                             "MPEG-1 320x240 -> nv12 320x240:",
+                             "100 pictures out, 0 rejected by the decoder",
+                             "MPEG-1 320x240 -> bgrx 320x240 bottom-up:",
+                             "stream 0 summary: container=mpeg codec=mpeg1video backend=libavcodec out=compressed mode=compressed"]),
         ("MADEIRA_WG_MPEG_TRANSFORM=0", {"MADEIRA_WG_MPEG_TRANSFORM": "0"}, ["off"],
          ["MPEG audio: disabled by MADEIRA_WG_MPEG_TRANSFORM=0"]),
     ]:

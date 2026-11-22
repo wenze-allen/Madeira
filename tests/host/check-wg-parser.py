@@ -79,6 +79,7 @@ assert "pthread_once( &wgp_config_once, wgp_configure )" in create
 configure = glue[glue.index("static void wgp_configure(void)"):]
 configure = configure[:configure.index("\n}\n")]
 assert 'getenv( "MADEIRA_WG_VIDEO" )' in glue and "wg_video_switch_on()" in configure
+assert 'getenv( "MADEIRA_WG_SUMMARY" )' in glue and "mav_allow_summary( wg_summary_switch_on() )" in configure
 assert "mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native )" in configure
 # rgb32 by default: the media session connects a source to its renderer with the native type only,
 # and DXMT has no YUV Direct3D 9 surface for the EVR's sample allocator (see the glue)
@@ -1178,12 +1179,30 @@ int main( int argc, char **argv )
         for (i = 0; i < 100; i++) mav_log( "line %d", i );
         return 0;
     }
+    if (argc > 1 && !strcmp( argv[1], "sumcap" ))
+    {
+        /* the summaries keep to a budget of their own, outside mav_log's */
+        struct mav_stream st;
+        int i;
+        memset( &st, 0, sizeof(st) );
+        snprintf( st.info.container, sizeof(st.info.container), "wav" );
+        st.type = MAV_STREAM_AUDIO;
+        for (i = 0; i < 60; i++) mav_log( "line %d", i );
+        for (i = 0; i < 60; i++) { st.number = i; mav_log_summary( NULL, &st, "summary" ); }
+        mav_log( "the movie's line" );
+        return 0;
+    }
     if (argc > 1 && !strcmp( argv[1], "dup" ))
     {
         int i;
         for (i = 0; i < 20; i++) mav_log( "connect refused (no container, compressed_out=0): same" );
         mav_log( "a different line" );
         return 0;
+    }
+    if (argc > 1 && !strcmp( argv[1], "nosummary" ))
+    {
+        mav_allow_summary( 0 );
+        return test_wav();
     }
     mav_configure( 1, &stub_video, &stub_audio, MAV_PIX_NV12 );
     if (argc > 1 && !strcmp( argv[1], "threads" ))
@@ -1271,11 +1290,45 @@ with tempfile.TemporaryDirectory() as t:
     assert any("video codec h264 (codec id 27" in l and "no video decoder backend" in l for l in lines), lines
     assert any("video codec mpeg4 (codec id 12" in l and "no decoder for it in this port" in l for l in lines), lines
     assert any("audio codec pcm_s16be (codec id" in l and "not exposed" in l for l in lines), lines
+    # playback summary lines: first buffer and disconnect, with plausible counts and timings
+    assert any("stream 0 first: container=mp4 codec=h264 backend=stub-video out=nv12 320x240 mode=ahead "
+               "delivered=1 " in l and " decode=" in l for l in lines), lines
+    assert any("stream 0 summary: container=wav codec=pcm_s16le backend=libavcodec out=s24 22050Hz 2ch mode=on-demand [disabled]" in l
+               for l in lines), lines
+    assert any("stream 0 summary: container=wav codec=pcm_s16le backend=libavcodec out=s16 44100Hz 2ch mode=on-demand "
+               "delivered=0 dropped=0 (trim=0 errors=0 bp=0) wait=0.00/0.00ms decode=0.00/0.00ms" in l for l in lines), lines
+    assert any("stream 0 summary: container=mp3 codec=mp2 backend=libavcodec out=s16 44100Hz 2ch mode=on-demand " in l
+               for l in lines), lines
+    assert any("stream 0 summary: container=mp4 codec=h264 backend=stub-video out=nv12 320x240 mode=ahead "
+               "delivered=432 dropped=3 (trim=3 errors=0 bp=0)" in l for l in lines), lines
+    assert any("stream 1 summary: container=mp4 codec=aac backend=stub-aac out=f32 44100Hz 2ch mode=on-demand [disabled]" in l
+               for l in lines), lines
+    ahead_re = re.compile(
+        r"stream 0 summary: container=mp4 codec=h264 backend=stub-video out=nv12 320x240 mode=(ahead|on-demand) "
+        r"delivered=(92|90) dropped=\d+ \(trim=\d+ errors=0 bp=0\) "
+        r"wait=([0-9.]+)/([0-9.]+)ms decode=([0-9.]+)/([0-9.]+)ms"
+    )
+    ahead_stats = {m.group(1): tuple(float(m.group(k)) for k in range(3, 7))
+                   for l in lines for m in [ahead_re.search(l)] if m}
+    assert "ahead" in ahead_stats and "on-demand" in ahead_stats, lines
+    assert ahead_stats["ahead"][0] < 5.0 and ahead_stats["ahead"][2] >= 15.0 and ahead_stats["ahead"][3] >= 18.0, ahead_stats
+    assert ahead_stats["on-demand"][0] >= 15.0 and ahead_stats["on-demand"][2] >= 15.0, ahead_stats
     assert "ERROR: AddressSanitizer" not in out.stderr and "runtime error" not in out.stderr, out.stderr
+    nosum = subprocess.run([str(exe), "nosummary"], env=env, capture_output=True, text=True)
+    assert nosum.returncode == 0, nosum.stdout + nosum.stderr
+    nosum_lines = [l for l in nosum.stderr.splitlines() if l.startswith(TAG)]
+    assert any("first audio buffer delivered" in l for l in nosum_lines), nosum_lines
+    assert not any("summary:" in l or "first:" in l for l in nosum_lines), nosum_lines
     cap = subprocess.run([str(exe), "cap"], env=env, capture_output=True, text=True)
     assert cap.returncode == 0, cap.stdout + cap.stderr
     capped = [l for l in cap.stderr.splitlines() if l.startswith(TAG)]
     assert len(capped) == 64 and capped[-1] == TAG + "further distinct parser lines suppressed after 63", capped[-3:]
+    sumcap = subprocess.run([str(exe), "sumcap"], env=env, capture_output=True, text=True)
+    assert sumcap.returncode == 0, sumcap.stdout + sumcap.stderr
+    sl = [l[len(TAG):] for l in sumcap.stderr.splitlines() if l.startswith(TAG)]
+    summaries = [l for l in sl if " summary: container=wav " in l]
+    assert len(summaries) == 48 and summaries[-1].startswith("stream 47 summary:"), summaries[-2:]
+    assert "further stream summaries suppressed after 48" in sl and "the movie's line" in sl, sl[-4:]
     dup = subprocess.run([str(exe), "dup"], env=env, capture_output=True, text=True)
     duped = [l for l in dup.stderr.splitlines() if l.startswith(TAG)]
     assert [l[len(TAG):] for l in duped] == ["connect refused (no container, compressed_out=0): same"] + \
