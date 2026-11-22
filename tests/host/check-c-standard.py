@@ -20,8 +20,11 @@ wine_build = Path(os.environ.get("MADEIRA_WINE_BUILD") or wine / "build-macos")
 
 # The files under the standard (docs/C-STANDARD.md, SCOPE): a file is added once it is clean.
 # Each is a translation unit; the files it includes from build/ntdll-unix are covered with it.
-UNITS = []
-COVERED = []
+UNITS = ["build/ntdll-unix/winegstreamer_unixlib_ios.c"]
+COVERED = [
+    "build/ntdll-unix/winegstreamer_unixlib_ios.c",
+    "build/ntdll-unix/wg_parser_av_ios.c",
+]
 
 WARNINGS = ("-std=gnu17 -Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion -Wdouble-promotion "
             "-Wformat=2 -Wundef -Wcast-qual -Wwrite-strings -Wvla -Wstrict-prototypes "

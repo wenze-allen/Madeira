@@ -247,6 +247,7 @@
 #include "config.h"
 
 #include <stdarg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,7 +267,7 @@
 /* ml1980: the wg_parser core (libavformat demux + decode, the PE read-thread
  * pull protocol).  It includes no Wine header, so it comes first; the Wine
  * side of the wg_parser entries is at the end of this file. */
-#include "wg_parser_av_ios.c"
+#include "wg_parser_av_ios.c" // NOLINT(bugprone-suspicious-include): the glue includes the core to form one translation unit
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -320,7 +321,7 @@ static BOOL madeira_subtype_tag( const GUID *guid, UINT *tag )
         { 0x00000000, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
     if (guid->Data2 != base.Data2 || guid->Data3 != base.Data3 ||
-        memcmp( guid->Data4, base.Data4, sizeof(base.Data4) ))
+        memcmp( guid->Data4, base.Data4, sizeof(base.Data4) ) != 0)
         return FALSE;
     *tag = guid->Data1;
     return TRUE;
@@ -520,7 +521,7 @@ static unsigned int wma_av_log_count;
 
 /* The WMV transform's decoders are opened by the wg_parser core's backend and
  * then marked with this instead of MAV_DECODER_MARKER (wmv_create). */
-static const char wmv_decoder_marker;
+static char wmv_decoder_marker;
 #define WMV_DECODER_MARKER ((void *)&wmv_decoder_marker)
 
 /* ml1980: the same callback serves the wg_parser core, whose demuxer and
@@ -543,6 +544,7 @@ static const char *av_log_owner( void *avcl )
     return "[wma] av:";
 }
 
+static void wma_av_log( void *avcl, int level, const char *fmt, va_list args ) __attribute__((format(printf, 3, 0)));
 static void wma_av_log( void *avcl, int level, const char *fmt, va_list args )
 {
     char buf[512];
@@ -680,7 +682,7 @@ static BOOL buffer_reserve( BYTE **buf, size_t *cap, size_t need )
     size_t want;
     BYTE *grown;
 
-    if (*cap >= need) return TRUE;
+    if (*buf && *cap >= need) return TRUE;
     want = *cap ? *cap : 4096;
     while (want < need) want *= 2;
     if (!(grown = realloc( *buf, want ))) return FALSE;
@@ -883,7 +885,7 @@ static NTSTATUS append_frame( struct wma_transform *transform, AVFrame *frame )
 
     dst = transform->pcm_buf + transform->pcm_len;
     converted = swr_convert( transform->swr, &dst, out_samples,
-                             (const uint8_t **)frame->extended_data, frame->nb_samples );
+                             (const uint8_t *const *)frame->extended_data, frame->nb_samples );
     if (converted < 0)
     {
         WMA_LOG( "swr_convert failed (%d)\n", converted );
@@ -1024,7 +1026,7 @@ static void wma_derived( enum AVCodecID id, UINT32 rate, UINT32 channels, INT64 
                  (rate >= 16000 ? 16000 : (rate >= 11025 ? 11025 : 8000)));
     int nb, nb_max;
 
-    *byte_offset_bits = av_log2( (int)(bps * (1 << flb) / 8.0 + 0.5) ) + 2;
+    *byte_offset_bits = av_log2( (unsigned int)lround( (double)bps * (double)(1u << flb) / 8.0 ) ) + 2;
 
     if (flags2 & 0x0004)
     {
@@ -1291,7 +1293,7 @@ static void dump_packet_to_file( struct wma_transform *transform, const BYTE *da
 static void dump_packet_head( struct wma_transform *transform, const BYTE *data, size_t size )
 {
     char hex[3 * 16 + 1];
-    unsigned int i, n = size < 16 ? (unsigned int)size : 16;
+    size_t i, n = size < 16 ? size : 16;
     UINT nibble_hi, nibble_lo;
 
     for (i = 0; i < n; i++)
@@ -1368,7 +1370,8 @@ static int send_one_packet( struct wma_transform *transform, const BYTE *data, s
 
     /* av_new_packet zero-fills AV_INPUT_BUFFER_PADDING_SIZE past the end,
      * which every bitstream reader in libavcodec reads past into. */
-    if ((err = av_new_packet( transform->packet, size )) < 0) return err;
+    if (size > INT_MAX) return AVERROR(EINVAL);
+    if ((err = av_new_packet( transform->packet, (int)size )) < 0) return err;
     memcpy( transform->packet->data, data, size );
 
     err = avcodec_send_packet( transform->avctx, transform->packet );
@@ -1713,8 +1716,8 @@ static NTSTATUS wma_create( struct wg_transform_create_params *params )
      * decoder refuses to open without it.  Kept on the transform because the
      * bit-rate retry has to reopen with it. */
     extra = in->cbSize;
-    if (extra > params->input_type.format_size - sizeof(WAVEFORMATEX))
-        extra = params->input_type.format_size - sizeof(WAVEFORMATEX);
+    if (extra > params->input_type.format_size - (UINT32)sizeof(WAVEFORMATEX))
+        extra = params->input_type.format_size - (UINT32)sizeof(WAVEFORMATEX);
     if (extra)
     {
         if (!(transform->extradata = malloc( extra ))) goto nomem;
@@ -1936,7 +1939,8 @@ static NTSTATUS wma_read_data( wg_transform_t handle, struct wg_sample *sample,
                              void *data, HRESULT *result )
 {
     struct wma_transform *transform = get_wma_transform( handle );
-    size_t avail, copy, frames;
+    size_t avail;
+    UINT32 copy, frames;
 
     if (!transform || !sample) return STATUS_INVALID_HANDLE;
     /* Consuming PCM into a buffer that does not exist would lose it silently. */
@@ -1952,7 +1956,7 @@ static NTSTATUS wma_read_data( wg_transform_t handle, struct wg_sample *sample,
         return STATUS_SUCCESS;
     }
 
-    copy = avail < sample->max_size ? avail : sample->max_size;
+    copy = avail < sample->max_size ? (UINT32)avail : sample->max_size;
     /* Never hand back a partial PCM frame: a caller that treats size/frame
      * size as a sample count would silently shear the channel interleave. */
     copy -= copy % transform->out_frame_size;
@@ -2547,10 +2551,11 @@ static void wmv_parse( struct wmv_transform *transform, const BYTE *data, UINT32
 
     for (;;)
     {
+        int chunk = data ? (size > INT_MAX ? INT_MAX : (int)size) : 0;
         uint8_t *frame;
         int frame_size, used;
 
-        used = av_parser_parse2( transform->parser, ctx, &frame, &frame_size, data, data ? (int)size : 0,
+        used = av_parser_parse2( transform->parser, ctx, &frame, &frame_size, data, chunk,
                                  pts == INT64_MIN ? AV_NOPTS_VALUE : pts, AV_NOPTS_VALUE, 0 );
         if (used < 0) break;
         if (data)
@@ -2797,17 +2802,25 @@ static void wmv_fill_black( enum mav_pixel_format fmt, const struct mav_layout *
     case MAV_PIX_YUY2:
     case MAV_PIX_UYVY:
     case MAV_PIX_YVYU:
+    {
+        static const uint8_t uyvy_black[4] = { 0x80, 0x10, 0x80, 0x10 };
+        static const uint8_t yuy2_black[4] = { 0x10, 0x80, 0x10, 0x80 };
         for (y = 0; y < h; y++)
-            for (x = 0; x + 4 <= l->stride[0]; x += 4)
-                memcpy( dst + (size_t)y * l->stride[0] + x, fmt == MAV_PIX_UYVY ? "\x80\x10\x80\x10" : "\x10\x80\x10\x80", 4 );
+            for (x = 0; x < l->stride[0] / 4; x++)
+                memcpy( dst + (size_t)y * l->stride[0] + (size_t)x * 4,
+                        fmt == MAV_PIX_UYVY ? uyvy_black : yuy2_black, 4 );
         break;
+    }
     case MAV_PIX_BGRA:
     case MAV_PIX_BGRx:
     case MAV_PIX_RGBA:
+    {
+        static const uint8_t rgb_black[4] = { 0, 0, 0, 0xff };
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++)
-                memcpy( dst + (size_t)y * l->stride[0] + x * 4, "\0\0\0\xff", 4 );
+                memcpy( dst + (size_t)y * l->stride[0] + (size_t)x * 4, rgb_black, 4 );
         break;
+    }
     default:
         memset( dst, 0, l->size );
         break;
@@ -3373,16 +3386,17 @@ static NTSTATUS rs_convert( struct rs_transform *transform, const BYTE *data, UI
     const uint8_t *in = data;
     uint8_t *out;
     UINT32 swr_frame = transform->out.channels * av_get_bytes_per_sample( transform->out.fmt );
-    int max, n, i;
+    int max, n;
 
+    if (frames > INT_MAX) return STATUS_INVALID_PARAMETER;
     if (data && transform->in.bits == 24)
     {
         /* little-endian 24-bit to the top of an S32 */
-        size_t samples = (size_t)frames * transform->in.channels;
+        size_t samples = (size_t)frames * transform->in.channels, i;
         INT32 *w;
         if (!buffer_reserve( &transform->wide, &transform->wide_cap, samples * 4 )) return STATUS_NO_MEMORY;
         w = (INT32 *)transform->wide;
-        for (i = 0; i < (int)samples; i++)
+        for (i = 0; i < samples; i++)
             w[i] = (INT32)((UINT32)data[3 * i] << 8 | (UINT32)data[3 * i + 1] << 16 | (UINT32)data[3 * i + 2] << 24);
         in = transform->wide;
     }
@@ -3541,14 +3555,15 @@ static NTSTATUS rs_push_data( wg_transform_t handle, struct wg_sample *sample, c
 static NTSTATUS rs_read_data( wg_transform_t handle, struct wg_sample *sample, void *data, HRESULT *result )
 {
     struct rs_transform *transform = get_rs_transform( handle );
-    size_t avail, copy;
+    size_t avail;
+    UINT32 copy;
 
     if (!transform || !sample) return STATUS_INVALID_HANDLE;
     if (sample->max_size && !data) return STATUS_INVALID_PARAMETER;
 
     pthread_mutex_lock( &transform->lock );
     avail = transform->pcm_len - transform->pcm_pos;
-    copy = avail < sample->max_size ? avail : sample->max_size;
+    copy = avail < sample->max_size ? (UINT32)avail : sample->max_size;
     copy -= copy % transform->out.frame_size;
     if (!copy)
     {
@@ -3793,7 +3808,7 @@ static NTSTATUS mpa_append( struct mpa_transform *transform, const AVFrame *fram
     if (!buffer_reserve( &transform->pcm_buf, &transform->pcm_cap, transform->pcm_len + (size_t)max * swr_frame ))
         return STATUS_NO_MEMORY;
     out = transform->pcm_buf + transform->pcm_len;
-    if ((n = swr_convert( transform->swr, &out, max, (const uint8_t **)frame->extended_data, frame->nb_samples )) < 0)
+    if ((n = swr_convert( transform->swr, &out, max, (const uint8_t *const *)frame->extended_data, frame->nb_samples )) < 0)
         return STATUS_INTERNAL_ERROR;
     if (transform->out.bits == 24) rs_pack24( out, (size_t)n * transform->out.channels );
     transform->pcm_len += (size_t)n * transform->out.frame_size;
@@ -3801,12 +3816,12 @@ static NTSTATUS mpa_append( struct mpa_transform *transform, const AVFrame *fram
 }
 
 /* One frame (NULL: the end) into the decoder, and what comes out. */
-static NTSTATUS mpa_decode( struct mpa_transform *transform, const uint8_t *data, int size )
+static NTSTATUS mpa_decode( struct mpa_transform *transform, uint8_t *data, int size )
 {
     NTSTATUS status = STATUS_SUCCESS;
     int err;
 
-    transform->pkt->data = (uint8_t *)data;
+    transform->pkt->data = data;
     transform->pkt->size = size;
     if ((err = avcodec_send_packet( transform->ctx, data ? transform->pkt : NULL )) < 0 && err != AVERROR_EOF)
     {
@@ -3835,11 +3850,12 @@ static NTSTATUS mpa_parse( struct mpa_transform *transform, const BYTE *data, UI
 
     while (!status)
     {
+        int chunk = data ? (size > INT_MAX ? INT_MAX : (int)size) : 0;
         uint8_t *frame;
         int frame_size, used;
 
         if ((used = av_parser_parse2( transform->parser, transform->ctx, &frame, &frame_size, data,
-                                      data ? (int)size : 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 )) < 0)
+                                      chunk, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 )) < 0)
             break;
         if (data)
         {
@@ -4022,14 +4038,15 @@ static NTSTATUS mpa_push_data( wg_transform_t handle, struct wg_sample *sample, 
 static NTSTATUS mpa_read_data( wg_transform_t handle, struct wg_sample *sample, void *data, HRESULT *result )
 {
     struct mpa_transform *transform = get_mpa_transform( handle );
-    size_t avail, copy;
+    size_t avail;
+    UINT32 copy;
 
     if (!transform || !sample) return STATUS_INVALID_HANDLE;
     if (sample->max_size && !data) return STATUS_INVALID_PARAMETER;
 
     pthread_mutex_lock( &transform->lock );
     avail = transform->pcm_len - transform->pcm_pos;
-    copy = avail < sample->max_size ? avail : sample->max_size;
+    copy = avail < sample->max_size ? (UINT32)avail : sample->max_size;
     copy -= copy % transform->out.frame_size;
     if (!copy)
     {
@@ -4484,6 +4501,8 @@ static int vconv_bt709( const MFVideoInfo *in_info, enum vconv_fmt in_fmt,
     UINT32 matrix = yuv->TransferMatrix ? yuv->TransferMatrix
                     : (in_info->TransferMatrix ? in_info->TransferMatrix : out_info->TransferMatrix);
 
+    (void)out_fmt;
+
     switch (matrix)
     {
     case MFVideoTransferMatrix_BT709:     return 1;
@@ -4890,7 +4909,8 @@ static NTSTATUS vconv_convert_frame( struct vconv_transform *transform, const BY
                 {
                     UINT32 fcy = gin->ry / 2 + y, bcrow = gin->flip ? gin->ch - 1 - fcy : fcy;
                     memcpy( transform->scratch + y_bytes + (size_t)y * uv_stride,
-                            src + gin->frame.offset[1] + (size_t)gin->frame.stride[1] * bcrow + gin->rx, ccw * 2 );
+                            src + gin->frame.offset[1] + (size_t)gin->frame.stride[1] * bcrow + gin->rx,
+                            (size_t)ccw * 2 );
                 }
             }
             else
@@ -5754,6 +5774,8 @@ static void wgp_configure(void)
              video ? "enabled" : "disabled", mav_apple_video_backend.name, mav_apple_audio_backend.name,
              mav_pix_name( native ) );
 #else
+    /* no VideoToolbox off Apple: the host checks enable video themselves */
+    (void)video;
     mav_configure( FALSE, NULL, NULL, native );
 #endif
 }

@@ -307,7 +307,7 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
 /* Bytes avformat_find_stream_info may read.  Enough for many seconds of any
  * stream here; it bounds the analysis of an MP3 carrying cover art, whose
  * (undecodable) picture stream would otherwise keep the analysis reading. */
-#define MAV_PROBESIZE (256 * 1024)
+#define MAV_PROBESIZE ((int64_t)256 * 1024)
 /* mp3dec.c's probe gives AVPROBE_SCORE_EXTENSION / 4 to a file that starts
  * with an ID3v2 tag larger than the probe buffer; anything below that is the
  * "detected only with low score" guess that misreads other MPEG files. */
@@ -456,7 +456,7 @@ static void mav_log( const char *fmt, ... )
 
 /* Left in AVCodecContext.opaque so a shared av_log callback can tell this
  * core's decoder from any other user of libavcodec in the process. */
-static const char mav_decoder_marker;
+static char mav_decoder_marker;
 #define MAV_DECODER_MARKER ((void *)&mav_decoder_marker)
 
 struct mav_vframe
@@ -625,14 +625,16 @@ static void *mav_lavc_open_stream( int codec, const AVStream *st, char *why, siz
     d->ctx->thread_count = 1;
     if (par->extradata && par->extradata_size > 0 && par->bits_per_coded_sample > 0 && par->bits_per_coded_sample <= 8)
     {
-        int pal_size = (1 << par->bits_per_coded_sample) * 4, i;
+        int pal_size = (1 << par->bits_per_coded_sample) * 4;
         const uint8_t *pal_src;
+        size_t i, n;
 
         if (pal_size > par->extradata_size) pal_size = par->extradata_size;
         pal_src = par->extradata + par->extradata_size - pal_size;
         if (pal_src - par->extradata >= 9 && !memcmp( par->extradata + par->extradata_size - 9, "BottomUp", 9 ))
             pal_src -= 9;
-        for (i = 0; i < pal_size / 4; i++)
+        n = (size_t)pal_size / 4;
+        for (i = 0; i < n; i++)
         {
             uint32_t c = 0xff000000u | (uint32_t)pal_src[4 * i] | ((uint32_t)pal_src[4 * i + 1] << 8)
                          | ((uint32_t)pal_src[4 * i + 2] << 16);
@@ -668,29 +670,29 @@ static inline void mav_lavc_rgb_pixel( const AVFrame *f, uint32_t x, uint32_t y,
     switch (f->format)
     {
     case AV_PIX_FMT_RGB24:
-        *r = row[3 * x]; *g = row[3 * x + 1]; *b = row[3 * x + 2];
+        *r = row[(size_t)3 * x]; *g = row[(size_t)3 * x + 1]; *b = row[(size_t)3 * x + 2];
         break;
     case AV_PIX_FMT_BGR24:
-        *b = row[3 * x]; *g = row[3 * x + 1]; *r = row[3 * x + 2];
+        *b = row[(size_t)3 * x]; *g = row[(size_t)3 * x + 1]; *r = row[(size_t)3 * x + 2];
         break;
     case AV_PIX_FMT_RGBA:
     case AV_PIX_FMT_RGB0:
-        *r = row[4 * x]; *g = row[4 * x + 1]; *b = row[4 * x + 2];
+        *r = row[(size_t)4 * x]; *g = row[(size_t)4 * x + 1]; *b = row[(size_t)4 * x + 2];
         break;
     case AV_PIX_FMT_BGRA:
     case AV_PIX_FMT_BGR0:
-        *b = row[4 * x]; *g = row[4 * x + 1]; *r = row[4 * x + 2];
+        *b = row[(size_t)4 * x]; *g = row[(size_t)4 * x + 1]; *r = row[(size_t)4 * x + 2];
         break;
     case AV_PIX_FMT_ARGB:
-        *r = row[4 * x + 1]; *g = row[4 * x + 2]; *b = row[4 * x + 3];
+        *r = row[(size_t)4 * x + 1]; *g = row[(size_t)4 * x + 2]; *b = row[(size_t)4 * x + 3];
         break;
     case AV_PIX_FMT_ABGR:
-        *b = row[4 * x + 1]; *g = row[4 * x + 2]; *r = row[4 * x + 3];
+        *b = row[(size_t)4 * x + 1]; *g = row[(size_t)4 * x + 2]; *r = row[(size_t)4 * x + 3];
         break;
     case AV_PIX_FMT_RGB555LE:
     case AV_PIX_FMT_BGR555LE:
     {
-        uint16_t v = (uint16_t)(row[2 * x] | (row[2 * x + 1] << 8));
+        uint16_t v = (uint16_t)(row[(size_t)2 * x] | (row[(size_t)2 * x + 1] << 8));
         uint8_t c0 = (uint8_t)((v >> 10) & 31), c1 = (uint8_t)((v >> 5) & 31), c2 = (uint8_t)(v & 31);
         c0 = (uint8_t)((c0 << 3) | (c0 >> 2));
         c1 = (uint8_t)((c1 << 3) | (c1 >> 2));
@@ -702,7 +704,7 @@ static inline void mav_lavc_rgb_pixel( const AVFrame *f, uint32_t x, uint32_t y,
     case AV_PIX_FMT_RGB565LE:
     case AV_PIX_FMT_BGR565LE:
     {
-        uint16_t v = (uint16_t)(row[2 * x] | (row[2 * x + 1] << 8));
+        uint16_t v = (uint16_t)(row[(size_t)2 * x] | (row[(size_t)2 * x + 1] << 8));
         uint8_t c0 = (uint8_t)(v >> 11), c1 = (uint8_t)((v >> 5) & 63), c2 = (uint8_t)(v & 31);
         c0 = (uint8_t)((c0 << 3) | (c0 >> 2));
         c1 = (uint8_t)((c1 << 2) | (c1 >> 4));
@@ -758,7 +760,7 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
         {
             const uint8_t *u = MAV_FROW( f, 1, y ), *v = MAV_FROW( f, 2, y );
             uint8_t *uv = uv_dst + (size_t)y * pic->uv_stride;
-            for (x = 0; x < cw; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+            for (x = 0; x < cw; x++) { uv[(size_t)2 * x] = u[x]; uv[(size_t)2 * x + 1] = v[x]; }
         }
         return 1;
 
@@ -771,8 +773,8 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
         {
             const uint8_t *src = MAV_FROW( f, 1, y );
             uint8_t *uv = uv_dst + (size_t)y * pic->uv_stride;
-            if (f->format == AV_PIX_FMT_NV12) memcpy( uv, src, cw * 2 );
-            else for (x = 0; x < cw; x++) { uv[2 * x] = src[2 * x + 1]; uv[2 * x + 1] = src[2 * x]; }
+            if (f->format == AV_PIX_FMT_NV12) memcpy( uv, src, (size_t)cw * 2 );
+            else for (x = 0; x < cw; x++) { uv[(size_t)2 * x] = src[(size_t)2 * x + 1]; uv[(size_t)2 * x + 1] = src[(size_t)2 * x]; }
         }
         return 1;
 
@@ -806,8 +808,8 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
             for (x = 0; x < cw; x++)
             {
                 uint32_t x0 = (2 * x) >> sw, x1 = (2 * x + 1 < w ? 2 * x + 1 : w - 1) >> sw;
-                uv[2 * x] = (uint8_t)((u0[x0] + u0[x1] + u1[x0] + u1[x1] + 2) >> 2);
-                uv[2 * x + 1] = (uint8_t)((v0[x0] + v0[x1] + v1[x0] + v1[x1] + 2) >> 2);
+                uv[(size_t)2 * x] = (uint8_t)((u0[x0] + u0[x1] + u1[x0] + u1[x1] + 2) >> 2);
+                uv[(size_t)2 * x + 1] = (uint8_t)((v0[x0] + v0[x1] + v1[x0] + v1[x1] + 2) >> 2);
             }
         }
         return 1;
@@ -839,8 +841,8 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
             uint8_t *uv = uv_dst + (size_t)y * pic->uv_stride;
             for (x = 0; x < cw; x++)
             {
-                uv[2 * x] = (uint8_t)((s0[4 * x + uo] + s1[4 * x + uo] + 1) >> 1);
-                uv[2 * x + 1] = (uint8_t)((s0[4 * x + vo] + s1[4 * x + vo] + 1) >> 1);
+                uv[(size_t)2 * x] = (uint8_t)((s0[4 * x + uo] + s1[4 * x + uo] + 1) >> 1);
+                uv[(size_t)2 * x + 1] = (uint8_t)((s0[4 * x + vo] + s1[4 * x + vo] + 1) >> 1);
             }
         }
         return 1;
@@ -855,19 +857,19 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
             for (y = 0; y < h; y++)
             {
                 const uint8_t *s = MAV_FROW( f, 0, y );
-                for (x = 0; x < w; x++) y_dst[(size_t)y * w + x] = s[2 * x];
+                for (x = 0; x < w; x++) y_dst[(size_t)y * w + x] = s[(size_t)2 * x];
             }
         memset( uv_dst, 128, (size_t)pic->uv_stride * ch );
         return 1;
 
     case AV_PIX_FMT_PAL8:
         if (!f->data[1]) return 0;
-        /* fall through */
+        __attribute__((fallthrough));
     case AV_PIX_FMT_GBRP:
     case AV_PIX_FMT_GBRAP:
         if ((f->format == AV_PIX_FMT_GBRP || f->format == AV_PIX_FMT_GBRAP) && (!f->data[1] || !f->data[2]))
             return 0;
-        /* fall through */
+        __attribute__((fallthrough));
     case AV_PIX_FMT_RGB24:
     case AV_PIX_FMT_BGR24:
     case AV_PIX_FMT_RGBA:
@@ -930,8 +932,8 @@ static int mav_lavc_fill_nv12( struct mav_lavc_picture *pic, const AVFrame *f )
                 rs = r00 + r01 + r10 + r11;
                 gs = g00 + g01 + g10 + g11;
                 bs = b00 + b01 + b10 + b11;
-                uv[2 * x] = mav_lavc_clip8( 128 + ((ur * rs + ug * gs + ub * bs + 131072) >> 18) );
-                uv[2 * x + 1] = mav_lavc_clip8( 128 + ((vr * rs + vg * gs + vb * bs + 131072) >> 18) );
+                uv[(size_t)2 * x] = mav_lavc_clip8( 128 + ((ur * rs + ug * gs + ub * bs + 131072) >> 18) );
+                uv[(size_t)2 * x + 1] = mav_lavc_clip8( 128 + ((vr * rs + vg * gs + vb * bs + 131072) >> 18) );
             }
         }
         return 1;
@@ -987,17 +989,15 @@ static int mav_lavc_decode( void *handle, const uint8_t *data, uint32_t size, in
     struct mav_lavc_vdec *d = handle;
     int err;
 
-    /* not reference-counted: libavcodec takes a padded copy */
-    d->pkt->data = (uint8_t *)data;
-    d->pkt->size = (int)size;
+    if (size > INT_MAX || (size && !data) || av_new_packet( d->pkt, (int)size ) < 0) return -1;
+    if (size) memcpy( d->pkt->data, data, size );
     d->pkt->pts = pts == INT64_MIN ? AV_NOPTS_VALUE : pts;
     d->pkt->dts = AV_NOPTS_VALUE;
     d->pkt->duration = duration == INT64_MIN ? 0 : duration;
     d->pkt->flags = keyframe ? AV_PKT_FLAG_KEY : 0;
     while ((err = avcodec_send_packet( d->ctx, d->pkt )) == AVERROR(EAGAIN))
         mav_lavc_receive( d, emit, ctx );
-    d->pkt->data = NULL;
-    d->pkt->size = 0;
+    av_packet_unref( d->pkt );
     if (err >= 0) mav_lavc_receive( d, emit, ctx );
     return err < 0 ? -1 : 0;
 }
@@ -1078,7 +1078,7 @@ static const struct mav_video_backend mav_lavc_video =
     mav_lavc_release, mav_lavc_flush, mav_lavc_close,
 };
 
-struct mav_stream
+struct mav_stream // NOLINT(clang-analyzer-optin.performance.Padding): fields grouped by role; at most MAV_MAX_STREAMS (2) per parser
 {
     unsigned int number;        /* index among the exposed streams */
     int av_index;               /* AVStream index */
@@ -1315,7 +1315,7 @@ static int mav_detect_cdxa( struct mav_parser *p )
     r = mav_raw_read_full( p, 0, hdr, sizeof(hdr) );
     if (r == AVERROR_EOF || (r > 0 && r < 44)) return 0;
     if (r < 0) return r;
-    if (memcmp( hdr, "RIFF", 4 ) || memcmp( hdr + 8, "CDXA", 4 )) return 0;
+    if (memcmp( hdr, "RIFF", 4 ) != 0 || memcmp( hdr + 8, "CDXA", 4 ) != 0) return 0;
 
     while (off + 8 <= 4096 && (!p->file_size || off + 8 <= p->file_size))
     {
@@ -1341,7 +1341,7 @@ static int mav_detect_cdxa( struct mav_parser *p )
 
     r = mav_raw_read_full( p, data_off, sec, sizeof(sec) );
     if (r < (int)sizeof(sec)) return r < 0 && r != AVERROR_EOF ? r : 0;
-    if (memcmp( sec, mav_cdxa_sync, 12 ) || sec[15] != 2) return 0;
+    if (memcmp( sec, mav_cdxa_sync, 12 ) != 0 || sec[15] != 2) return 0;
 
     if (p->file_size)
     {
@@ -2174,7 +2174,8 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
             snprintf( why, why_size, "no AAC decoder backend" );
             return MAV_E_UNSUPPORTED;
         }
-        if (!(s->adec = mav_abackend->open( MAV_BACKEND_AAC, par->extradata, par->extradata_size,
+        if (!(s->adec = mav_abackend->open( MAV_BACKEND_AAC, par->extradata,
+                                            par->extradata && par->extradata_size > 0 ? (uint32_t)par->extradata_size : 0,
                                             &rate, &channels, why, why_size )))
             return MAV_E_UNSUPPORTED;
         if (!rate || rate > 384000 || !channels || channels > MAV_MAX_CHANNELS)
@@ -2192,7 +2193,7 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
         s->info.native.rate = rate;
         s->info.native.channels = channels;
         s->info.native.channel_mask = mav_layout_mask( &s->bframe->ch_layout );
-        if (par->extradata && par->extradata_size <= sizeof(s->info.codec_data))
+        if (par->extradata && par->extradata_size > 0 && (size_t)par->extradata_size <= sizeof(s->info.codec_data))
         {
             memcpy( s->info.codec_data, par->extradata, par->extradata_size );
             s->info.codec_data_len = par->extradata_size;
@@ -2233,7 +2234,7 @@ static int mav_open_audio( struct mav_parser *p, struct mav_stream *s, AVStream 
                               : par->codec_id == AV_CODEC_ID_WMAPRO ? 3 : 4;
             s->info.block_align = par->block_align > 0 ? (uint32_t)par->block_align : 0;
             s->info.depth = par->bits_per_coded_sample > 0 ? (uint32_t)par->bits_per_coded_sample : 16;
-            if (par->extradata && par->extradata_size <= (int)sizeof(s->info.codec_data))
+            if (par->extradata && par->extradata_size > 0 && (size_t)par->extradata_size <= sizeof(s->info.codec_data))
             {
                 memcpy( s->info.codec_data, par->extradata, par->extradata_size );
                 s->info.codec_data_len = par->extradata_size;
@@ -2321,15 +2322,16 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     s->decode_order = p->is_avi && s->vbackend == &mav_lavc_video;
     s->vdec = s->decode_order
               ? mav_lavc_open_stream( codec, st, why, why_size )
-              : s->vbackend->open( codec, par->extradata, par->extradata_size, par->width, par->height,
-                                   why, why_size );
+              : s->vbackend->open( codec, par->extradata,
+                                   par->extradata && par->extradata_size > 0 ? (uint32_t)par->extradata_size : 0,
+                                   par->width, par->height, why, why_size );
     if (!s->vdec) return MAV_E_UNSUPPORTED;
     snprintf( s->info.backend, sizeof(s->info.backend), "%s", s->vbackend->name );
 
     if (p->is_mpegvideo)
     {
         fps = (AVRational){ 0, 1 };
-        if (!mav_mpeg1_seq_fps( par->extradata, (size_t)par->extradata_size, &fps ))
+        if (par->extradata_size <= 0 || !mav_mpeg1_seq_fps( par->extradata, (size_t)par->extradata_size, &fps ))
         {
             uint8_t probe_hdr[4096];
             int n = mav_raw_read_full( p, 0, probe_hdr, sizeof(probe_hdr) );
@@ -2365,7 +2367,7 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     s->info.bitrate = par->bit_rate > 0 && par->bit_rate < UINT32_MAX ? (uint32_t)par->bit_rate : 0;
     s->info.profile = par->profile > 0 ? par->profile : 0;
     s->info.level = par->level > 0 ? par->level : 0;
-    if (par->extradata && par->extradata_size <= sizeof(s->info.codec_data))
+    if (par->extradata && par->extradata_size > 0 && (size_t)par->extradata_size <= sizeof(s->info.codec_data))
     {
         memcpy( s->info.codec_data, par->extradata, par->extradata_size );
         s->info.codec_data_len = par->extradata_size;
@@ -2400,7 +2402,7 @@ static int mav_connect_locked( struct mav_parser *p )
         return mav_refuse( p, MAV_E_IO, "read error during probe" );
     }
 
-    if (!(avio_buf = av_malloc( MAV_AVIO_BUFFER ))) return MAV_E_NOMEM;
+    if (!(avio_buf = av_malloc( (size_t)MAV_AVIO_BUFFER ))) return MAV_E_NOMEM;
     if (!(p->avio = avio_alloc_context( avio_buf, MAV_AVIO_BUFFER, 0, p, mav_avio_read, NULL, mav_avio_seek )))
     {
         av_free( avio_buf );
@@ -2431,7 +2433,7 @@ static int mav_connect_locked( struct mav_parser *p )
     if (p->is_mpegvideo && !mav_mpeg_raw)
         return mav_refuse( p, MAV_E_UNSUPPORTED, "container disabled by MADEIRA_WG_MPEG_RAW=0" );
     p->is_avi = !strcmp( name, "avi" );
-    if (!is_mp3 && strcmp( name, "wav" ) && !(mav_video_container( p ) && mav_video_allowed))
+    if (!is_mp3 && strcmp( name, "wav" ) != 0 && !(mav_video_container( p ) && mav_video_allowed))
         return mav_refuse( p, MAV_E_UNSUPPORTED, mav_video_container( p ) ? "container disabled by MADEIRA_WG_VIDEO=0"
                                                                           : "container not in the allowlist" );
     if (p->is_avi && !mav_avi_allowed)
@@ -2675,7 +2677,7 @@ static int mav_enable( struct mav_parser *p, unsigned int stream, const struct m
     }
     else
     {
-        if (memcmp( out, &s->out, sizeof(*out) ) || s->compressed)
+        if (memcmp( out, &s->out, sizeof(*out) ) != 0 || s->compressed)
         {
             /* the held buffer is in the old format */
             s->has_buffer = 0;
@@ -3010,7 +3012,7 @@ static int mav_convert( struct mav_stream *s, const AVFrame *frame )
     if (!mav_reserve( s, (size_t)want * s->out.channels * conv_bps )) return -1;
     outp = s->buf;
     got = swr_convert( s->swr, &outp, want,
-                       frame ? (const uint8_t **)frame->extended_data : NULL,
+                       frame ? (const uint8_t *const *)frame->extended_data : NULL,
                        frame ? frame->nb_samples : 0 );
     if (got <= 0) return got;
     if (bps == 3)
@@ -3397,12 +3399,16 @@ static void mav_convert_picture( const struct mav_video_output *vout, int bt709,
 
     if (cw < w || ch < h)
     {
+        static const uint8_t uyvy_black[4] = { 0x80, 0x10, 0x80, 0x10 };
+        static const uint8_t yuy2_black[4] = { 0x10, 0x80, 0x10, 0x80 };
+        static const uint8_t rgb_black[4] = { 0, 0, 0, 0xff };
+
         /* black: Y 16 / chroma 128, or RGB black (opaque where there is alpha) */
         if (packed)
             for (y = 0; y < h; y++)
                 for (x = 0; x < l->stride[0] / 4; x++)
-                    memcpy( dst + (size_t)y * l->stride[0] + x * 4,
-                            vout->fmt == MAV_PIX_UYVY ? "\x80\x10\x80\x10" : "\x10\x80\x10\x80", 4 );
+                    memcpy( dst + (size_t)y * l->stride[0] + (size_t)x * 4,
+                            vout->fmt == MAV_PIX_UYVY ? uyvy_black : yuy2_black, 4 );
         else if (planar)
         {
             memset( dst, 16, l->offset[1] );
@@ -3413,7 +3419,7 @@ static void mav_convert_picture( const struct mav_video_output *vout, int bt709,
         else
             for (y = 0; y < h; y++)
                 for (x = 0; x < w; x++)
-                    memcpy( dst + (size_t)y * l->stride[0] + x * 4, "\0\0\0\xff", 4 );
+                    memcpy( dst + (size_t)y * l->stride[0] + (size_t)x * 4, rgb_black, 4 );
     }
 
 #define DST_ROW(plane, row, rows) (dst + l->offset[plane] + (size_t)l->stride[plane] * (flip ? (rows) - 1 - (row) : (row)))
@@ -3421,7 +3427,7 @@ static void mav_convert_picture( const struct mav_video_output *vout, int bt709,
     {
     case MAV_PIX_NV12:
         for (y = 0; y < ch; y++) memcpy( DST_ROW( 0, y, h ), src->y + (size_t)y * src->y_stride, cw );
-        for (y = 0; y < cch; y++) memcpy( DST_ROW( 1, y, l->chroma_height ), src->uv + (size_t)y * src->uv_stride, ccw * 2 );
+        for (y = 0; y < cch; y++) memcpy( DST_ROW( 1, y, l->chroma_height ), src->uv + (size_t)y * src->uv_stride, (size_t)ccw * 2 );
         break;
     case MAV_PIX_I420:
     case MAV_PIX_YV12:
@@ -3434,8 +3440,8 @@ static void mav_convert_picture( const struct mav_video_output *vout, int bt709,
             uint8_t *u = DST_ROW( u_plane, y, l->chroma_height ), *v = DST_ROW( v_plane, y, l->chroma_height );
             for (x = 0; x < ccw; x++)
             {
-                u[x] = uv[2 * x];
-                v[x] = uv[2 * x + 1];
+                u[x] = uv[(size_t)2 * x];
+                v[x] = uv[(size_t)2 * x + 1];
             }
         }
         break;
@@ -3504,17 +3510,17 @@ static void mav_convert_picture( const struct mav_video_output *vout, int bt709,
                 uint8_t b = mav_clip8( (yy + c.bu * u) >> 16 );
                 if (vout->fmt == MAV_PIX_BGR)
                 {
-                    o[3 * x] = b;
-                    o[3 * x + 1] = g;
-                    o[3 * x + 2] = r;
+                    o[(size_t)3 * x] = b;
+                    o[(size_t)3 * x + 1] = g;
+                    o[(size_t)3 * x + 2] = r;
                 }
                 else
                 {
                     uint16_t px = vout->fmt == MAV_PIX_RGB16
                                   ? (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | b >> 3)
                                   : (uint16_t)((r >> 3) << 10 | (g >> 3) << 5 | b >> 3);
-                    o[2 * x] = (uint8_t)px;
-                    o[2 * x + 1] = (uint8_t)(px >> 8);
+                    o[(size_t)2 * x] = (uint8_t)px;
+                    o[(size_t)2 * x + 1] = (uint8_t)(px >> 8);
                 }
             }
         }
@@ -3780,8 +3786,9 @@ static void mav_ahead_start( struct mav_parser *p, struct mav_stream *s )
     pthread_attr_t attr;
     int err;
 
+    (void)p;
     pthread_attr_init( &attr );
-    pthread_attr_setstacksize( &attr, 1024 * 1024 );
+    pthread_attr_setstacksize( &attr, (size_t)1024 * 1024 );
     s->ahead_stop = 0;
     s->ahead_eos = 0;
     s->ready_count = 0;
@@ -3851,7 +3858,7 @@ static int mav_compressed_next( struct mav_parser *p, struct mav_stream *s )
             s->eos = 1;
             return MAV_NO_BUFFER;
         }
-        if (!s->pkt->size)
+        if (s->pkt->size <= 0)
         {
             av_packet_unref( s->pkt );
             continue;
@@ -4117,11 +4124,12 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
         else
             p->stop = stop > INT64_MAX ? -1 : (int64_t)stop;
         /* pictures decoded ahead past a new stop are not handed out */
-        for (i = 0; i < p->stream_count && p->stop >= 0; i++)
+        for (i = 0; i < p->stream_count && i < MAV_MAX_STREAMS && p->stop >= 0; i++)
         {
             struct mav_stream *c = p->streams[i];
             unsigned int j, kept = 0;
 
+            if (!c) continue;
             for (j = 0; j < c->ready_count; j++)
                 if ((int64_t)c->ahead[c->ready[j]].cur.pts < p->stop) c->ready[kept++] = c->ready[j];
             if (kept < c->ready_count) c->ahead_eos = 1;
@@ -4137,8 +4145,9 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
          * MPEG program stream seeks to a pack by its timestamp, not to a
          * keyframe: a second earlier, the picture group that holds the target
          * starts after it, and the pictures up to the target are trimmed. */
-        for (i = 0; i < p->stream_count; i++)
-            if (!ref || p->streams[i]->type == MAV_STREAM_VIDEO) ref = p->streams[i];
+        for (i = 0; i < p->stream_count && i < MAV_MAX_STREAMS; i++)
+            if (p->streams[i] && (!ref || p->streams[i]->type == MAV_STREAM_VIDEO)) ref = p->streams[i];
+        if (!ref) ref = s;
         ts = av_rescale_q( p->is_mpeg ? (target > MAV_MPEG_SEEK_LEAD ? target - MAV_MPEG_SEEK_LEAD : 0) : target,
                            (AVRational){ 1, 10000000 }, ref->time_base ) + ref->origin;
 
@@ -4161,10 +4170,11 @@ static int mav_seek( struct mav_parser *p, unsigned int stream, int set_start, u
         else
         {
             p->demux_eof = 0;
-            for (i = 0; i < p->stream_count; i++)
+            for (i = 0; i < p->stream_count && i < MAV_MAX_STREAMS; i++)
             {
                 struct mav_stream *c = p->streams[i];
 
+                if (!c) continue;
                 if (c->dec) avcodec_flush_buffers( c->dec );
                 if (c->adec) mav_abackend->flush( c->adec );
                 if (c->vdec)

@@ -17,8 +17,10 @@ to Wine follow Wine's.
 
 A file is under the acceptance criteria once it is listed in
 `tests/host/check-c-standard.py`. A file is added when it is cleaned, and every
-file a change touches should be. The first to be cleaned are the media unix
-side's two files (measured below, under DEVIATIONS).
+file a change touches should be:
+
+- `build/ntdll-unix/winegstreamer_unixlib_ios.c`
+- `build/ntdll-unix/wg_parser_av_ios.c`
 
 ## RATIONALE
 
@@ -122,9 +124,11 @@ From the general standard, and why:
   standard adds a criterion only for an observed failure, and casts at 170
   sites would hide the next real one. Narrowing stays under `-Wconversion`.
 - **clang-tidy checks also disabled here** (`tests/host/c-standard.clang-tidy`):
-  - `bugprone-branch-clone`: 58 findings, parallel arms written so on purpose
-    (format tables, per-container cases); each was checked before it was
-    disabled.
+  - `bugprone-branch-clone`: 58 findings, each checked before it was
+    disabled. 56 are calls of the glue's log macros, whose first and last arms
+    print the same line by design (under the cap, and past it with
+    `MADEIRA_DIAG=1`); one is the core's fallback order for a stream's
+    duration; one a mapping switch.
   - `bugprone-multi-level-implicit-pointer-conversion`: `memmove` and `free`
     on pointer arrays, which C converts through `void *` by design.
   - `bugprone-assignment-in-selection-statement`: the general standard's
