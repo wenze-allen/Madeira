@@ -323,8 +323,16 @@ YV12 surface holds only its luma plane, so each frame's copy overran it, and
 each blit failed: a black window, if the game did not crash. Without 3D, ddraw
 now lists only YUY2 (wine submodule), and the VMR-7 takes the decoder's YUY2.
 Movies that reach the renderer through the decoding splitter (MPEG-2, AVI) get
-RGB32 first and were not affected. `tests/host/check-dshow-default-renderer.py`
-pins the chain.
+RGB32 first, top-down (`biHeight < 0`): `quartz_parser` offers the stream's
+native `rgb32` first and negates `biHeight` for RGB as DirectShow does for
+top-down DIBs. The VMR-7 passed `biHeight` straight into the DirectDraw surface
+height (`(DWORD)-height`, wrapping the surface size to ~4 GB in 32-bit wined3d
+so every `Lock` failed with `E_OUTOFMEMORY`), the window and source rects (the
+window shrank to its title bar) and the sizes it reports: another black window.
+The VMR-7, VMR-9 and `IBasicVideo` now take `abs(biHeight)` for surfaces, rects
+and reported sizes while `vmr_render` keeps the sign so only bottom-up RGB is
+flipped (wine submodule). `tests/host/check-dshow-default-renderer.py` pins
+both paths.
 
 The PE half of winegstreamer is upstream's but for `wm_reader.c` (above). Wine's configure
 disables the module when GStreamer is missing, so a PE build tree has to be
@@ -482,8 +490,9 @@ none:
   - the allocators that ask for `DXVA2_VideoProcessorRenderTarget`;
   - the one-thread work queue that makes decode-ahead necessary.
 - `tests/host/check-dshow-default-renderer.py`: source checks on the path from
-  `RenderFile`'s default renderer to wined3d's CPU blitter, and that ddraw lists
-  only YUY2 without 3D.
+  `RenderFile`'s default renderer to wined3d's CPU blitter, that ddraw lists
+  only YUY2 without 3D, and that the VMR-7 handles the decoding splitter's
+  top-down RGB (`biHeight < 0`).
 - `tests/host/check-wma-decoder.py` (Linux or macOS, needs a configured
   Wine tree for the generated headers): compiles the production
   `winegstreamer_unixlib_ios.c` under ASan/UBSan against a host FFmpeg built

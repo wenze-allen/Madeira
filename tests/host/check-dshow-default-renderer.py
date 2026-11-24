@@ -14,13 +14,26 @@ RGB. These are the checks that an MPEG-1 movie through RenderFile() is drawn:
 4. The CPU blitter converts YUY2 to the display's RGB, and only YUY2 among the YUV formats.
 5. quartz's MPEG video decoder offers YV12 before YUY2 (why 3 matters), and our video
    transform, which it uses, writes YUY2.
+6. Movies through winegstreamer's decoding splitter (AVI, MPEG-2) get the stream's native
+   format first, which here is top-down RGB32 (`biHeight < 0`). The VMR-7's presenter, the
+   VMR-7 itself, VMR-9 and shared `IBasicVideo` use `abs(biHeight)` for surface heights,
+   window/source rects and reported sizes while `vmr_render` keeps the sign so only bottom-up
+   RGB is flipped.
 """
 from pathlib import Path
 import re, sys
 
 root = Path(__file__).resolve().parents[2]
 wine = root / "wine"
-need = [wine / "dlls/quartz/videorenderer.c", wine / "dlls/ddraw/ddraw.c"]
+need = [
+    wine / "dlls/quartz/videorenderer.c",
+    wine / "dlls/quartz/vmr7.c",
+    wine / "dlls/quartz/vmr7_presenter.c",
+    wine / "dlls/quartz/vmr9.c",
+    wine / "dlls/quartz/window.c",
+    wine / "dlls/winegstreamer/quartz_parser.c",
+    wine / "dlls/ddraw/ddraw.c",
+]
 for n in need:
     if not n.exists():
         sys.exit("SKIP-FAIL: %s is missing (submodules not checked out)" % n)
@@ -86,3 +99,75 @@ assert offers.index("WG_VIDEO_FORMAT_YV12") < offers.index("WG_VIDEO_FORMAT_YUY2
 glue = (root / "build/ntdll-unix/winegstreamer_unixlib_ios.c").read_text()
 assert "case MAKEFOURCC('Y','U','Y','2'): return MAV_PIX_YUY2;" in glue, "the video transform writes YUY2"
 print("PASS: quartz's MPEG video decoder offers YV12 before YUY2, and our video transform writes YUY2")
+
+# ---- 6. top-down RGB from the decoding splitter -------------------------------------
+native_fmt = function(glue, "static enum mav_pixel_format wg_video_native_format(")
+assert "if (!v || !*v) return MAV_PIX_BGRx;" in native_fmt, \
+    "the parser's default native video format is BGRx (RGB32, top-down)"
+
+qp = (wine / "dlls/winegstreamer/quartz_parser.c").read_text()
+decodebin_mt = function(qp, "static HRESULT decodebin_parser_source_get_media_type(")
+assert decodebin_mt.index("wg_parser_stream_get_current_format(") \
+    < decodebin_mt.index("amt_from_wg_format(mt, &format, false)") \
+    < decodebin_mt.index("video_formats[index]"), \
+    "the decoding splitter offers the stream's current format before the bottom-up fallback table"
+amt_video = function(qp, "static bool amt_from_wg_format_video(")
+assert re.search(
+    r"if \(wg_video_format_is_rgb\(format->u\.video\.format\)\)\s*"
+    r"video_format->bmiHeader\.biHeight = -format->u\.video\.height;",
+    amt_video,
+), "amt_from_wg_format_video negates biHeight for top-down RGB"
+print("PASS: the decoding splitter offers top-down RGB32 (biHeight < 0) first")
+
+presenter = (wine / "dlls/quartz/vmr7_presenter.c").read_text()
+alloc_surf = function(presenter, "static HRESULT WINAPI surface_allocator_AllocateSurface(")
+assert "surface_desc.dwHeight = abs(info->lpHdr->biHeight);" in alloc_surf, alloc_surf
+assert "surface_desc.dwHeight = info->lpHdr->biHeight;" not in alloc_surf, alloc_surf
+
+alloc_vmr7 = function(vmr7, "static HRESULT allocate_surfaces(")
+assert "info.szAspectRatio.cy = info.szNativeSize.cy = abs(bitmap_header.biHeight);" in alloc_vmr7, alloc_vmr7
+assert "info.lpHdr = &bitmap_header;" in alloc_vmr7, "AllocateSurface still receives the connection's BITMAPINFOHEADER"
+connect_vmr7 = function(vmr7, "static HRESULT vmr_connect(")
+assert "SetRect(&rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));" in connect_vmr7, connect_vmr7
+defrect_vmr7 = function(vmr7, "static void vmr_get_default_rect(")
+assert "SetRect(rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));" in defrect_vmr7, defrect_vmr7
+native_vmr7 = function(vmr7, "static HRESULT WINAPI windowless_control_GetNativeVideoSize(")
+assert "*height = abs(bitmap_header->biHeight);" in native_vmr7, native_vmr7
+assert "*aspect_height = abs(bitmap_header->biHeight);" in native_vmr7, native_vmr7
+assert "info.szAspectRatio.cy = abs(height);" in render, render
+assert "else if (height > 0 && (bitmap_header->biCompression == BI_RGB || bitmap_header->biCompression == BI_BITFIELDS))" in render, \
+    "vmr_render flips RGB only when biHeight > 0"
+assert "height = abs(height);" in render and "memcpy(surface_desc.lpSurface, data, data_size);" in render, \
+    "top-down RGB copies forward (pitch-converting or memcpy)"
+
+window_c = (wine / "dlls/quartz/window.c").read_text()
+for fn in [
+    "static HRESULT WINAPI basic_video_get_VideoHeight(",
+    "static HRESULT WINAPI basic_video_put_SourceTop(",
+    "static HRESULT WINAPI basic_video_put_SourceHeight(",
+    "static HRESULT WINAPI basic_video_SetSourcePosition(",
+    "static HRESULT WINAPI basic_video_SetDefaultSourcePosition(",
+    "static HRESULT WINAPI basic_video_GetVideoSize(",
+    "static HRESULT WINAPI basic_video_IsUsingDefaultSource(",
+]:
+    body = function(window_c, fn)
+    assert "biHeight" in body, fn
+    assert not re.search(r"(?<!abs\()(?<!abs\(get_bitmap_header\(window\)->)(?<!abs\(bitmap_header->)biHeight", body), body
+assert len(re.findall(r"->biHeight", window_c)) == len(re.findall(r"abs\([^;\n]*?->biHeight\)", window_c)), \
+    "unwrapped ->biHeight in window.c"
+
+vmr9 = (wine / "dlls/quartz/vmr9.c").read_text()
+assert "info.dwHeight = info.szAspectRatio.cy = info.szNativeSize.cy = abs(bmiheader->biHeight);" in function(
+    vmr9, "static HRESULT allocate_surfaces("
+)
+assert "SetRect(&rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));" in function(
+    vmr9, "static HRESULT vmr_connect("
+)
+assert "SetRect(rect, 0, 0, bitmap_header->biWidth, abs(bitmap_header->biHeight));" in function(
+    vmr9, "static void vmr_get_default_rect("
+)
+assert "bih.biHeight = abs(bih.biHeight);" in function(vmr9, "static HRESULT vmr_get_current_image(")
+native_vmr9 = function(vmr9, "static HRESULT WINAPI VMR9WindowlessControl_GetNativeVideoSize(")
+assert "*height = abs(bmiheader->biHeight);" in native_vmr9 and "*aspect_height = abs(bmiheader->biHeight);" in native_vmr9
+assert "info.szAspectRatio.cy = abs(height);" in function(vmr9, "static HRESULT vmr_render(")
+print("PASS: the VMR-7 presenter, VMR-7, VMR-9 and IBasicVideo use abs(biHeight) for surfaces, rects and sizes")
