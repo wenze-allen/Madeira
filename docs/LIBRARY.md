@@ -152,6 +152,19 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
   choice exports `MADEIRA_FEX_AVX=1`, which makes the ARM64EC FEX module report
   and emulate AVX/AVX2 for a game built for AVX processors (64-bit games; WOW64
   has no AVX);
+- **Pause threads fully** (Automatic, On or Off): `MADEIRA_REAL_SUSPEND` for
+  the session (ml730: a Wine SuspendThread really stops the thread instead of
+  only snapshotting it). Automatic follows madeira.cfg's `real-suspend` when
+  set, otherwise turns it on when `GameAssembly.dll` is in the game's folder or
+  beside a direct-started Steam executable (Unity IL2CPP, whose garbage
+  collector scans suspended threads' stacks: Megabonk crashed while loading
+  without it). The launch unsets it when nothing chooses it, and wineserver
+  reads it on every call;
+- **Japanese locale** (off by default): exports `MADEIRA_JAPANESE=1` for the
+  game, running Wine with a Japanese system and user locale (`LC_ALL = ja_JP.UTF-8`,
+  ANSI and OEM code page 932), enabling the extra code page tables
+  (`MADEIRA_NLS_EXTRA=1`), and installing the bundled Noto Sans JP font with
+  Windows Japanese font replacements (`docs/JAPANESE.md`);
 - **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
   filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
   other than the default exports `MADEIRA_CPU_COUNT` (wine) or

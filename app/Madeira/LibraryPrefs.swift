@@ -15,6 +15,8 @@ enum LibraryPrefs {
     private static let avxKey = "madeira.library.avx"
     private static let vcrtKey = "madeira.library.wineVCRT"
     private static let nvidiaKey = "madeira.library.nvidia"
+    private static let realSuspendKey = "madeira.library.realSuspend"
+    private static let japaneseKey = "madeira.library.japanese"
 
     private static func dict<T>(_ key: String) -> [String: T] {
         (UserDefaults.standard.dictionary(forKey: key) as? [String: T]) ?? [:]
@@ -34,6 +36,15 @@ enum LibraryPrefs {
 
     static func nvidia(_ windowsPath: String) -> Bool { (dict(nvidiaKey) as [String: Bool])[windowsPath] ?? false }
     static func setNvidia(_ on: Bool, for windowsPath: String) { store(on ? true : nil, nvidiaKey, windowsPath) }
+
+    /// "Japanese locale": Wine runs the game with a Japanese system locale (code page 932)
+    /// and a Japanese font (MADEIRA_JAPANESE, WineProcessBridge.m madeira_japanese_prefix).
+    static func japanese(_ windowsPath: String) -> Bool { (dict(japaneseKey) as [String: Bool])[windowsPath] ?? false }
+    static func setJapanese(_ on: Bool, for windowsPath: String) { store(on ? true : nil, japaneseKey, windowsPath) }
+
+    /// "Pause threads fully" (BCDLaunch.realSuspend): nil is Automatic, true On, false Off.
+    static func realSuspend(_ windowsPath: String) -> Bool? { (dict(realSuspendKey) as [String: Bool])[windowsPath] }
+    static func setRealSuspend(_ on: Bool?, for windowsPath: String) { store(on, realSuspendKey, windowsPath) }
 
     /// FNV-1a over a string: stable across launches, unlike String.hashValue.
     /// Names a game's config file (GameProfiles.swift) and fingerprints the

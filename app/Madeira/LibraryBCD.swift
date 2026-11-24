@@ -17,6 +17,7 @@ enum BCDLaunch {
     /// previous launch's choice never leaks into this one.
     static func applyExtras(avx: Bool, wineVCRT: Bool, nvidia: Bool, profile: GameProfile?) {
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
+        applyJapanese(false)   // applyLibrary turns it on for a game that has it
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
         var dxmtExtra: [String] = []
         if nvidia {
@@ -49,6 +50,23 @@ enum BCDLaunch {
         else { setenv("MADEIRA_DXMT_EXTRA", dxmtExtra.joined(separator: ";"), 1)   /* DXMT splits on ";" */ }
     }
 
+    /// "Japanese locale" (Game details › Compatibility): MADEIRA_JAPANESE, read by
+    /// WineProcessBridge.m before the wineserver starts (the font and the Japanese font
+    /// names go into the prefix) and when Wine starts (LC_ALL = ja_JP.UTF-8, so code page
+    /// 932, and the extra code page tables). Off: a Japanese locale an earlier launch
+    /// exported is taken back; madeira.cfg's and the game file's own env lines are
+    /// exported again after this, so a line there still applies.
+    static func applyJapanese(_ on: Bool) {
+        if on {
+            setenv("MADEIRA_JAPANESE", "1", 1)
+        } else {
+            unsetenv("MADEIRA_JAPANESE")
+            if let lc = getenv("LC_ALL"), String(cString: lc).hasPrefix("ja") {
+                unsetenv("LC_ALL"); unsetenv("LANG"); unsetenv("MADEIRA_NLS_EXTRA")
+            }
+        }
+    }
+
     /// A start from upstream's library: this game's madeira-bcd options. The
     /// FPS limit is the entry's (upstream's FPS picker, which offers 40 FPS too).
     static func applyLibrary(_ entry: LibraryEntry) {
@@ -60,9 +78,51 @@ enum BCDLaunch {
         let profile = GameProfile(windowsPath: path)
         applyExtras(avx: LibraryPrefs.avx(path), wineVCRT: LibraryPrefs.wineVCRT(path),
                     nvidia: LibraryPrefs.nvidia(path), profile: profile)
+        applyJapanese(LibraryPrefs.japanese(path))
         let program = path.split(separator: "\\").last.map(String.init) ?? path
         LogStore.shared.log("[bcd] library launch \(program): avx=\(LibraryPrefs.avx(path) ? 1 : 0) "
                             + "wine-vcrt=\(LibraryPrefs.wineVCRT(path) ? 1 : 0) nvidia=\(LibraryPrefs.nvidia(path) ? 1 : 0) "
+                            + "japanese=\(LibraryPrefs.japanese(path) ? 1 : 0) "
                             + "game-config=\(profile.hasSettings ? 1 : 0)")
+    }
+
+    /// "Pause threads fully" (Game details › Compatibility): MADEIRA_REAL_SUSPEND for
+    /// this session, or nil to leave it unset. Without it a Wine SuspendThread only
+    /// snapshots the target's registers while the thread keeps running (ml730,
+    /// build/wineserver/mach_ios.c). A Unity IL2CPP game's garbage collector suspends
+    /// every thread and scans its stack: with the threads still running it freed
+    /// objects in use, and Megabonk crashed while loading (c0000005 at a scrambled
+    /// address in two of the threads it had suspended). With real suspension it runs.
+    /// The game's own On or Off wins; Automatic follows madeira.cfg's real-suspend
+    /// when that is set, and otherwise turns it on for a Unity IL2CPP game only:
+    /// real suspension can deadlock a game that suspends a thread holding a lock
+    /// Madeira's own code needs, so it stays off for everything else.
+    static func realSuspend(_ entry: LibraryEntry?) -> (value: String, source: String)? {
+        if let entry, entry.desktop != true, let on = LibraryPrefs.realSuspend(entry.windowsPath) {
+            return (on ? "1" : "0", "this game's switch")
+        }
+        if let v = MadeiraConfig.get("real-suspend")?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+            return (v, "madeira.cfg real-suspend")
+        }
+        if let entry, entry.desktop != true, isUnityIL2CPP(entry) { return ("1", "Unity IL2CPP game (GameAssembly.dll)") }
+        return nil
+    }
+
+    /// A Unity IL2CPP build keeps GameAssembly.dll next to its exe. A direct Steam
+    /// launch can select an exe below its install folder; Dock keeps the root check.
+    static func isUnityIL2CPP(_ entry: LibraryEntry) -> Bool {
+        guard let url = LibraryEntry.hostURL(ofWindowsPath: entry.windowsPath) else { return false }
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        let folder = fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue ? url : url.deletingLastPathComponent()
+        if let launched = LibraryEntry.hostURL(ofWindowsPath: entry.launchWindowsPath) {
+            let program = launched.resolvingSymlinksInPath().standardizedFileURL
+            let root = folder.resolvingSymlinksInPath().standardizedFileURL
+            if program.path.hasPrefix(root.path + "/"),
+               fm.fileExists(atPath: program.deletingLastPathComponent().appendingPathComponent("GameAssembly.dll").path) {
+                return true
+            }
+        }
+        return fm.fileExists(atPath: folder.appendingPathComponent("GameAssembly.dll").path)
     }
 }
