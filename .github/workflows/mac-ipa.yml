@@ -1,14 +1,14 @@
 name: mac-ipa
 
 # The Debug, unsigned IPA, built on a GitHub-hosted Mac with build/build-mac-reuse.sh: the source
-# of this branch plus the reuse overlay (a release asset of this repository). The overlay carries
-# what the 21e6697 Mac build made and what has not changed since (FEX, the i386 Wine farm minus the
-# DLLs whose sources changed, the pairing library). DXMT moved past 21e6697 (pin 3d62913 and
-# build/dxmt-patches/0002-d3d9-index-range-per-draw.patch), so the overlay's libdxmt_combined.a is
-# removed below and rebuilt from this checkout (and the overlay's I386_REBUILD adds quartz and dxmt
-# so the 32-bit DirectShow and DXMT DLLs rebuild too); the iOS LLVM archives and headers DXMT links
-# (build/llvm-ios/build.sh) are cached across runs under their own Xcode + recipe key. See the
-# overlay's REUSE-README.md and reuse/MANIFEST.md.
+# of this branch plus the reuse overlay (release reuse-overlay-115f032 of this repository). The
+# overlay carries what the 21e6697 Mac build made and what has not changed since (FEX, the i386
+# Wine farm minus the seven Wine DLLs and seven DXMT DLLs whose sources changed, the pairing
+# library). DXMT moved past 21e6697 (pin 3d62913 and build/dxmt-patches/0002-d3d9-index-range-per-draw.patch),
+# so reuse/ omits libdxmt_combined.a and shader-headers: build-mac-reuse.sh builds dxmt-ios from
+# this checkout and rebuilds quartz and dxmt in I386_REBUILD, while the iOS LLVM archives and
+# headers DXMT links (build/llvm-ios/build.sh) are cached across runs under their own Xcode +
+# recipe key. See the overlay's REUSE-README.md and reuse/MANIFEST.md.
 
 on:
   push:
@@ -23,9 +23,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OVERLAY_TAG: reuse-overlay-9bb6dc6
-  OVERLAY_ASSET: Madeira-reuse-overlay-9bb6dc6-ci.tar.xz
-  OVERLAY_SHA256: 7273aa32d3be5d9129ab611666d4a3df28d6ded2eba6549a28e731b32e00a238
+  OVERLAY_TAG: reuse-overlay-115f032
+  OVERLAY_ASSET: Madeira-reuse-overlay-115f032-ci.tar.xz
+  OVERLAY_SHA256: 991841be345bdf3de57ce3c6bdf87e959efd4c8e8687c56a075f6f39050f79ea
 
 jobs:
   ipa:
@@ -105,8 +105,9 @@ jobs:
             echo "Xcode $XCODE_BUILD is older than 27C5020n: FEX is built here"
             rm -rf reuse/FEX
           fi
-          # DXMT moved to 3d62913 and gained 0002-d3d9-index-range-per-draw.patch:
-          # drop the 21e6697 libdxmt_combined.a so build-mac-reuse.sh rebuilds dxmt-ios.
+          # Guard: reuse-overlay-115f032 already omits libdxmt_combined.a and build/dxmt-ios;
+          # keep this rm -rf so an older OVERLAY_TAG can never slip a stale 1f617cd archive through
+          # (and tests/host/check-dxmt-patches.py pins this guard).
           rm -rf reuse/app/Madeira/libdxmt_combined.a reuse/build/dxmt-ios
           rm -f "$RUNNER_TEMP/$OVERLAY_ASSET"
 
