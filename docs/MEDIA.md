@@ -352,7 +352,21 @@ and reported sizes while `vmr_render` keeps the sign so only bottom-up RGB is
 flipped (wine submodule). `tests/host/check-dshow-default-renderer.py` pins
 both paths.
 
-The PE half of winegstreamer is upstream's but for `wm_reader.c` and `media_source.c` (above). Wine's configure
+**Playing a DirectShow movie again.** KiriKiri loops or replays a movie by
+seeking back with `put_CurrentPosition(0)` after `EC_COMPLETE` and running the
+graph again; the self-test's MPEG-1 paths do the same, and on the iPad all
+three got `EC_COMPLETE` at once in the second play, with no frame. Wine's
+filter graph sets the event behind `IMediaEvent::WaitForCompletion()` at
+`EC_COMPLETE` and never reset it, so after one completion every later wait
+returned at once. `graph_start` now resets it when the graph runs, with the
+`EC_COMPLETE` count it already reset there (wine submodule). quartz's MPEG
+video and audio decoders also flush their transform when the stream is flushed
+for a seek, so a decoder no longer hands out its last picture from before the
+seek. Our parser was not involved: it hands out every packet again after the
+two seeks a rewind makes (one through each renderer). `tests/host/check-dshow-rewind.py`
+pins both fixes.
+
+The PE half of winegstreamer is upstream's but for `wm_reader.c`, `media_source.c` and `quartz_transform.c` (above). Wine's configure
 disables the module when GStreamer is missing, so a PE build tree has to be
 configured with `--enable-winegstreamer` (`build/wine-pe/build-ntdll.sh` does
 this for the arm64ec tree) and only the PE target is built. A 32-bit

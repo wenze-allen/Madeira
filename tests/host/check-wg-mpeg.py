@@ -22,7 +22,8 @@ program stream, and its wg_transform no MPEG decoder.
      keep the offset they have in the file); the tone; decoded ahead on a worker; an exact seek;
      a rewind to 0 after reading to the end (KiriKiri's put_CurrentPosition(0));
    - compressed output, as quartz's MPEG-1 splitter reads it: every packet of both streams with
-     the file's bytes and keyframe flags; MADEIRA_WG_COMPRESSED=0 refuses the file;
+     the file's bytes and keyframe flags, and all of them again after a DirectShow rewind's two
+     seeks (one through each renderer's pin); MADEIRA_WG_COMPRESSED=0 refuses the file;
    - an MPEG-2 program stream (the dvd muxer): decoded bit-exact; its video not passed compressed
      (no wg_format), its audio is;
    - a raw MPEG-1 elementary stream (.m1v, at 25 fps and 30000/1001 fps with open-GOP B-frames):
@@ -581,6 +582,27 @@ static int test_compressed_ref( const uint8_t *data, size_t size, const uint8_t 
     }
     CHECK( count[0] == want[0] && count[1] == want[1] && count[0] > 0 && count[1] > 0,
            "%d / %d video packets, %d / %d audio packets", count[0], want[0], count[1], want[1] );
+    /* A DirectShow rewind seeks twice: put_CurrentPosition(0) reaches the splitter through each
+     * renderer, the video pin's then the audio pin's, and each pin's thread reads in between. */
+    {
+        int again[2] = { 0, 0 }, k, more;
+        CHECK( mav_seek( p, 0, 1, 0, 0, 0 ) == MAV_OK, "%s: rewind through the video pin", label );
+        for (k = 0; k < 5 && mav_get_buffer( p, 0, &b ) == MAV_OK; k++) mav_release_buffer( p, 0 );
+        for (k = 0; k < 30 && mav_get_buffer( p, 1, &b ) == MAV_OK; k++) mav_release_buffer( p, 1 );
+        CHECK( mav_seek( p, 1, 1, 0, 0, 0 ) == MAV_OK, "%s: rewind through the audio pin", label );
+        do
+        {
+            more = 0;
+            for (k = 0; k < 2; k++)
+                if (mav_get_buffer( p, k, &b ) == MAV_OK)
+                {
+                    if (!again[k]) CHECK( b.discontinuity && (k || !b.delta), "stream %d: the replay starts afresh", k );
+                    again[k]++; mav_release_buffer( p, k ); more = 1;
+                }
+        } while (more);
+        CHECK( again[0] == want[0] && again[1] == want[1], "%s: after the two seeks of a rewind, %d / %d video and "
+               "%d / %d audio packets", label, again[0], want[0], again[1], want[1] );
+    }
     src_stop( &s ); mav_destroy( p );
 
     /* MADEIRA_WG_COMPRESSED=0: the splitter gives way to the decoding splitter */
@@ -591,7 +613,8 @@ static int test_compressed_ref( const uint8_t *data, size_t size, const uint8_t 
     mav_allow_compressed_asf( 1 );
     free( buf );
     printf( "PASS: %s compressed (quartz's MPEG-1 splitter): all %d video and %d audio packets with "
-            "the file's bytes, keyframe flags and timestamps; MADEIRA_WG_COMPRESSED=0 refuses it\n", label, count[0], count[1] );
+            "the file's bytes, keyframe flags and timestamps, and all again after a rewind's two seeks; "
+            "MADEIRA_WG_COMPRESSED=0 refuses it\n", label, count[0], count[1] );
     return 0;
 }
 
