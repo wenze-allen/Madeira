@@ -312,6 +312,24 @@ submodule:
   session thread that also feeds the audio. It now locks with
   `D3DLOCK_DISCARD`, since it overwrites every byte.
 
+**The Media Foundation source's frame buffers.** `media_stream_send_sample` in
+`winegstreamer`'s `media_source.c` called `MFCreateMemoryBuffer` for every
+sample: for a 1920x1080 `RGB32` frame (`8,294,400` bytes), a `0x7f0000`-byte
+heap large block allocated and freed 24 to 60 times a second. In a 32-bit game
+that churn fragments the 4 GB window until no 8 MB gap remains (`[va-scan]
+FAILED ... size=0x7f0000`), and because every stream's `RequestSample` runs on
+the source's one `async_commands_queue` thread, failing video allocations stall
+the audio requests behind them (Senren Banka's opening ran 1.4 s short of audio
+in its first 10 s). Each `media_stream` now keeps a pool of up to four
+`IMFMediaBuffer`s (grown on demand): a buffer is reused only when the pool holds
+its sole reference (`IMFMediaBuffer_AddRef` returning 2, after every sample and
+caller downstream has released it), a free buffer too small for the next sample
+is dropped and replaced, and when all four slots are busy it falls back to a
+fresh unpooled `MFCreateMemoryBuffer`. Pool buffers are released at source
+shutdown or stream destruction, and each stream that pooled anything logs one
+`[mf-source]` summary line (`MESSAGE()`). `MADEIRA_MF_SOURCE_POOL=0` allocates a
+fresh buffer per sample again.
+
 **DirectShow's default video renderer.** `RenderFile` connects video to the
 "Video Renderer", which is the VMR-7 (the GDI renderer only if the VMR-7
 cannot be created). The VMR-7 draws through DirectDraw, and DirectDraw through
@@ -334,7 +352,7 @@ and reported sizes while `vmr_render` keeps the sign so only bottom-up RGB is
 flipped (wine submodule). `tests/host/check-dshow-default-renderer.py` pins
 both paths.
 
-The PE half of winegstreamer is upstream's but for `wm_reader.c` (above). Wine's configure
+The PE half of winegstreamer is upstream's but for `wm_reader.c` and `media_source.c` (above). Wine's configure
 disables the module when GStreamer is missing, so a PE build tree has to be
 configured with `--enable-winegstreamer` (`build/wine-pe/build-ntdll.sh` does
 this for the arm64ec tree) and only the PE target is built. A 32-bit
@@ -359,6 +377,7 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_COMPRESSED` | on | `0`: a compressed-output parser refuses an ASF, an MPEG program stream and a raw MPEG-1 video stream, as before: the WM reader's compressed samples are not available, and quartz's MPEG-1 splitter gives way to the decoding splitter (see above). |
 | `MADEIRA_WG_MPEG_RAW` | on | `0`: raw MPEG-1 video elementary streams (`.m1v`/`.mpv`) are refused at connect and `RIFF`/`CDXA` VideoCD `.dat` sectors are not unwrapped, as before. |
 | `MADEIRA_WG_VIDEO_AHEAD` | on | `0`: video is decoded on the thread that asks for it, as before; a Media Foundation movie's audio then waits behind each picture (see above). |
+| `MADEIRA_MF_SOURCE_POOL` | on | `0`: `winegstreamer`'s Media Foundation source allocates a fresh `MFCreateMemoryBuffer` for every sample again, instead of reusing per-stream pooled buffers (see above). Read once per process. |
 | `MADEIRA_WG_VIDEO_FORMAT` | `rgb32` | Native format a video stream reports: `nv12`, `i420`, `yv12`, `yuy2`, `rgb32`, `argb32` or `abgr32` (see above for why the default is `rgb32`). |
 | `MADEIRA_WG_SUMMARY` | on | `0`: omit the one-line playback summaries per parser stream (`stream N first:`, `stream N summary:`) and per `wg_transform` (`destroy:`), restoring the previous log output. |
 | `MADEIRA_WMA_SEARCH` | on | `0`: keep the WMA v1/v2 decoder at the bit rate and flags it opened with; no search over other candidates when a bit-reservoir stream fails. A packet that fails is concealed with silence of its length and the next one is decoded as usual. (An xWMA stream still opens at the rate libavformat's xWMA table normalises to.) |
@@ -422,6 +441,11 @@ none:
 - `[wma] destroy: transform 0x..., wmav2 44100 Hz 2ch block=2973 (128000 bit/s) -> s16 44100 Hz 2ch: S samples (K packets) in, O samples (F frames) out, E packet errors (Z silence frames)` (plus `[muted]` if the parameter ladder exhausted without a valid decode)
 - `[resampler] destroy: transform 0x..., s16 48000 Hz 2ch -> f32 48000 Hz 2ch: S samples (I frames) in, O samples (F frames) out, E errors`
 - `[resampler] MPEG audio destroy: transform 0x..., MPEG-1 layer II 44100 Hz 2ch -> s16 44100 Hz 2ch: S samples (B bytes) in, O samples (F frames) out, E errors`
+
+**Media Foundation source summaries (`[mf-source]`).** Each Media Foundation
+stream that pooled at least one buffer logs one line via `MESSAGE()` when its
+pool is freed at source shutdown or stream destruction:
+- `[mf-source] stream N: B buffers of S bytes, R reuses, F fresh allocations, E failed, at most M in use` (`F > 0` means downstream held all four pooled buffers at once and fell back to unpooled allocations; `E > 0` means `MFCreateMemoryBuffer` failed).
 
 **How to read a failure from one or two lines:**
 - **Refused at open:** `[wg-parser] ... connect refused (...)` or a transform
@@ -489,6 +513,13 @@ none:
   - mfplat's discard copy;
   - the allocators that ask for `DXVA2_VideoProcessorRenderTarget`;
   - the one-thread work queue that makes decode-ahead necessary.
+- `tests/host/check-mf-source-pool.py`: source checks (and `llvm-mingw`
+  `-fsyntax-only` compilation when the toolchain is present) on
+  `winegstreamer`'s Media Foundation source buffer pool: per-stream bounded
+  pool, sole-reference `IMFMediaBuffer` reuse invariant, too-small buffer
+  replacement, fresh-allocation fallback when full, `MADEIRA_MF_SOURCE_POOL`
+  kill switch in code, docs and catalog, shutdown/release cleanup, and the
+  `[mf-source]` `MESSAGE()` summary line.
 - `tests/host/check-dshow-default-renderer.py`: source checks on the path from
   `RenderFile`'s default renderer to wined3d's CPU blitter, that ddraw lists
   only YUY2 without 3D, and that the VMR-7 handles the decoding splitter's
