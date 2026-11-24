@@ -296,9 +296,13 @@ none are committed with the code.
    `wow64win.dll`, and `ntdll.dll` rebuilt, from the pinned Wine's aarch64 PE
    build (`make -C dlls/wow64 dlls/wow64win dlls/ntdll` in a tree configured
    with `--enable-archs=aarch64`).
-3. **FEX WOW64 module:** `build/fex-wow64/build.sh` configures `FEX/build-wow64`
-   for `aarch64-w64-mingw32` with the iOS host options, builds target
-   `wow64fex` and installs `Bin/libwow64fex.dll` as
+3. **FEX WOW64 module:** `build/fex-wow64/build.sh` first applies
+   `build/fex-patches/*.patch` to the `FEX` working tree
+   (`build/fex-patches/README.md`, Madeira's own changes, not for FEX-Emu;
+   `0001` arms, releases and invalidates self-modifying-code write traps and
+   tracks hot SMC pages per 16 KB iOS host page in both modules), configures
+   `FEX/build-wow64` for `aarch64-w64-mingw32` with the iOS host options,
+   builds target `wow64fex` and installs `Bin/libwow64fex.dll` as
    `app/Madeira/aarch64-windows/xtajit.dll`.
 4. **Smoke test:** `tests/x86/build.sh hello-x86` builds a kernel32-only
    i386 PE into `app/Madeira/i386-windows/`. Put `env.MADEIRA_EXE = hello-x86.exe`
