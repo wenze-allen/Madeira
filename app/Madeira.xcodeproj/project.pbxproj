@@ -16,6 +16,7 @@
 		A1000531 /* SteamGames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000531 /* SteamGames.swift */; };
 		A1000900 /* LiquidMetal.metal in Sources */ = {isa = PBXBuildFile; fileRef = A2000900 /* LiquidMetal.metal */; };
 		A1000910 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000910 /* Assets.xcassets */; };
+		A1009C03 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = A2009C03 /* Localizable.xcstrings */; };
 		A1000902 /* GlassSkin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000902 /* GlassSkin.swift */; };
 		A1000903 /* LiquidMetalSkin.metal in Sources */ = {isa = PBXBuildFile; fileRef = A2000903 /* LiquidMetalSkin.metal */; };
 		A1000904 /* AmbientGlow.metal in Sources */ = {isa = PBXBuildFile; fileRef = A2000904 /* AmbientGlow.metal */; };
@@ -73,6 +74,7 @@
 		A1000020 /* WineServerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A200001E /* WineServerBridge.m */; };
 		A1000021 /* libwineserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020 /* libwineserver.a */; };
 		A1000022 /* nls in Resources */ = {isa = PBXBuildFile; fileRef = A2000021 /* nls */; };
+		A10009A1 /* fonts-ja in Resources */ = {isa = PBXBuildFile; fileRef = A20009A1 /* fonts-ja */; };
 		A1000030 /* WineProcessBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000030 /* WineProcessBridge.m */; };
 		A1000031 /* libntdll_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000032 /* libntdll_unix.a */; };
 		A1000032 /* aarch64-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000033 /* aarch64-windows */; };
@@ -206,6 +208,7 @@
 		A2000531 /* SteamGames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamGames.swift"; sourceTree = "<group>"; };
 		A2000900 /* LiquidMetal.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = "LiquidMetal.metal"; sourceTree = "<group>"; };
 		A2000910 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A2009C03 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		A2000902 /* GlassSkin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlassSkin.swift"; sourceTree = "<group>"; };
 		A2000903 /* LiquidMetalSkin.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = "LiquidMetalSkin.metal"; sourceTree = "<group>"; };
 		A2000904 /* AmbientGlow.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = "AmbientGlow.metal"; sourceTree = "<group>"; };
@@ -273,6 +276,7 @@
 		A200001F /* WineServerBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineServerBridge.h; sourceTree = "<group>"; };
 		A2000020 /* libwineserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwineserver.a; sourceTree = "<group>"; };
 		A2000021 /* nls */ = {isa = PBXFileReference; lastKnownFileType = folder; path = nls; sourceTree = "<group>"; };
+		A20009A1 /* fonts-ja */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "fonts-ja"; sourceTree = "<group>"; };
 		A2000030 /* WineProcessBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WineProcessBridge.m; sourceTree = "<group>"; };
 		A2000031 /* WineProcessBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineProcessBridge.h; sourceTree = "<group>"; };
 		A2000032 /* libntdll_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libntdll_unix.a; sourceTree = "<group>"; };
@@ -442,6 +446,7 @@
 				A2000541 /* ConfigCatalog.generated.swift */,
 				A2000531 /* SteamGames.swift */,
 				A2000900 /* LiquidMetal.metal */,
+				A2009C03 /* Localizable.xcstrings */,
 				A2000910 /* Assets.xcassets */,
 				A2000902 /* GlassSkin.swift */,
 				A2000903 /* LiquidMetalSkin.metal */,
@@ -543,6 +548,7 @@
 				B2000004 /* madeira-jit.js */,
 				B2000051 /* Madeira JIT.shortcut */,
 				A2000021 /* nls */,
+				A20009A1 /* fonts-ja */,
 				A2000033 /* aarch64-windows */,
 				A20000F1 /* legal */,
 				A2000080 /* arm64ec-windows */,
@@ -697,6 +703,12 @@
 			knownRegions = (
 				en,
 				Base,
+				de,
+				es,
+				ko,
+				"pt-BR",
+				ru,
+				"zh-Hans",
 			);
 			mainGroup = A4000001;
 			productRefGroup = A4000003 /* Products */;
@@ -715,6 +727,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000022 /* nls in Resources */,
+				A10009A1 /* fonts-ja in Resources */,
 				A1000032 /* aarch64-windows in Resources */,
 				A10000F1 /* legal in Resources */,
 				A1000080 /* arm64ec-windows in Resources */,
@@ -724,6 +737,7 @@
 				A1000081 /* x86_64-vcruntime in Resources */,
 				A1000040 /* prefix-template.tar.gz in Resources */,
 				A1000094 /* cacert.pem in Resources */,
+				A1009C03 /* Localizable.xcstrings in Resources */,
 				A1000910 /* Assets.xcassets in Resources */,
 				B1000004 /* madeira-jit.js in Resources */,
 				B1000051 /* Madeira JIT.shortcut in Resources */,
