@@ -10,6 +10,8 @@
 #
 #   build/wine-i386/build.sh                 whole farm + DXMT's i386 DLLs
 #   build/wine-i386/build.sh kernel32 user32 only those Wine modules
+#   build/wine-i386/build.sh dxmt            only DXMT's i386 DLLs
+#   build/wine-i386/build.sh mf wined3d dxmt those Wine modules + DXMT's i386 DLLs
 #   SKIP_DXMT=1 build/wine-i386/build.sh     Wine modules only
 #
 # What goes in, and why it is not a hand-written list: a 32-bit program that
@@ -75,44 +77,68 @@ SKIP=()
 for e in "${SKIP_REASON[@]}"; do IFS='|' read -r -a n <<< "${e%%=*}"; SKIP+=("${n[@]}"); done
 is_in() { local x="$1"; shift; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
 
-TARGETS=()
-while IFS= read -r t; do
-    b="$(basename "$t")"
-    is_in "$b" "${SKIP[@]}" && continue
-    if [ $# -gt 0 ]; then
-        want=0
-        for a in "$@"; do [ "$b" = "$a" ] || [ "${b%.*}" = "$a" ] && want=1; done
-        [ "$want" = 1 ] || continue
-    fi
-    TARGETS+=("$t")
-done < <(grep -oE '^(dlls|programs)/[^/]+/i386-windows/[^/ :]+' "$B/Makefile" | grep -E "$EXT_RE" | sort -u)
-[ ${#TARGETS[@]} -gt 0 ] || { echo "no i386 targets matched" >&2; exit 2; }
-echo "== ${#TARGETS[@]} i386 modules (skipped by policy: ${#SKIP[@]} names) =="
-
-# -------------------------------------------------------------------- build
-cd "$B"
-set +e
-make -k -j"$JOBS" "${TARGETS[@]}" > "$LOG" 2>&1
-set -e
-FAILED=()
-for t in "${TARGETS[@]}"; do
-    [ -f "$t" ] && continue
-    if ! make -j1 "$t" >> "$LOG" 2>&1 || [ ! -f "$t" ]; then FAILED+=("$t"); fi
-done
-if [ ${#FAILED[@]} -gt 0 ]; then
-    printf 'FAIL %s\n' "${FAILED[@]}"
-    echo "== ${#FAILED[@]} modules failed; nothing installed (log: $LOG) =="
-    exit 1
+BUILD_DXMT=0
+WINE_ARGS=()
+if [ $# -eq 0 ]; then
+    [ -n "${SKIP_DXMT:-}" ] || BUILD_DXMT=1
+else
+    for a in "$@"; do
+        if [ "$a" = dxmt ]; then
+            [ -n "${SKIP_DXMT:-}" ] || BUILD_DXMT=1
+        else
+            WINE_ARGS+=("$a")
+        fi
+    done
 fi
 
-mkdir -p "$DEST"
-for t in "${TARGETS[@]}"; do
-    b="$(basename "$t")"
-    cp -f "$t" "$DEST/$b.tmp"
-    case "$b" in *.tlb) ;; *) "$STRIP" --strip-debug "$DEST/$b.tmp" ;; esac
-    mv -f "$DEST/$b.tmp" "$DEST/$b"
-done
-echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
+TARGETS=()
+if [ $# -eq 0 ] || [ ${#WINE_ARGS[@]} -gt 0 ]; then
+    while IFS= read -r t; do
+        b="$(basename "$t")"
+        is_in "$b" "${SKIP[@]}" && continue
+        if [ ${#WINE_ARGS[@]} -gt 0 ]; then
+            want=0
+            for a in "${WINE_ARGS[@]}"; do [ "$b" = "$a" ] || [ "${b%.*}" = "$a" ] && want=1; done
+            [ "$want" = 1 ] || continue
+        fi
+        TARGETS+=("$t")
+    done < <(grep -oE '^(dlls|programs)/[^/]+/i386-windows/[^/ :]+' "$B/Makefile" | grep -E "$EXT_RE" | sort -u)
+fi
+if [ ${#TARGETS[@]} -eq 0 ] && [ "$BUILD_DXMT" = 0 ]; then
+    echo "no i386 targets matched" >&2
+    exit 2
+fi
+
+# -------------------------------------------------------------------- build
+if [ ${#TARGETS[@]} -gt 0 ]; then
+    echo "== ${#TARGETS[@]} i386 modules (skipped by policy: ${#SKIP[@]} names) =="
+    cd "$B"
+    set +e
+    make -k -j"$JOBS" "${TARGETS[@]}" > "$LOG" 2>&1
+    set -e
+    FAILED=()
+    for t in "${TARGETS[@]}"; do
+        [ -f "$t" ] && continue
+        if ! make -j1 "$t" >> "$LOG" 2>&1 || [ ! -f "$t" ]; then FAILED+=("$t"); fi
+    done
+    if [ ${#FAILED[@]} -gt 0 ]; then
+        printf 'FAIL %s\n' "${FAILED[@]}"
+        echo "== ${#FAILED[@]} modules failed; nothing installed (log: $LOG) =="
+        exit 1
+    fi
+
+    mkdir -p "$DEST"
+    for t in "${TARGETS[@]}"; do
+        b="$(basename "$t")"
+        cp -f "$t" "$DEST/$b.tmp"
+        case "$b" in *.tlb) ;; *) "$STRIP" --strip-debug "$DEST/$b.tmp" ;; esac
+        mv -f "$DEST/$b.tmp" "$DEST/$b"
+    done
+    echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
+else
+    : > "$LOG"
+    mkdir -p "$DEST"
+fi
 
 # --------------------------------------------------------------------- DXMT
 # The i386 build of dxmt (d3d11/dxgi/d3d10core/winemetal and the
@@ -120,7 +146,17 @@ echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
 # winemetal's wow64 thunk table on the unix side is what lets these 32-bit
 # DLLs reach the Metal renderer; the shim reaches the native D3D9 frontend
 # through its own table (virtual_ios.c, the d3d9shim branch).
-if [ -z "${SKIP_DXMT:-}" ] && [ $# -eq 0 ]; then
+if [ "$BUILD_DXMT" = 1 ]; then
+    # DXMT's meson build looks up winebuild, libwinecrt0.a, libntdll.a and
+    # libdbghelp.a in wine/build-i386; build those four when the whole Wine
+    # farm was not built above (e.g. `build.sh dxmt` or a selective rebuild).
+    if [ $# -gt 0 ]; then
+        make -C "$B" -j"$JOBS" \
+            tools/winebuild/winebuild \
+            libs/winecrt0/i386-windows/libwinecrt0.a \
+            dlls/ntdll/i386-windows/libntdll.a \
+            dlls/dbghelp/i386-windows/libdbghelp.a >> "$LOG" 2>&1
+    fi
     D="$R/dxmt"
     # This repository's DXMT changes (build/dxmt-patches/README.md) go in first.
     bash "$R/build/dxmt-patches/apply.sh"

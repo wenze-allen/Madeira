@@ -2,10 +2,13 @@ name: mac-ipa
 
 # The Debug, unsigned IPA, built on a GitHub-hosted Mac with build/build-mac-reuse.sh: the source
 # of this branch plus the reuse overlay (a release asset of this repository). The overlay carries
-# what the 21e6697 Mac build made and what has not changed since (DXMT and its LLVM, FEX, the
-# i386 farm but the six DLLs the wine pin changed, the pairing library), so LLVM is never built here and
-# the job fits a standard runner. What changed is built from this checkout. See the overlay's
-# REUSE-README.md and reuse/MANIFEST.md.
+# what the 21e6697 Mac build made and what has not changed since (FEX, the i386 Wine farm minus the
+# DLLs whose sources changed, the pairing library). DXMT moved past 21e6697 (pin 3d62913 and
+# build/dxmt-patches/0002-d3d9-index-range-per-draw.patch), so the overlay's libdxmt_combined.a is
+# removed below and rebuilt from this checkout (and the overlay's I386_REBUILD adds quartz and dxmt
+# so the 32-bit DirectShow and DXMT DLLs rebuild too); the iOS LLVM archives and headers DXMT links
+# (build/llvm-ios/build.sh) are cached across runs under their own Xcode + recipe key. See the
+# overlay's REUSE-README.md and reuse/MANIFEST.md.
 
 on:
   push:
@@ -102,7 +105,30 @@ jobs:
             echo "Xcode $XCODE_BUILD is older than 27C5020n: FEX is built here"
             rm -rf reuse/FEX
           fi
+          # DXMT moved to 3d62913 and gained 0002-d3d9-index-range-per-draw.patch:
+          # drop the 21e6697 libdxmt_combined.a so build-mac-reuse.sh rebuilds dxmt-ios.
+          rm -rf reuse/app/Madeira/libdxmt_combined.a reuse/build/dxmt-ios
           rm -f "$RUNNER_TEMP/$OVERLAY_ASSET"
+
+      - name: Restore LLVM for iOS
+        id: cache-llvm-ios
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build/lib
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-project/llvm/include
+            toolchains/mac-build/stamps/llvm-ios
+          key: llvm-ios-v1-${{ env.XCODE_BUILD }}-${{ hashFiles('build/llvm-ios/build.sh') }}
+
+      - name: Check restored LLVM headers
+        if: steps.cache-llvm-ios.outputs.cache-hit == 'true'
+        run: |
+          if [ ! -f toolchains/llvm-project/llvm/include/llvm/IR/Module.h ] ||
+             [ ! -f toolchains/llvm-ios-build/include/llvm/Config/llvm-config.h ]; then
+            echo "Incomplete LLVM cache: forcing a clean llvm-ios build"
+            rm -f toolchains/mac-build/stamps/llvm-ios
+          fi
 
       - name: Restore what earlier runs built
         uses: actions/cache/restore@v4
@@ -129,6 +155,17 @@ jobs:
         run: |
           export JOBS="$(sysctl -n hw.ncpu)"
           build/build-mac-reuse.sh
+
+      - name: Save LLVM for iOS
+        if: always() && steps.cache-llvm-ios.outputs.cache-hit != 'true' && hashFiles('toolchains/mac-build/stamps/llvm-ios') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build/lib
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-project/llvm/include
+            toolchains/mac-build/stamps/llvm-ios
+          key: llvm-ios-v1-${{ env.XCODE_BUILD }}-${{ hashFiles('build/llvm-ios/build.sh') }}
 
       - name: Keep what this run built
         if: always()

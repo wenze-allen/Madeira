@@ -267,6 +267,8 @@ the switch is only consulted for a WoW64 process, window or thread.
 | `MADEIRA_STRICT_SPLITLOCK` | on | FEX WOW64 | `StrictInProcessSplitLocks` default for 32-bit guests (an explicit FEX setting wins) |
 | `MADEIRA_WOW_SYSCALL_SWEEP` | on | FEX WOW64 | Let the code-buffer sweeper move threads parked in a system call |
 | `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend. Also set by the `d3d9` key of `madeira.cfg` |
+| `MADEIRA_D3D9_INDEX_RANGE` | on | DXMT D3D9 | Upload only the index bytes an indexed D3D9 draw reads (`build/dxmt-patches/0002-d3d9-index-range-per-draw.patch`); `0`: refresh the whole mirror |
+| `MADEIRA_D3D9_LUMINANCE_RT` | on | DXMT D3D9 | Allow `D3DFMT_L8`, `D3DFMT_A8L8` and `D3DFMT_L16` as D3D9 render targets (`dxmt` `3d62913`); `0`: refuse them |
 | `MADEIRA_WOW_RWX_PLAIN` | unset (automatic) | 32-bit | Anonymous RWX memory in a window is plain read/write to the host once Wine Mono's `libmono-2.0-x86.dll` is mapped there; 1: in every window, 0: never (stores go through the JIT pool's alias, as before; also keeps FEX's Mono bridge off) |
 | `MADEIRA_WINEMONO_BRIDGE` | automatic for `libmono-2.0-x86.dll` | FEX WOW64 | FEX's Mono backpatcher bridge (ml712) and, once it finds the backpatcher, SMC detection off for the process (ml1280); 0 keeps both off. The 64-bit runtime still needs 1 |
 | `MADEIRA_MONO_DEFAULTS` | on | Wine Mono | mscoree sets `MONO_THREADS_SUSPEND=coop` and adds `keep-delegates` to `MONO_DEBUG` before Mono loads; values already set win; 0 sets nothing |
@@ -285,7 +287,11 @@ none are committed with the code.
    `app/Madeira/i386-windows/`, builds DXMT's i386 `d3d11`/`dxgi`/`d3d10core`/
    `winemetal` against that tree with meson, and reports the farm's import
    closure. `build/wine-i386/build.sh kernel32 user32` rebuilds only those
-   modules; `SKIP_DXMT=1` leaves DXMT out. The unix side needs
+   Wine modules; `build/wine-i386/build.sh dxmt` (or `... kernel32 dxmt`)
+   rebuilds DXMT's i386 DLLs without rebuilding the whole Wine farm (making
+   sure `winebuild` and the `winecrt0`/`ntdll`/`dbghelp` import libraries exist
+   first, and applying `build/dxmt-patches/*.patch`); `SKIP_DXMT=1` leaves DXMT
+   out. The unix side needs
    `libdxmt_combined.a` rebuilt from the pinned DXMT (`build/dxmt-ios/build.sh`),
    which carries winemetal's 32-bit table.
    It is the macOS form of the WSL script the 32-bit work was built with; it

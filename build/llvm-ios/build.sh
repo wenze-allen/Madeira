@@ -18,6 +18,7 @@ JOBS="$(sysctl -n hw.ncpu)"
 mkdir -p "$T"
 
 if [ ! -d "$T/llvm-project/.git" ]; then
+    rm -rf "$T/llvm-project"
     git clone --filter=blob:none https://github.com/llvm/llvm-project.git "$T/llvm-project"
 fi
 git -C "$T/llvm-project" checkout -q 8dfdcc7b7
